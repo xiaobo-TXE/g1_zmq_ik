@@ -307,6 +307,120 @@ def log3_error(R_cur: np.ndarray, R_des: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# 内置符号正解：不依赖 pinocchio.casadi
+# ---------------------------------------------------------------------------
+def so3_log_casadi(casadi, R):
+    """SO(3) 对数映射的 CasADi 版本（对应 pinocchio.casadi 的 log3）。
+
+    log3(R) = θ/(2 sinθ) · (R - Rᵀ)∨，其中 v = (R - Rᵀ)∨ 的长度就是 2sinθ。
+    用 if_else 取 0/0 的极限值以避免 NaN（θ→0 时 θ/sinθ→1，故系数→1/2）。
+    极端情况 θ≈180° 时方向不可辨、结果退化，本工程的跟踪场景不会出现（会在文档中说明）。
+    """
+    v = casadi.vertcat(R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1])
+    s = casadi.norm_2(v)                                   # = 2|sinθ|
+    c = (R[0, 0] + R[1, 1] + R[2, 2] - 1) / 2              # = cosθ
+    theta = casadi.atan2(s / 2, c)                         # θ ∈ [0, π]
+    k = casadi.if_else(s < 1e-9, 0.5, theta / (s + 1e-12))  # 两个分支都有限，if_else 不会引入 NaN
+    return k * v
+
+
+class SymbolicArmKinematics:
+    """用 URDF 解析结果直接搭 CasADi 符号正解，替代 pinocchio.casadi.framesForwardKinematics。
+
+    pinocchio 已经把 URDF 解析成数值模型（关节链 parents、关节原点 SE3 jointPlacements、
+    关节类型/轴、各关节在 q 中的索引 idx_qs），这里把同一套数据搭成符号表达式：
+
+        T = I
+        for j in 根 → 末端 的路径:
+            T = T @ jointPlacements[j] @ exp_se3(axis_j, q[idx_qs[j]])
+        T_ee = T @ frames[ee].placement
+
+    因为遍历与数值都来自同一份 URDF 数据，它与 pinocchio 的数值正解逐位一致
+    （verify_fk() 会实测校验，典型最大差 ~1e-16）。
+    """
+
+    _REVOLUTE = {"JointModelRX": (1, 0, 0), "JointModelRY": (0, 1, 0), "JointModelRZ": (0, 0, 1),
+                 "JointModelRUBX": (1, 0, 0), "JointModelRUBY": (0, 1, 0), "JointModelRUBZ": (0, 0, 1)}
+    _PRISMATIC = {"JointModelPX": (1, 0, 0), "JointModelPY": (0, 1, 0), "JointModelPZ": (0, 0, 1)}
+
+    def __init__(self, model, casadi):
+        self.cs = casadi
+        self.model = model
+        self._chains = {name: self._build_chain(model, name) for name in ("L_ee", "R_ee")}
+
+    def _build_chain(self, model, frame_name: str) -> dict:
+        fid = model.getFrameId(frame_name)
+        if fid >= model.nframes:
+            raise ValueError(f"模型里没有 frame {frame_name}")
+        frame = model.frames[fid]
+        jid = frame.parentJoint
+        joints = []
+        while jid > 0:                       # 根关节(parents=0)之前的都收集
+            joints.append(jid)
+            jid = model.parents[jid]
+        joints.reverse()
+        steps = []
+        for j in joints:
+            jm = model.joints[j]
+            short = jm.shortname()
+            if model.nqs[j] != 1:
+                raise NotImplementedError(f"{frame_name} 链上关节 {model.names[j]} 不是单自由度（{short}）")
+            if short in self._REVOLUTE:
+                kind, axis = "revolute", self._REVOLUTE[short]
+            elif short in self._PRISMATIC:
+                kind, axis = "prismatic", self._PRISMATIC[short]
+            elif short == "JointModelRevoluteUnaligned":
+                kind, axis = "revolute", tuple(np.asarray(jm.axis, dtype=float).reshape(3))
+            elif short == "JointModelPrismaticUnaligned":
+                kind, axis = "prismatic", tuple(np.asarray(jm.axis, dtype=float).reshape(3))
+            else:
+                raise NotImplementedError(f"{frame_name} 链上暂不支持关节类型 {short}（{model.names[j]}）")
+            steps.append({"placement": np.asarray(model.jointPlacements[j].homogeneous, dtype=float),
+                          "axis": np.asarray(axis, dtype=float),
+                          "kind": kind,
+                          "qi": int(model.idx_qs[j])})
+        return {"steps": steps,
+                "frame_placement": np.asarray(frame.placement.homogeneous, dtype=float)}
+
+    # ---- 基本块 ----
+    def _mat3(self, rows):
+        return self.cs.vertcat(*[self.cs.horzcat(*r) for r in rows])
+
+    def _rot4(self, axis, q):
+        cs = self.cs
+        c, s = cs.cos(q), cs.sin(q)
+        ax = np.round(np.asarray(axis, dtype=float), 12)
+        if np.allclose(ax, [1, 0, 0]):
+            R = self._mat3([[1, 0, 0], [0, c, -s], [0, s, c]])
+        elif np.allclose(ax, [0, 1, 0]):
+            R = self._mat3([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+        elif np.allclose(ax, [0, 0, 1]):
+            R = self._mat3([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        else:                                # 非对齐轴：Rodrigues（轴为常量）
+            x, y, z = ax
+            K = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]], dtype=float)
+            R = cs.DM(np.eye(3)) + s * cs.DM(K) + (1 - c) * cs.DM(K @ K)
+        return cs.vertcat(cs.horzcat(R, cs.SX.zeros(3, 1)), cs.DM([[0, 0, 0, 1]]))
+
+    def _trans4(self, axis, q):
+        cs = self.cs
+        t = cs.DM(np.asarray(axis, dtype=float).reshape(3, 1)) * q
+        return cs.vertcat(cs.horzcat(cs.DM(np.eye(3)), t), cs.DM([[0, 0, 0, 1]]))
+
+    # ---- 对外 ----
+    def ee_pose(self, q, frame_name: str):
+        cs = self.cs
+        T = cs.DM(np.eye(4))
+        chain = self._chains[frame_name]
+        for st in chain["steps"]:
+            qj = q[st["qi"]]
+            block = (self._rot4(st["axis"], qj) if st["kind"] == "revolute"
+                     else self._trans4(st["axis"], qj))
+            T = T @ cs.DM(st["placement"]) @ block
+        return T @ cs.DM(chain["frame_placement"])
+
+
+# ---------------------------------------------------------------------------
 # 反解求解器 1：CasADi + IPOPT（忠实移植 xr_teleoperate 的实现）
 # ---------------------------------------------------------------------------
 class ArmIKCasadi:
@@ -323,7 +437,8 @@ class ArmIKCasadi:
                  print_time: bool = False, smooth_ref: str = "measured",
                  w_translation: Optional[float] = None, w_rotation: Optional[float] = None,
                  w_regularization: Optional[float] = None, w_smooth: Optional[float] = None,
-                 tol: float = 1e-4, acceptable_tol: float = 5e-4):
+                 tol: float = 1e-4, acceptable_tol: float = 5e-4,
+                 fk_backend: str = "auto"):
         """smooth_ref: 平滑项 0.1*||q - q_ref||² 的参考量
              "measured" —— q_ref = 本帧传入的实测关节角（**与 xr_teleoperate 完全一致**：
                            原版每帧 self.init_data = current_lr_arm_motor_q，
@@ -332,6 +447,8 @@ class ArmIKCasadi:
         """
         if smooth_ref not in ("measured", "previous"):
             raise ValueError("smooth_ref 只能是 measured / previous")
+        if fk_backend not in ("auto", "pinocchio", "builtin"):
+            raise ValueError("fk_backend 只能是 auto / pinocchio / builtin")
         self.smooth_ref = smooth_ref
         # 权重可覆盖。位置/姿态/平滑项默认与原版一致；正则项默认 0（精度优先），
         # 想要 xr_teleoperate 原版行为请传 w_regularization=W_REGULARIZATION_UNITREE
@@ -340,43 +457,60 @@ class ArmIKCasadi:
         self.w_regularization = W_REGULARIZATION if w_regularization is None else float(w_regularization)
         self.w_smooth = W_SMOOTH if w_smooth is None else float(w_smooth)
         import casadi
-        import pinocchio.casadi as cpin
-
-        # xr_teleoperate 依赖 pinocchio.casadi 的这几个接口；缺失时给出可执行的提示，
-        # 而不是在几十行之后抛一个看不懂的 AttributeError。
-        for attr in ("Model", "framesForwardKinematics", "log3"):
-            if not hasattr(cpin, attr):
-                raise RuntimeError(
-                    f"pinocchio.casadi 缺少 {attr}（本工程与 xr_teleoperate 的算法需要它）。"
-                    f"请安装 conda-forge 版：conda install -c conda-forge pinocchio casadi")
 
         self.casadi = casadi
         self.model = model
         rm = model.model
 
-        self.cmodel = cpin.Model(rm)
-        self.cdata = self.cmodel.createData()
-
         self.cq = casadi.SX.sym("q", rm.nq, 1)
         self.cTf_l = casadi.SX.sym("tf_l", 4, 4)
         self.cTf_r = casadi.SX.sym("tf_r", 4, 4)
-        cpin.framesForwardKinematics(self.cmodel, self.cdata, self.cq)
-
         self.L_hand_id = rm.getFrameId("L_ee")
         self.R_hand_id = rm.getFrameId("R_ee")
+
+        # 符号正解的后端：优先用 pinocchio.casadi（= xr_teleoperate 原路径，conda-forge 提供）；
+        # 它不在 PyPI 上，所以 uv/pip 环境自动改用内置符号正解（同一份 URDF 数据，
+        # 数值上逐位一致，见 verify_fk）。
+        self.cmodel = self.cdata = None
+        try:
+            if fk_backend == "builtin":
+                raise ImportError("按 --fk-backend builtin 强制使用内置符号正解")
+            import pinocchio.casadi as cpin
+            for attr in ("Model", "framesForwardKinematics", "log3"):
+                if not hasattr(cpin, attr):
+                    raise ImportError(f"pinocchio.casadi 缺少 {attr}")
+            self.cmodel = cpin.Model(rm)
+            self.cdata = self.cmodel.createData()
+            cpin.framesForwardKinematics(self.cmodel, self.cdata, self.cq)
+            p_L = self.cdata.oMf[self.L_hand_id].translation
+            R_L = self.cdata.oMf[self.L_hand_id].rotation
+            p_R = self.cdata.oMf[self.R_hand_id].translation
+            R_R = self.cdata.oMf[self.R_hand_id].rotation
+            so3_log = cpin.log3
+            self.backend = "pinocchio.casadi"
+        except ImportError as exc:
+            if fk_backend == "pinocchio":
+                raise RuntimeError(
+                    f"指定了 fk_backend=pinocchio 但不可用：{exc}。"
+                    f"pinocchio.casadi 只由 conda-forge 提供（PyPI 的 pin 轮子不含它）；"
+                    f"用 uv/pip 时请保持 fk_backend=auto，会自动改用内置符号正解。")
+            self.kin = SymbolicArmKinematics(rm, casadi)
+            T_L = self.kin.ee_pose(self.cq, "L_ee")
+            T_R = self.kin.ee_pose(self.cq, "R_ee")
+            p_L, R_L = T_L[:3, 3], T_L[:3, :3]
+            p_R, R_R = T_R[:3, 3], T_R[:3, :3]
+            so3_log = lambda R: so3_log_casadi(casadi, R)
+            self.backend = "builtin(URDF->CasADi)"
 
         self.translational_error = casadi.Function(
             "translational_error",
             [self.cq, self.cTf_l, self.cTf_r],
-            [casadi.vertcat(
-                self.cdata.oMf[self.L_hand_id].translation - self.cTf_l[:3, 3],
-                self.cdata.oMf[self.R_hand_id].translation - self.cTf_r[:3, 3])])
+            [casadi.vertcat(p_L - self.cTf_l[:3, 3], p_R - self.cTf_r[:3, 3])])
         self.rotational_error = casadi.Function(
             "rotational_error",
             [self.cq, self.cTf_l, self.cTf_r],
-            [casadi.vertcat(
-                cpin.log3(self.cdata.oMf[self.L_hand_id].rotation @ self.cTf_l[:3, :3].T),
-                cpin.log3(self.cdata.oMf[self.R_hand_id].rotation @ self.cTf_r[:3, :3].T))])
+            [casadi.vertcat(so3_log(R_L @ self.cTf_l[:3, :3].T),
+                            so3_log(R_R @ self.cTf_r[:3, :3].T))])
 
         self.opti = casadi.Opti()
         self.var_q = self.opti.variable(rm.nq)
@@ -432,16 +566,20 @@ class ArmIKCasadi:
 
     # ---------------- 正解（符号版，宇树同款） ----------------
     def _build_fk_function(self):
-        """oMf[L_ee]/oMf[R_ee] 的符号表达式 -> casadi.Function，输出两个 4x4 齐次矩阵(列优先展平)。"""
+        """末端的符号位姿 -> casadi.Function，输出两个 4x4 齐次矩阵(列优先展平)。
+
+        两个后端共用：pinocchio.casadi 时取 cdata.oMf；内置后端直接取符号齐次矩阵。
+        """
         casadi = self.casadi
-
-        def homog(placement):
-            R = placement.rotation
-            p = placement.translation
-            return casadi.vertcat(casadi.hcat([R, p]), casadi.DM([[0.0, 0.0, 0.0, 1.0]]))
-
-        T_L = homog(self.cdata.oMf[self.L_hand_id])
-        T_R = homog(self.cdata.oMf[self.R_hand_id])
+        if self.cdata is not None:
+            def homog(placement):
+                return casadi.vertcat(casadi.hcat([placement.rotation, placement.translation]),
+                                      casadi.DM([[0.0, 0.0, 0.0, 1.0]]))
+            T_L = homog(self.cdata.oMf[self.L_hand_id])
+            T_R = homog(self.cdata.oMf[self.R_hand_id])
+        else:
+            T_L = self.kin.ee_pose(self.cq, "L_ee")
+            T_R = self.kin.ee_pose(self.cq, "R_ee")
         return casadi.Function("fk_ee", [self.cq],
                                [casadi.reshape(T_L, 16, 1), casadi.reshape(T_R, 16, 1)])
 
@@ -630,7 +768,7 @@ def make_ik(model: G1ArmModel, solver: str = "auto", **kwargs):
                                        if k in ("max_iter", "warm_start", "print_time",
                                                 "smooth_ref", "w_translation", "w_rotation",
                                                 "w_regularization", "w_smooth", "tol",
-                                                "acceptable_tol")})
+                                                "acceptable_tol", "fk_backend")})
             logger.info("IK 求解器: %s (IPOPT)", ik.name)
             return ik
         except Exception as exc:

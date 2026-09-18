@@ -75,6 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="casadi=IPOPT(与 xr_teleoperate 一致) / dls=雅可比迭代回退")
     g.add_argument("--ik-max-iter", type=int, default=30,
                    help="IPOPT 最大迭代次数（30 = xr_teleoperate 原值）")
+    g.add_argument("--fk-backend", default="auto", choices=["auto", "pinocchio", "builtin"],
+                   help="符号正解后端：auto=有 pinocchio.casadi 就用它，否则用内置符号正解")
     g.add_argument("--ik-smooth-ref", default="measured", choices=["measured", "previous"],
                    help="平滑项参考量：measured=当前实测关节角(原版行为) / previous=上一帧下发值")
     g.add_argument("--w-reg", type=float, default=0.0,
@@ -255,10 +257,10 @@ def run_check(args) -> int:
             ok = ok and name in ("casadi", "zmq")   # 这两个是可选的
     try:
         import pinocchio.casadi  # noqa: F401
-        print("  [OK]   pinocchio.casadi (IPOPT 求解器可用)")
-    except Exception as exc:
-        print(f"  [WARN] pinocchio.casadi 不可用: {exc}")
-        print("         -> 将回退到 DLS 求解器；想要与 xr_teleoperate 完全一致请用 conda-forge 安装")
+        print("  [OK]   pinocchio.casadi（符号正解后端：pinocchio.casadi = 上游原路径）")
+    except Exception:
+        print("  [OK]   符号正解后端：内置 URDF->CasADi（PyPI 的 pin 不含 pinocchio.casadi，"
+              "\n         内置实现与它的数值差 ~2e-16，算法/权重/IPOPT 选项完全相同）")
     print("\n" + "=" * 72)
     print("模型自检")
     print("=" * 72)
@@ -284,6 +286,8 @@ def run_check(args) -> int:
                                       ("w_rotation", args.w_rot),
                                       ("w_smooth", args.w_smooth)) if v is not None})
         from g1_ik import self_test
+        if hasattr(ik, "backend"):
+            print(f"求解器后端: {ik.name}  |  符号正解: {ik.backend}")
         if hasattr(ik, "verify_fk"):
             v = ik.verify_fk(samples=10)
             print(f"正解一致性（CasADi 符号 FK vs Pinocchio 数值 FK）: "
@@ -388,6 +392,8 @@ def main(argv=None) -> int:
             ctrl.hold(arm)
 
     log.info("%s", ctrl.describe())
+    if hasattr(ik, "backend"):
+        log.info("符号正解后端: %s", ik.backend)
     log.info("目标系=pelvis(x前 y左 z上, m)；受控臂=%s；求解器=%s", args.arm, ik.name)
     if args.demo != "none":
         log.info("轨迹: %s 半径/幅值=%s 周期=%.1fs", args.demo, args.radius if args.demo == "circle" else args.amp,

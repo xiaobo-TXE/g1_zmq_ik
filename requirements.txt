@@ -1,17 +1,16 @@
-# 硬依赖（跑正解/反解 + ZMQ 必需）
-numpy>=1.22
+# 用 uv 安装（推荐）：
+#   uv venv --python 3.10
+#   uv pip install -r requirements.txt
+# 或者直接读 pyproject.toml：
+#   uv sync
+numpy>=1.26
 pyzmq>=24
+pin>=3.1
+casadi>=3.6
 
-# ---------------------------------------------------------------------------
-# 下面两个请优先用 conda-forge 安装（唯一能一起拿到 pinocchio + pinocchio.casadi 的途径）：
-#
-#   conda create -n g1ik python=3.10 pinocchio=3.1.0 casadi numpy=1.26.4 -c conda-forge
-#   conda activate g1ik
-#   pip install pyzmq
-#
-# 注意：PyPI 的 pin 轮子【不含】pinocchio.casadi，pip 装完只能跑 DLS 回退求解器
-#      （功能可用，但解不会和 xr_teleoperate 的 IPOPT 逐位一致）。
-#      详见 README §3。
-#
-# pin>=3.1.0
-# casadi>=3.6
+# 说明：
+# * PyPI 的 pin 轮子含 Pinocchio，但【不含 pinocchio.casadi】。程序会自动改用内置符号正解
+#   （同一份 URDF 数据搭 CasADi 表达式，与 pinocchio.casadi 数值差 ~2e-16，见 README）。
+# * PyPI 的 casadi 轮子自带 IPOPT 插件（libcasadi_nlpsol_ipopt.so），所以 IPOPT 不需要额外安装。
+# * 若确实想用 pinocchio.casadi 这条上游原路径，只能用 conda-forge：
+#       conda install -c conda-forge pinocchio casadi

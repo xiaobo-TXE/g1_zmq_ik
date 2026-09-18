@@ -1,0 +1,14 @@
+[project]
+name = "g1-zmq-ik"
+version = "0.1.0"
+description = "G1 humanoid dual-arm: target pose -> ZMQ joint states -> FK -> IK (CasADi/IPOPT, xr_teleoperate algorithm) -> ZMQ joint command"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "pyzmq>=24",
+    "pin>=3.1",       # Pinocchio（PyPI 版即可；它不含 pinocchio.casadi，见 README）
+    "casadi>=3.6",    # PyPI 轮子自带 IPOPT 插件
+]
+
+[tool.uv]
+package = false       # 不是要发布的 Python 包，uv sync 只装依赖

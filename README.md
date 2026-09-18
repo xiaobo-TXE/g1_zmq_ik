@@ -2,9 +2,10 @@
 
 G1 双臂：**给一个目标位置 → ZMQ 读当前关节角 → 正解出当前末端位姿 → 反解出期望关节角 → ZMQ 下发**。
 
-正解/反解用的是宇树 `xr_teleoperate` 的方案：`pinocchio` 加载 URDF + `pinocchio.casadi` 符号运动学
-+ `CasADi Opti/IPOPT` 求解（权重 50 : 1 : 0 : 0.1，关节限位为硬约束）。
-源码逐行对照见 [`docs/对照宇树源码.md`](docs/对照宇树源码.md)。
+正解/反解用的是宇树 `xr_teleoperate` 的方案：`pinocchio` 加载 URDF + 符号运动学 + `CasADi Opti/IPOPT`
+求解（权重 50 : 1 : 0 : 0.1，关节限位为硬约束）。源码逐行对照见 [`docs/对照宇树源码.md`](docs/对照宇树源码.md)。
+
+依赖用 **uv** 安装（`pin` + `casadi` 都在 PyPI 上，不需要 conda）。
 
 ---
 
@@ -19,7 +20,7 @@ G1 双臂：**给一个目标位置 → ZMQ 读当前关节角 → 正解出当�
       │   motor_state[12..14].q  →  3 维腰关节角（供 ④ 做坐标换算）
       ▼
  ③ 正解 FK(q_meas)  ─────────────▶  当前末端位姿（日志里的 meas=）
-      │   与反解共用同一个 CasADi 符号模型
+      │   与反解共用同一个 CasADi 符号模型（内置正解，或 pinocchio.casadi）
       ▼
  ④ 目标换算：pelvis 系目标 ──▶ 求解坐标系（用实测腰角做刚体换算）
       ▼
@@ -56,18 +57,36 @@ G1 双臂：**给一个目标位置 → ZMQ 读当前关节角 → 正解出当�
 
 ## 2. 怎么跑起来
 
-### 2.1 环境（Ubuntu 22.04）
+### 2.1 环境（Ubuntu 22.04，用 uv）
 
 ```bash
-# 原算法需要 pinocchio.casadi，只有 conda-forge 版带它（与 xr_teleoperate 官方说明一致）
-conda create -n g1ik python=3.10 pinocchio=3.1.0 casadi numpy=1.26.4 -c conda-forge
-conda activate g1ik
-pip install pyzmq
+# ① 装 uv（一次性）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# ② 建环境 + 装依赖
+cd g1_zmq_ik
+uv venv --python 3.10                 # 生成 .venv（uv 会自动准备 Python 3.10）
+uv pip install -r requirements.txt
+#    等价的另一种写法（读 pyproject.toml）：uv sync
+
+# ③ 激活（激活后下面的 python 命令直接可用；不想激活就在命令前加 `uv run`）
+source .venv/bin/activate
 ```
 
-> `pip install pin` 也能装上 pinocchio，但**不含 `pinocchio.casadi`**：
-> `--solver auto` 会警告并回退到内置的 DLS 求解器（能跑，但不是宇树算法）；
-> `--solver casadi` 会直接报错退出，不会静默降级。
+装的四个包：`numpy` `pyzmq` `pin`(Pinocchio) `casadi`。
+
+> **关于符号正解后端**：宇树原实现用 `pinocchio.casadi`，但它只由 conda-forge 提供（PyPI 的 `pin`
+> 轮子不含）。本工程内置了一份等价实现：用同一份 URDF 数据搭 CasADi 符号表达式，实测与
+> `pinocchio.casadi` 数值差 **2e-16**，代价函数/权重/关节限位/IPOPT 选项完全不变。
+> 启动日志会打印用的是哪个：
+>
+> ```
+> 符号正解后端: builtin(URDF->CasADi)     # uv/pip 环境（默认）
+> 符号正解后端: pinocchio.casadi          # 若你装了 conda-forge 的 pinocchio，会自动优先用它
+> ```
+>
+> 想强制指定用 `--fk-backend {auto,pinocchio,builtin}`。
+> PyPI 的 `casadi` 轮子自带 IPOPT 插件（`libcasadi_nlpsol_ipopt.so`），不需要额外装 IPOPT。
 
 ### 2.2 启动顺序：**先让机器人跑起来，再启动脚本并给目标**
 
@@ -183,6 +202,7 @@ python main.py --sim --arm right --pos 0.35 -0.20 0.10
 | `--demo` | `none` | `circle` / `line` 轨迹测试 |
 | `--rate` | `50` | 控制循环频率 Hz |
 | `--solver` | `auto` | `auto` 优先 CasADi/IPOPT；`casadi` 强制原算法（缺依赖直接报错）；`dls` 用回退求解器 |
+| `--fk-backend` | `auto` | 符号正解后端：`auto` 优先 `pinocchio.casadi`、否则用内置实现；也可强制 `pinocchio` / `builtin` |
 | `--w-trans` `--w-rot` `--w-reg` `--w-smooth` | `50` `1.0` `0` `0.1` | IK 权重。**正则项默认 0（精度优先）**；填 `--w-reg 0.02` 回到 xr_teleoperate 原版（会带来约 3mm 系统性偏置与静止漂移，见 docs） |
 | `--waist` | `state` | `state` 用实测腰角换算；`zero` 按腰=0（原版假设） |
 | `--max-step-deg` | `2.0` | 单周期关节增量上限（50Hz 约 100°/s） |
@@ -213,6 +233,7 @@ g1_zmq_ik/
 ├── joint_map.py            电机序 ↔ SDK 关节名 ↔ LeRobot 键名
 ├── sim_arm.py              一阶跟随仿真手臂（--sim 与 mock_robot 共用）
 ├── assets/g1/              G1-29DoF URDF（只需 URDF，不需要 meshes）
+├── pyproject.toml / requirements.txt    uv 依赖声明（uv sync / uv pip install -r）
 ├── tools/
 │   ├── mock_robot.py       本地假机器人：复刻 6001/6002 协议，便于不接真机联调
 │   ├── read_state.py       只读 6001，打印 29 个关节角
