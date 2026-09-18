@@ -118,7 +118,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("安全")
     g.add_argument("--max-step-deg", type=float, default=2.0,
-                   help="单周期(1/rate 秒)每个关节最大增量，0=不限")
+                   help="单周期(1/rate 秒)每个关节最大增量，0=不限（关节侧兜底限速）")
+    g.add_argument("--ee-speed", type=float, default=0.0,
+                   help="末端笛卡尔速度上限 m/s，例如 0.05=5cm/s；0=不限（默认）")
+    g.add_argument("--ee-rot-speed", type=float, default=0.0,
+                   help="末端姿态角速度上限 rad/s，例如 0.5；0=不限（默认）")
     g.add_argument("--state-timeout", type=float, default=0.25, help="状态超时秒数，超时不再下发")
     g.add_argument("--vx", type=float, default=0.0, help="行走线速度（一般保持 0）")
     g.add_argument("--vy", type=float, default=0.0)
@@ -435,6 +439,8 @@ def main(argv=None) -> int:
                          waist_source=args.waist,
                          use_filter=not args.no_filter,
                          max_step_deg=args.max_step_deg,
+                         ee_speed=args.ee_speed,
+                         ee_rot_speed=args.ee_rot_speed,
                          state_timeout=args.state_timeout,
                          dry_run=args.dry_run and not args.sim,
                          velocity=(args.vx, args.vy, args.wz))

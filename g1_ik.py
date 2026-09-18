@@ -250,6 +250,21 @@ class G1ArmModel:
     def neutral(self) -> np.ndarray:
         return np.zeros(self.model.nq)
 
+    def ee_jacobians(self, q14: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
+        """两个末端 frame 的雅可比（6x14，LOCAL_WORLD_ALIGNED）。
+
+        用于把"关节增量"换算成"末端线速度/角速度"，从而做笛卡尔速度钳制。
+        注意必须先显式调 computeJointJacobians（否则拿到全零矩阵）。
+        """
+        q = np.asarray(q14, dtype=float).reshape(self.model.nq)
+        pin.computeJointJacobians(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+        J_L = pin.getFrameJacobian(self.model, self.data, self.L_ee_id,
+                                   pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+        J_R = pin.getFrameJacobian(self.model, self.data, self.R_ee_id,
+                                   pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+        return np.array(J_L), np.array(J_R)
+
     def clamp(self, q14: Sequence[float]) -> np.ndarray:
         return np.clip(np.asarray(q14, dtype=float).reshape(-1), self.q_lower, self.q_upper)
 

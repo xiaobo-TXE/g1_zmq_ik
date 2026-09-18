@@ -31,7 +31,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from g1_ik import G1ArmModel, WeightedMovingFilter, pose_error, rpy_to_rotation
+import pinocchio as pin
+
+from g1_ik import G1ArmModel, WeightedMovingFilter, log3_error, pose_error, rpy_to_rotation
 from joint_map import N_ARM
 from zmq_link import ArmCommandPublisher
 
@@ -59,6 +61,9 @@ class StepInfo:
     err_track_pos: Dict[str, float] = field(default_factory=dict)  # 实测离目标多远（跟踪滞后）
     err_track_rot: Dict[str, float] = field(default_factory=dict)
     at_limit: int = 0
+    ee_clamp: float = 1.0             # 末端速度钳制的缩放系数（<1 表示被限速）
+    ee_speed_mm_s: float = 0.0        # 上一帧指令位姿 -> 本帧，末端实际移动速度
+    ee_rot_speed_dps: float = 0.0
     waist_bias_mm: float = 0.0     # --waist zero 时：真实 pelvis 系与 locked 系的位置偏差
     ik_status: str = ""
 
@@ -78,7 +83,8 @@ def format_step(info: StepInfo, arm: str, with_joints: bool = False) -> str:
             f"meas=({p_m[0]:+.3f},{p_m[1]:+.3f},{p_m[2]:+.3f}) "
             f"tgt=({p_t[0]:+.3f},{p_t[1]:+.3f},{p_t[2]:+.3f}) "
             f"ik_err={eik:6.1f}mm/{rik:5.1f}° track_err={etr:6.1f}mm/{rtr:5.1f}° "
-            f"ik={info.ik_ms:5.1f}ms")
+            f"ik={info.ik_ms:5.1f}ms "
+            f"v={info.ee_speed_mm_s:6.1f}mm/s")
     if not info.sent:
         line += " [未下发]"
     if info.waist_bias_mm > 0.5:
@@ -100,6 +106,8 @@ class ArmController:
                  waist_source: str = "state",        # state | zero
                  use_filter: bool = True,
                  max_step_deg: float = 2.0,
+                 ee_speed: float = 0.0,
+                 ee_rot_speed: float = 0.0,
                  state_timeout: float = 0.25,
                  dry_run: bool = False,
                  velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0)):
@@ -112,6 +120,9 @@ class ArmController:
         self.controlled = controlled
         self.waist_source = waist_source
         self.max_step = np.deg2rad(float(max_step_deg))
+        # 末端笛卡尔速度上限（m/s，0=不限）；姿态上限（rad/s，0=不限）
+        self.ee_speed = float(ee_speed)
+        self.ee_rot_speed = float(ee_rot_speed)
         self.state_timeout = float(state_timeout)
         self.dry_run = bool(dry_run)
         self.velocity = tuple(float(v) for v in velocity)
@@ -129,6 +140,7 @@ class ArmController:
         self.cycle = 0
         self.start_time = time.time()
         self.sent_cycles = 0
+        self._prev_ee_cmd: Dict[str, Optional[np.ndarray]] = {LEFT: None, RIGHT: None}
 
     # ------------------------------------------------------------------ 目标
     def set_target_pose(self, arm: str, T_pelvis: np.ndarray) -> None:
@@ -195,6 +207,35 @@ class ArmController:
             out[arm] = self.model.pelvis_to_locked(T, waist)
         return out[LEFT], out[RIGHT]
 
+    # ------------------------------------------------------------------ 末端速度限制
+    def _clamp_ee_velocity(self, q_prev: np.ndarray, dq: np.ndarray,
+                           dt: float) -> Tuple[np.ndarray, float]:
+        """按末端笛卡尔速度上限缩放关节增量。
+
+        用雅可比把 dq 映射成末端的线速度/角速度，再按 (上限*dt)/实际 的比例整体缩放，
+        因此**与 IK 用什么权重、什么求解器无关**，速度上限总是成立的。
+        返回 (缩放后的 dq, 缩放系数)。
+        """
+        if (self.ee_speed <= 0 and self.ee_rot_speed <= 0) or dt <= 0:
+            return dq, 1.0
+        J_L, J_R = self.model.ee_jacobians(q_prev)
+        scale = 1.0
+        for arm, J in ((LEFT, J_L), (RIGHT, J_R)):
+            if self.controlled not in (arm, "both"):
+                continue
+            v = J[:3] @ dq          # 末端线速度（世界系）
+            w = J[3:] @ dq          # 末端角速度
+            if self.ee_speed > 0:
+                sp = float(np.linalg.norm(v))
+                if sp > 1e-12:
+                    scale = min(scale, self.ee_speed * dt / sp)
+            if self.ee_rot_speed > 0:
+                sw = float(np.linalg.norm(w))
+                if sw > 1e-12:
+                    scale = min(scale, self.ee_rot_speed * dt / sw)
+        scale = max(0.0, min(1.0, scale))
+        return dq * scale, scale
+
     # ------------------------------------------------------------------ 主步
     def step(self, dt: float) -> StepInfo:
         self.cycle += 1
@@ -237,7 +278,7 @@ class ArmController:
                 if self.target[arm] is None and self.controlled in (arm, "both"):
                     self.target[arm] = T.copy()
 
-        # 4) 目标 -> locked 系 -> IK
+        # 4) 目标 -> locked 系 -> IK（直接解真目标；速度限制在下面用雅可比钳制）
         T_L_tgt, T_R_tgt = self._ik_targets(T_L_meas, T_R_meas)
         t0 = time.perf_counter()
         q_raw = None
@@ -265,13 +306,16 @@ class ArmController:
         elif self.controlled == RIGHT:
             q_new[:7] = prev[:7]
 
-        # 7) 限速 + 限位
+        # 7) 限速（先关节侧兜底，再按末端笛卡尔速度钳制）+ 限位
         delta = q_new - prev
         if self.max_step > 0:
             over = np.abs(delta) > self.max_step
             if np.any(over):
                 delta = np.clip(delta, -self.max_step, self.max_step)
-                info.notes.append(f"限速 {int(np.sum(over))} 个关节")
+                info.notes.append(f"关节限速 {int(np.sum(over))} 个")
+        delta, info.ee_clamp = self._clamp_ee_velocity(prev, delta, dt)
+        if info.ee_clamp < 0.999:
+            info.notes.append(f"末端限速 x{info.ee_clamp:.2f}")
         q_send = self.model.clamp(prev + delta)
         info.at_limit = int(np.sum((q_send <= self.model.q_lower + 1e-9) |
                                    (q_send >= self.model.q_upper - 1e-9)))
@@ -289,14 +333,25 @@ class ArmController:
         #    ik_err   : 在 locked 系里比较"指令 FK"与"IK 目标"  -> 纯求解精度
         #    track_err: 在真实 pelvis 系里比较"实测 FK"与"pelvis 目标" -> 真实物理偏差
         #               （含腰部换算偏置 + 伺服滞后）
+        T_L_raw_lk, T_R_raw_lk = self.model.fk(q_raw)      # IK 原始解（未限幅）-> 纯求解质量
         T_L_cmd_lk, T_R_cmd_lk = self.model.fk(q_send)
         T_L_cmd_tr, T_R_cmd_tr = self.model.fk_pelvis(q_send, waist_true)
         info.ee_cmd = {LEFT: T_L_cmd_tr, RIGHT: T_R_cmd_tr}
-        for arm, T_cmd_lk, T_tgt_lk, T_true in ((LEFT, T_L_cmd_lk, T_L_tgt, T_L_true),
-                                                (RIGHT, T_R_cmd_lk, T_R_tgt, T_R_true)):
+        # 本周期指令末端实际移动速度（用于核对速度上限是否生效）
+        for arm, T_now in ((LEFT, T_L_cmd_tr), (RIGHT, T_R_cmd_tr)):
+            T_prev = self._prev_ee_cmd.get(arm)
+            if T_prev is not None and dt > 0:
+                v = float(np.linalg.norm(T_now[:3, 3] - T_prev[:3, 3])) / dt
+                w = float(np.linalg.norm(log3_error(T_now[:3, :3], T_prev[:3, :3]))) / dt
+                if arm == self.controlled or self.controlled == "both":
+                    info.ee_speed_mm_s = max(info.ee_speed_mm_s, v * 1000.0)
+                    info.ee_rot_speed_dps = max(info.ee_rot_speed_dps, np.rad2deg(w))
+            self._prev_ee_cmd[arm] = np.array(T_now, copy=True)
+        for arm, T_raw_lk, T_tgt_lk, T_true in ((LEFT, T_L_raw_lk, T_L_tgt, T_L_true),
+                                               (RIGHT, T_R_raw_lk, T_R_tgt, T_R_true)):
             T_tgt_pelvis = self.target[arm] if self.target[arm] is not None else T_true
             info.ee_target[arm] = T_tgt_pelvis
-            p, r, _ = pose_error(T_cmd_lk, T_tgt_lk)
+            p, r, _ = pose_error(T_raw_lk, T_tgt_lk)
             info.err_ik_pos[arm], info.err_ik_rot[arm] = p, r
             p2, r2, _ = pose_error(T_true, T_tgt_pelvis)
             info.err_track_pos[arm], info.err_track_rot[arm] = p2, r2
@@ -304,7 +359,9 @@ class ArmController:
 
     # ------------------------------------------------------------------ 状态
     def describe(self) -> str:
+        ee = (f"末端限速={self.ee_speed*1000:.0f}mm/s" if self.ee_speed > 0 else "末端限速=关")
         return (f"受控臂={self.controlled} 腰参考={self.waist_source} "
                 f"滤波={'on' if self.filter else 'off'} "
                 f"单周期限速={np.rad2deg(self.max_step):.2f}° "
+                f"{ee} "
                 f"状态超时={self.state_timeout * 1000:.0f}ms 下发={self.sent_cycles} 帧")
