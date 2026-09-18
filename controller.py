@@ -62,6 +62,7 @@ class StepInfo:
     err_track_rot: Dict[str, float] = field(default_factory=dict)
     at_limit: int = 0
     ee_clamp: float = 1.0             # 末端速度钳制的缩放系数（<1 表示被限速）
+    ee_accel_m_s2: float = 0.0        # 本周期实测末端加速度
     ee_speed_mm_s: float = 0.0        # 上一帧指令位姿 -> 本帧，末端实际移动速度
     ee_rot_speed_dps: float = 0.0
     waist_bias_mm: float = 0.0     # --waist zero 时：真实 pelvis 系与 locked 系的位置偏差
@@ -84,7 +85,8 @@ def format_step(info: StepInfo, arm: str, with_joints: bool = False) -> str:
             f"tgt=({p_t[0]:+.3f},{p_t[1]:+.3f},{p_t[2]:+.3f}) "
             f"ik_err={eik:6.1f}mm/{rik:5.1f}° track_err={etr:6.1f}mm/{rtr:5.1f}° "
             f"ik={info.ik_ms:5.1f}ms "
-            f"v={info.ee_speed_mm_s:6.1f}mm/s")
+            f"v={info.ee_speed_mm_s:6.1f}mm/s"
+            + (f" a={info.ee_accel_m_s2:5.2f}m/s²" if info.ee_accel_m_s2 > 0 else ""))
     if not info.sent:
         line += " [未下发]"
     if info.waist_bias_mm > 0.5:
@@ -108,6 +110,8 @@ class ArmController:
                  max_step_deg: float = 2.0,
                  ee_speed: float = 0.0,
                  ee_rot_speed: float = 0.0,
+                 ee_accel: float = 0.0,
+                 ee_rot_accel: float = 0.0,
                  state_timeout: float = 0.25,
                  dry_run: bool = False,
                  velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0)):
@@ -123,6 +127,12 @@ class ArmController:
         # 末端笛卡尔速度上限（m/s，0=不限）；姿态上限（rad/s，0=不限）
         self.ee_speed = float(ee_speed)
         self.ee_rot_speed = float(ee_rot_speed)
+        # 末端加速度上限（m/s²、rad/s²，0=不限）。会给出一条梯形速度曲线：
+        # 起步按加速度爬升，临近目标按 sqrt(2*a*d) 提前减速，避免"到位即停"的冲击。
+        self.ee_accel = float(ee_accel)
+        self.ee_rot_accel = float(ee_rot_accel)
+        self._ee_v: Dict[str, float] = {LEFT: 0.0, RIGHT: 0.0}     # 上周期实现的末端线速度
+        self._ee_w: Dict[str, float] = {LEFT: 0.0, RIGHT: 0.0}     # 上周期实现的末端角速度
         self.state_timeout = float(state_timeout)
         self.dry_run = bool(dry_run)
         self.velocity = tuple(float(v) for v in velocity)
@@ -141,6 +151,7 @@ class ArmController:
         self.start_time = time.time()
         self.sent_cycles = 0
         self._prev_ee_cmd: Dict[str, Optional[np.ndarray]] = {LEFT: None, RIGHT: None}
+        self._prev_ee_speed: Dict[str, Optional[float]] = {LEFT: None, RIGHT: None}
 
     # ------------------------------------------------------------------ 目标
     def set_target_pose(self, arm: str, T_pelvis: np.ndarray) -> None:
@@ -208,32 +219,61 @@ class ArmController:
         return out[LEFT], out[RIGHT]
 
     # ------------------------------------------------------------------ 末端速度限制
-    def _clamp_ee_velocity(self, q_prev: np.ndarray, dq: np.ndarray,
-                           dt: float) -> Tuple[np.ndarray, float]:
-        """按末端笛卡尔速度上限缩放关节增量。
+    def _clamp_ee_motion(self, q_prev: np.ndarray, dq: np.ndarray, dt: float,
+                         dist=None, dtheta=None) -> Tuple[np.ndarray, float]:
+        """按末端速度/加速度上限缩放关节增量（笛卡尔空间钳制）。
 
-        用雅可比把 dq 映射成末端的线速度/角速度，再按 (上限*dt)/实际 的比例整体缩放，
-        因此**与 IK 用什么权重、什么求解器无关**，速度上限总是成立的。
-        返回 (缩放后的 dq, 缩放系数)。
+        用雅可比把 dq 映射成末端的线速度 v 与角速度 w，再整体缩放：
+
+          速度上限：  |v| ≤ ee_speed            |w| ≤ ee_rot_speed
+          加速度上限：|v| ≤ |v_上周期| + ee_accel·dt        （爬升/减速受限于加速度）
+                      |v| ≤ sqrt(2·ee_accel·剩余距离)        （临近目标提前减速，梯形曲线）
+
+        因此与 IK 用什么权重、什么求解器无关：设定值一定成立。
+        返回 (缩放后的 dq, 缩放系数)。dist/dtheta 为受控臂到目标的剩余距离/角度。
         """
-        if (self.ee_speed <= 0 and self.ee_rot_speed <= 0) or dt <= 0:
+        if (self.ee_speed <= 0 and self.ee_rot_speed <= 0
+                and self.ee_accel <= 0 and self.ee_rot_accel <= 0) or dt <= 0:
             return dq, 1.0
         J_L, J_R = self.model.ee_jacobians(q_prev)
         scale = 1.0
+        achieved = {}
         for arm, J in ((LEFT, J_L), (RIGHT, J_R)):
             if self.controlled not in (arm, "both"):
                 continue
-            v = J[:3] @ dq          # 末端线速度（世界系）
-            w = J[3:] @ dq          # 末端角速度
+            v_vec = J[:3] @ dq                 # 末端线速度（世界系）
+            w_vec = J[3:] @ dq                 # 末端角速度
+            sp = float(np.linalg.norm(v_vec))
+            sw = float(np.linalg.norm(w_vec))
+
+            # --- 线速度上限 ---
+            v_cap = np.inf
             if self.ee_speed > 0:
-                sp = float(np.linalg.norm(v))
-                if sp > 1e-12:
-                    scale = min(scale, self.ee_speed * dt / sp)
+                v_cap = min(v_cap, self.ee_speed)
+            if self.ee_accel > 0:
+                v_cap = min(v_cap, self._ee_v[arm] + self.ee_accel * dt)      # 加速度爬升
+                if dist is not None:
+                    v_cap = min(v_cap, float(np.sqrt(2.0 * self.ee_accel * max(dist, 0.0))))  # 提前减速
+            # 注意量纲：sp = |J·dq| 是"本周期末端位移(m)"，v_cap 是"速度(m/s)"，故需乘 dt
+            if sp > 1e-12 and np.isfinite(v_cap):
+                scale = min(scale, v_cap * dt / sp)
+
+            # --- 角速度上限 ---
+            w_cap = np.inf
             if self.ee_rot_speed > 0:
-                sw = float(np.linalg.norm(w))
-                if sw > 1e-12:
-                    scale = min(scale, self.ee_rot_speed * dt / sw)
+                w_cap = min(w_cap, self.ee_rot_speed)
+            if self.ee_rot_accel > 0:
+                w_cap = min(w_cap, self._ee_w[arm] + self.ee_rot_accel * dt)
+                if dtheta is not None:
+                    w_cap = min(w_cap, float(np.sqrt(2.0 * self.ee_rot_accel * max(dtheta, 0.0))))
+            if sw > 1e-12 and np.isfinite(w_cap):
+                scale = min(scale, w_cap * dt / sw)
+
+            achieved[arm] = (sp, sw)
         scale = max(0.0, min(1.0, scale))
+        for arm, (sp, sw) in achieved.items():      # 记录本周期"真正实现"的速度(m/s)，供下周期加速度限制
+            self._ee_v[arm] = scale * sp / dt
+            self._ee_w[arm] = scale * sw / dt
         return dq * scale, scale
 
     # ------------------------------------------------------------------ 主步
@@ -313,7 +353,18 @@ class ArmController:
             if np.any(over):
                 delta = np.clip(delta, -self.max_step, self.max_step)
                 info.notes.append(f"关节限速 {int(np.sum(over))} 个")
-        delta, info.ee_clamp = self._clamp_ee_velocity(prev, delta, dt)
+        # 受控臂到目标的剩余距离（用于加速度限制的提前减速）
+        T_prev_lk = self.model.fk(prev)
+        dist = dtheta = None
+        for arm, T_prev_arm, T_tgt_arm in ((LEFT, T_prev_lk[0], T_L_tgt),
+                                           (RIGHT, T_prev_lk[1], T_R_tgt)):
+            if self.controlled not in (arm, "both"):
+                continue
+            d = float(np.linalg.norm(T_tgt_arm[:3, 3] - T_prev_arm[:3, 3]))
+            th = float(np.linalg.norm(log3_error(T_prev_arm[:3, :3], T_tgt_arm[:3, :3])))
+            dist = d if dist is None else min(dist, d)
+            dtheta = th if dtheta is None else min(dtheta, th)
+        delta, info.ee_clamp = self._clamp_ee_motion(prev, delta, dt, dist=dist, dtheta=dtheta)
         if info.ee_clamp < 0.999:
             info.notes.append(f"末端限速 x{info.ee_clamp:.2f}")
         q_send = self.model.clamp(prev + delta)
@@ -346,6 +397,10 @@ class ArmController:
                 if arm == self.controlled or self.controlled == "both":
                     info.ee_speed_mm_s = max(info.ee_speed_mm_s, v * 1000.0)
                     info.ee_rot_speed_dps = max(info.ee_rot_speed_dps, np.rad2deg(w))
+                    prev_v = self._prev_ee_speed.get(arm)
+                    if prev_v is not None:
+                        info.ee_accel_m_s2 = max(info.ee_accel_m_s2, abs(v - prev_v) / dt)
+                    self._prev_ee_speed[arm] = v
             self._prev_ee_cmd[arm] = np.array(T_now, copy=True)
         for arm, T_raw_lk, T_tgt_lk, T_true in ((LEFT, T_L_raw_lk, T_L_tgt, T_L_true),
                                                (RIGHT, T_R_raw_lk, T_R_tgt, T_R_true)):
@@ -359,7 +414,11 @@ class ArmController:
 
     # ------------------------------------------------------------------ 状态
     def describe(self) -> str:
-        ee = (f"末端限速={self.ee_speed*1000:.0f}mm/s" if self.ee_speed > 0 else "末端限速=关")
+        if self.ee_speed > 0 or self.ee_accel > 0:
+            ee = ("末端限速=" + (f"{self.ee_speed*1000:.0f}mm/s" if self.ee_speed > 0 else "关")
+                  + (f" 加速度={self.ee_accel:.2f}m/s²" if self.ee_accel > 0 else ""))
+        else:
+            ee = "末端限速=关"
         return (f"受控臂={self.controlled} 腰参考={self.waist_source} "
                 f"滤波={'on' if self.filter else 'off'} "
                 f"单周期限速={np.rad2deg(self.max_step):.2f}° "

@@ -123,6 +123,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="末端笛卡尔速度上限 m/s，例如 0.05=5cm/s；0=不限（默认）")
     g.add_argument("--ee-rot-speed", type=float, default=0.0,
                    help="末端姿态角速度上限 rad/s，例如 0.5；0=不限（默认）")
+    g.add_argument("--ee-accel", type=float, default=0.0,
+                   help="末端加速度上限 m/s²，例如 0.2=0.2m/s²（0→5cm/s 用时 0.25s）；0=不限")
+    g.add_argument("--ee-rot-accel", type=float, default=0.0,
+                   help="末端姿态角加速度上限 rad/s²；0=不限")
     g.add_argument("--state-timeout", type=float, default=0.25, help="状态超时秒数，超时不再下发")
     g.add_argument("--vx", type=float, default=0.0, help="行走线速度（一般保持 0）")
     g.add_argument("--vy", type=float, default=0.0)
@@ -441,6 +445,8 @@ def main(argv=None) -> int:
                          max_step_deg=args.max_step_deg,
                          ee_speed=args.ee_speed,
                          ee_rot_speed=args.ee_rot_speed,
+                         ee_accel=args.ee_accel,
+                         ee_rot_accel=args.ee_rot_accel,
                          state_timeout=args.state_timeout,
                          dry_run=args.dry_run and not args.sim,
                          velocity=(args.vx, args.vy, args.wz))
