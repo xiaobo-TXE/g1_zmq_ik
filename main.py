@@ -65,7 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--dry-run", action="store_true", help="不发 6002，只打印将要发送的帧")
     g.add_argument("--rate", type=float, default=50.0, help="控制循环频率 Hz")
     g.add_argument("--duration", type=float, default=0.0, help="运行秒数，0=一直跑")
-    g.add_argument("--print-every", type=int, default=5, help="每 N 个周期打印一行")
+    g.add_argument("--print-every", type=int, default=None,
+                   help="每 N 个周期打印一行状态；0=不打印。默认：普通模式 5，"
+                        "--interactive 时为 0（否则会刷屏，没法输入命令）")
     g.add_argument("--print-joints", action="store_true", help="同时打印 14 个下发关节角")
 
     g = p.add_argument_group("模型与求解")
@@ -174,6 +176,7 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
     if not parts:
         return True
     head, args = parts[0].lower(), parts[1:]
+    flags["force_print"] = True          # 每条命令都在下一个周期回一行状态
     try:
         if head == "p" and len(args) == 3:
             pos = [float(v) for v in args]
@@ -198,7 +201,6 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
                     ctrl.hold(arm)
             log.info("受控臂 -> %s（未受控臂已冻结保持）", args[0])
         elif head in ("h", "j"):
-            flags["force_print"] = True
             flags["print_joints"] = flags.get("print_joints", False) or head == "j"
         elif head in ("?", "help"):
             print(HELP_TEXT)
@@ -454,13 +456,19 @@ def main(argv=None) -> int:
         log.info("轨迹: %s 半径/幅值=%s 周期=%.1fs", args.demo, args.radius if args.demo == "circle" else args.amp,
                  args.period)
 
+    print_every = args.print_every
+    if print_every is None:
+        print_every = 0 if args.interactive else 5
     flags = {"arms": arms, "force_print": False, "print_joints": args.print_joints,
-             "last_stream_pos": {}, "pending_delta": []}
+             "last_stream_pos": {}, "pending_delta": [], "hint_time": 0.0}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
     last_target_warn = 0.0
     console = None
     if args.interactive:
         print(HELP_TEXT)
+        print("交互模式已静默：状态不再刷屏，直接输入即可（无需提示符）。\n"
+              "  · 每条命令都会在下一个控制周期（约 20ms）回一行状态\n"
+              "  · h 看完整状态、j 看当前下发的 14 个关节角、? 看全部命令\n")
         console = InteractiveConsole([])
         console.start()
 
@@ -507,10 +515,23 @@ def main(argv=None) -> int:
                 delta_done = True
 
             # 打印
-            if args.print_every > 0 and (ctrl.cycle % args.print_every == 0 or flags["force_print"]):
+            if flags["force_print"] or (print_every > 0 and ctrl.cycle % print_every == 0):
                 flags["force_print"] = False
                 for arm in flags["arms"]:
                     print(format_step(info, arm, flags["print_joints"]))
+                sys.stdout.flush()
+
+            # 目标不可达/被限位时的提示（限频，避免刷屏）
+            if info.sent and info.ee_meas:
+                arm0 = flags["arms"][0]
+                eik = info.err_ik_pos.get(arm0, 0.0)
+                etr = info.err_track_pos.get(arm0, 0.0)
+                if (info.at_limit or eik > 0.05) and elapse - flags.get("hint_time", 0.0) > 2.0:
+                    flags["hint_time"] = elapse
+                    why = "已顶到关节限位" if info.at_limit else "目标可能不可达"
+                    print(f"  ⚠ {why}：反解残差 {eik*1000:.0f}mm，实测距目标 {etr*1000:.0f}mm"
+                          f"（手臂停在能到的最近处）")
+                    sys.stdout.flush()
 
             if args.duration > 0 and elapse >= args.duration:
                 log.info("到达 --duration %.1fs，退出", args.duration)
