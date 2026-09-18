@@ -108,10 +108,12 @@ class ArmController:
                  waist_source: str = "state",        # state | zero
                  use_filter: bool = True,
                  max_step_deg: float = 2.0,
-                 ee_speed: float = 0.0,
+                 ee_speed: float = 0.10,      # 默认 10cm/s：由 tools/tune_motion.py 标定
                  ee_rot_speed: float = 0.0,
-                 ee_accel: float = 0.0,
+                 ee_accel: float = 0.20,       # 默认 0.2m/s²：同样由标定得出
                  ee_rot_accel: float = 0.0,
+                 ee_jerk: float = 0.0,
+                 ee_rot_jerk: float = 0.0,
                  state_timeout: float = 0.25,
                  dry_run: bool = False,
                  velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0)):
@@ -125,12 +127,21 @@ class ArmController:
         self.waist_source = waist_source
         self.max_step = np.deg2rad(float(max_step_deg))
         # 末端笛卡尔速度上限（m/s，0=不限）；姿态上限（rad/s，0=不限）
+        # 默认值 0.10m/s + 0.20m/s² 来自 tools/tune_motion.py 的网格扫描：
+        # 该组合的峰值 jerk 约 10 m/s³、速度纹波 10.6%、过冲 0.71mm、12cm 移动约 2.0s 到位，
+        # 在"平滑度 / 稳定性 / 到位时间"的综合评分里最优（详见 README §2.6）。
         self.ee_speed = float(ee_speed)
         self.ee_rot_speed = float(ee_rot_speed)
         # 末端加速度上限（m/s²、rad/s²，0=不限）。会给出一条梯形速度曲线：
         # 起步按加速度爬升，临近目标按 sqrt(2*a*d) 提前减速，避免"到位即停"的冲击。
         self.ee_accel = float(ee_accel)
         self.ee_rot_accel = float(ee_rot_accel)
+        # 加加速度上限（m/s³、rad/s³，0=不限）。>0 时加速度本身也受限制，
+        # 于是速度曲线从"梯形"变成 S 形 —— 起停不再有加速度阶跃，是"平滑处理"的关键一环。
+        self.ee_jerk = float(ee_jerk)
+        self.ee_rot_jerk = float(ee_rot_jerk)
+        self._ee_a: Dict[str, float] = {LEFT: 0.0, RIGHT: 0.0}      # 上周期末端线加速度
+        self._ee_wa: Dict[str, float] = {LEFT: 0.0, RIGHT: 0.0}     # 上周期末端角加速度
         self._ee_v: Dict[str, float] = {LEFT: 0.0, RIGHT: 0.0}     # 上周期实现的末端线速度
         self._ee_w: Dict[str, float] = {LEFT: 0.0, RIGHT: 0.0}     # 上周期实现的末端角速度
         self.state_timeout = float(state_timeout)
@@ -246,7 +257,7 @@ class ArmController:
             sp = float(np.linalg.norm(v_vec))
             sw = float(np.linalg.norm(w_vec))
 
-            # --- 线速度上限 ---
+            # --- 线速度上限（速度 -> 加速度 -> 加加速度 三级约束）---
             v_cap = np.inf
             if self.ee_speed > 0:
                 v_cap = min(v_cap, self.ee_speed)
@@ -254,6 +265,19 @@ class ArmController:
                 v_cap = min(v_cap, self._ee_v[arm] + self.ee_accel * dt)      # 加速度爬升
                 if dist is not None:
                     v_cap = min(v_cap, float(np.sqrt(2.0 * self.ee_accel * max(dist, 0.0))))  # 提前减速
+                # jerk 限制：把"期望加速度"限幅后再积分，得到平滑的 S 形速度曲线
+                if self.ee_jerk > 0:
+                    v_cap_orig = v_cap                      # 速度/制动上限，绝不能被突破
+                    a_des = (v_cap_orig - self._ee_v[arm]) / dt
+                    a_des = float(np.clip(a_des, -self.ee_accel, self.ee_accel))
+                    a_new = self._ee_a[arm] + float(np.clip(a_des - self._ee_a[arm],
+                                                            -self.ee_jerk * dt,
+                                                            self.ee_jerk * dt))
+                    self._ee_a[arm] = a_new
+                    # jerk 限制后的速度只能"更保守"：再与原始上限取 min
+                    v_cap = min(v_cap_orig, max(0.0, self._ee_v[arm] + a_new * dt))
+                else:
+                    self._ee_a[arm] = max(0.0, (v_cap - self._ee_v[arm]) / dt)
             # 注意量纲：sp = |J·dq| 是"本周期末端位移(m)"，v_cap 是"速度(m/s)"，故需乘 dt
             if sp > 1e-12 and np.isfinite(v_cap):
                 scale = min(scale, v_cap * dt / sp)
@@ -266,6 +290,15 @@ class ArmController:
                 w_cap = min(w_cap, self._ee_w[arm] + self.ee_rot_accel * dt)
                 if dtheta is not None:
                     w_cap = min(w_cap, float(np.sqrt(2.0 * self.ee_rot_accel * max(dtheta, 0.0))))
+            if self.ee_rot_accel > 0 and self.ee_rot_jerk > 0:
+                w_cap_orig = w_cap
+                wa_des = float(np.clip((w_cap_orig - self._ee_w[arm]) / dt,
+                                       -self.ee_rot_accel, self.ee_rot_accel))
+                wa_new = self._ee_wa[arm] + float(np.clip(wa_des - self._ee_wa[arm],
+                                                          -self.ee_rot_jerk * dt,
+                                                          self.ee_rot_jerk * dt))
+                self._ee_wa[arm] = wa_new
+                w_cap = min(w_cap_orig, max(0.0, self._ee_w[arm] + wa_new * dt))
             if sw > 1e-12 and np.isfinite(w_cap):
                 scale = min(scale, w_cap * dt / sw)
 
@@ -416,7 +449,8 @@ class ArmController:
     def describe(self) -> str:
         if self.ee_speed > 0 or self.ee_accel > 0:
             ee = ("末端限速=" + (f"{self.ee_speed*1000:.0f}mm/s" if self.ee_speed > 0 else "关")
-                  + (f" 加速度={self.ee_accel:.2f}m/s²" if self.ee_accel > 0 else ""))
+                  + (f" 加速度={self.ee_accel:.2f}m/s²" if self.ee_accel > 0 else "")
+                  + (f" jerk={self.ee_jerk:.1f}m/s³" if self.ee_jerk > 0 else ""))
         else:
             ee = "末端限速=关"
         return (f"受控臂={self.controlled} 腰参考={self.waist_source} "

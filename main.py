@@ -119,14 +119,20 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("安全")
     g.add_argument("--max-step-deg", type=float, default=2.0,
                    help="单周期(1/rate 秒)每个关节最大增量，0=不限（关节侧兜底限速）")
-    g.add_argument("--ee-speed", type=float, default=0.0,
-                   help="末端笛卡尔速度上限 m/s，例如 0.05=5cm/s；0=不限（默认）")
+    g.add_argument("--ee-speed", type=float, default=0.10,
+                   help="末端笛卡尔速度上限 m/s（默认 0.10=10cm/s，由 tools/tune_motion.py "
+                        "标定的最平滑稳定值）；传 0 = 不限速")
     g.add_argument("--ee-rot-speed", type=float, default=0.0,
                    help="末端姿态角速度上限 rad/s，例如 0.5；0=不限（默认）")
-    g.add_argument("--ee-accel", type=float, default=0.0,
-                   help="末端加速度上限 m/s²，例如 0.2=0.2m/s²（0→5cm/s 用时 0.25s）；0=不限")
+    g.add_argument("--ee-accel", type=float, default=0.20,
+                   help="末端加速度上限 m/s²（默认 0.20，标定值；0→10cm/s 用时 0.5s）；0=不限")
     g.add_argument("--ee-rot-accel", type=float, default=0.0,
                    help="末端姿态角加速度上限 rad/s²；0=不限")
+    g.add_argument("--ee-jerk", type=float, default=0.0,
+                   help="末端加加速度(jerk)上限 m/s³；配合 --ee-accel 把梯形曲线变成 S 形，"
+                        "起停无加速度阶跃；0=不限")
+    g.add_argument("--ee-rot-jerk", type=float, default=0.0,
+                   help="末端姿态加加速度上限 rad/s³；0=不限")
     g.add_argument("--state-timeout", type=float, default=0.25, help="状态超时秒数，超时不再下发")
     g.add_argument("--vx", type=float, default=0.0, help="行走线速度（一般保持 0）")
     g.add_argument("--vy", type=float, default=0.0)
@@ -447,6 +453,8 @@ def main(argv=None) -> int:
                          ee_rot_speed=args.ee_rot_speed,
                          ee_accel=args.ee_accel,
                          ee_rot_accel=args.ee_rot_accel,
+                         ee_jerk=args.ee_jerk,
+                         ee_rot_jerk=args.ee_rot_jerk,
                          state_timeout=args.state_timeout,
                          dry_run=args.dry_run and not args.sim,
                          velocity=(args.vx, args.vy, args.wz))
