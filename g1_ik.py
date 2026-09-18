@@ -1,0 +1,705 @@
+"""G1-29DoF 双臂正解(FK) + 反解(IK) —— 从 unitreerobotics/xr_teleoperate 抽取并独立化。
+
+抽取自（commit 817fb00, 2026-09-07）：
+  teleop/robot_control/robot_arm_ik.py   -> class G1_29_ArmIK
+  teleop/utils/weighted_moving_filter.py -> class WeightedMovingFilter
+
+相对原版的改动（都是为了脱离 xr_teleoperate 工程独立运行）：
+  1. 去掉 logging_mp / meshcat / pinocchio.visualize 依赖（改为 stdlib logging）。
+  2. 去掉 pin.rnea 力矩计算：ZMQ 6002 协议只接受 14 个关节角，没有 tau 字段。
+  3. 用 pin.buildModelFromUrdf + pin.buildReducedModel 代替 RobotWrapper.BuildFromURDF +
+     buildReducedRobot：只建运动学模型，**不需要 200MB 的 meshes 目录**。
+  4. 缓存加 URDF mtime/size 校验（原版缓存永不失效，改了 URDF 会静默加载旧模型）。
+  5. 增加 FK、腰部投影、关节限位查询等本工具需要的接口。
+  6. 增加一个不依赖 CasADi/IPOPT 的 DLS 迭代求解器作为回退与交叉验证。
+
+IK 的数学模型与权重完全保留原版（这样才能和 xr_teleoperate 的行为对得上）：
+
+    minimize  50*||e_pos||^2 + 1.0*||e_rot||^2 + w_reg*||q||^2 + 0.1*||q-q_ref||^2
+              （w_reg 默认 0 = 精度优先；原版为 0.02，会带来约 3mm 系统性偏置）
+    s.t.      lowerPositionLimit <= q <= upperPositionLimit          (URDF 关节限位)
+
+    e_pos = p_cur - p_target                (m)
+    e_rot = log3(R_cur @ R_target^T)        (rad, SO(3) 对数映射)
+    求解器: CasADi Opti + IPOPT (max_iter=30, acceptable_tol=5e-4, warm start)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import pickle
+import time
+from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
+import pinocchio as pin
+
+from joint_map import ARM_JOINT_NAMES, N_ARM
+
+logger = logging.getLogger("g1_ik")
+
+# ---------------------------------------------------------------------------
+# IK 权重
+#   W_TRANSLATION / W_ROTATION / W_SMOOTH 与原版一致；
+#   正则项默认取 0（精度优先）—— 原版 0.02 会让解朝零位偏，实测带来约 3mm 的
+#   系统性末端偏置（见 README §9 / docs/对照宇树源码.md §8）。
+#   需要复现原版手感时用 --w-reg 0.02。
+#   注：w_reg=0 时零空间锚定由平滑项 0.1*||q-q_ref||² 承担（q_ref = 本帧实测角），
+#   即"停在当前构型"，比原版"朝零位拉"更可预测，且不会漂移（已实测）。
+# ---------------------------------------------------------------------------
+W_TRANSLATION = 50.0     # 位置误差权重（原版值）
+W_ROTATION = 1.0         # 姿态误差权重（原版值）
+W_REGULARIZATION = 0.0   # 正则项权重（**本工程默认 0 = 精度优先**；原版为 0.02）
+W_REGULARIZATION_UNITREE = 0.02   # xr_teleoperate 原值，供对照/复现
+W_SMOOTH = 0.1           # 平滑项：抑制关节抖动（原版值）
+
+# 锁定的关节（腿 12 + 腰 3 + 手指 14），G1-29 手臂链只剩 14 个自由度
+LOCKED_JOINT_NAMES = [
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+    "left_hand_thumb_0_joint", "left_hand_thumb_1_joint", "left_hand_thumb_2_joint",
+    "left_hand_middle_0_joint", "left_hand_middle_1_joint",
+    "left_hand_index_0_joint", "left_hand_index_1_joint",
+    "right_hand_thumb_0_joint", "right_hand_thumb_1_joint", "right_hand_thumb_2_joint",
+    "right_hand_index_0_joint", "right_hand_index_1_joint",
+    "right_hand_middle_0_joint", "right_hand_middle_1_joint",
+]
+
+# 手臂链在 pelvis 之后的“根参考帧”所挂的关节：用它定义 腰部->手臂 的变换 A
+ARM_CHAIN_ROOT_JOINT = "left_shoulder_pitch_joint"
+
+
+# ---------------------------------------------------------------------------
+# 平滑滤波（原样移植 teleop/utils/weighted_moving_filter.py，去掉 matplotlib）
+# ---------------------------------------------------------------------------
+class WeightedMovingFilter:
+    """加权滑动平均：weights=[0.4,0.3,0.2,0.1] -> 最新一帧权重最大。
+
+    窗口 4 帧 @ 50Hz 时群延迟约 1 帧（20ms），只做时间平滑，不做限速。
+    """
+
+    def __init__(self, weights: Sequence[float], data_size: int = N_ARM):
+        self._window_size = len(weights)
+        self._weights = np.array(weights, dtype=float)
+        assert np.isclose(np.sum(self._weights), 1.0), "weights 之和必须为 1.0"
+        self._data_size = int(data_size)
+        self._filtered_data = np.zeros(self._data_size)
+        self._data_queue: List[np.ndarray] = []
+
+    def _apply_filter(self) -> np.ndarray:
+        if len(self._data_queue) < self._window_size:
+            return self._data_queue[-1]
+        data_array = np.array(self._data_queue)
+        return np.sum(data_array * self._weights[::-1, None], axis=0)
+
+    def add_data(self, new_data: np.ndarray) -> None:
+        new_data = np.asarray(new_data, dtype=float).reshape(-1)
+        assert len(new_data) == self._data_size, \
+            f"滤波输入长度应为 {self._data_size}，实际 {len(new_data)}"
+        if len(self._data_queue) > 0 and np.array_equal(new_data, self._data_queue[-1]):
+            return  # 与上一帧完全相同则跳过，避免静止时把队列灌满
+        if len(self._data_queue) >= self._window_size:
+            self._data_queue.pop(0)
+        self._data_queue.append(new_data)
+        self._filtered_data = self._apply_filter()
+
+    @property
+    def filtered_data(self) -> np.ndarray:
+        return self._filtered_data
+
+    def reset(self) -> None:
+        self._data_queue.clear()
+        self._filtered_data = np.zeros(self._data_size)
+
+
+# ---------------------------------------------------------------------------
+# 模型：FK + 坐标系变换
+# ---------------------------------------------------------------------------
+class G1ArmModel:
+    """G1-29 双臂运动学模型。
+
+    两套模型：
+      full     : 完整 43 自由度（腿12 + 腰3 + 左臂7 + 左手7 + 右臂7 + 右手7）
+      reduced  : 锁掉腿/腰/手指后只剩 14 个手臂关节（与 IK 的 q 维度一致）
+
+    坐标系约定（非常重要）：
+      "locked 坐标系" = reduced 模型的基座，等价于「腰关节全部为 0 时的 pelvis 系」。
+      "pelvis 坐标系" = URDF 根 link(pelvis)，即机器人本体坐标系；x 前, y 左, z 上。
+
+      实测腰角不为 0 时，两者的关系是纯刚体变换（已数值验证，误差 ~1e-16）：
+          A  = FK_full(腰=实测值) 中 ARM_CHAIN_ROOT_JOINT 的位姿
+          A0 = FK_full(腰=0)      中同一个关节的位姿（常量）
+          正解:  T_pelvis = A @ inv(A0) @ T_locked
+          反解:  T_locked = A0 @ inv(A) @ T_pelvis
+    """
+
+    def __init__(self, urdf_path: str, ee_offset: float = 0.05,
+                 cache_dir: Optional[str] = None):
+        self.urdf_path = urdf_path
+        self.ee_offset = float(ee_offset)
+        self.cache_dir = cache_dir
+
+        self.full_model = pin.buildModelFromUrdf(urdf_path)
+        if self.full_model.nq != 43:
+            logger.warning("URDF 自由度 %d != 43，本工具按 G1-29DoF(g1_body29_hand14.urdf) 设计",
+                           self.full_model.nq)
+
+        self.model = self._build_reduced(urdf_path, ee_offset)
+        if self.model.nq != N_ARM:
+            raise RuntimeError(f"缩链后自由度 {self.model.nq} != {N_ARM}，URDF 与 G1-29 不匹配")
+
+        self.data = self.model.createData()
+        self.full_data = self.full_model.createData()
+
+        self.L_ee_id = self.model.getFrameId("L_ee")
+        self.R_ee_id = self.model.getFrameId("R_ee")
+
+        # 腰部投影用：手臂链根参考帧（腰之后）
+        self.root_joint_id = self.full_model.getJointId(ARM_CHAIN_ROOT_JOINT)
+        self.A0 = self._fk_full_frame(pin.neutral(self.full_model), self.root_joint_id)
+
+        # 关节限位（URDF）
+        self.q_lower = np.array(self.model.lowerPositionLimit, dtype=float).copy()
+        self.q_upper = np.array(self.model.upperPositionLimit, dtype=float).copy()
+
+    # ---------------- 构建 / 缓存 ----------------
+    def _build_reduced(self, urdf_path: str, ee_offset: float) -> pin.Model:
+        def build() -> pin.Model:
+            full = pin.buildModelFromUrdf(urdf_path)
+            missing = [n for n in LOCKED_JOINT_NAMES if not full.existJointName(n)]
+            if missing:
+                raise RuntimeError(f"URDF 缺少待锁定关节: {missing}")
+            lock_ids = [full.getJointId(n) for n in LOCKED_JOINT_NAMES]
+            reduced = pin.buildReducedModel(full, lock_ids, pin.neutral(full))
+            for side, joint in (("L", "left_wrist_yaw_joint"), ("R", "right_wrist_yaw_joint")):
+                reduced.addFrame(pin.Frame(
+                    f"{side}_ee", reduced.getJointId(joint),
+                    pin.SE3(np.eye(3), np.array([ee_offset, 0.0, 0.0])),
+                    pin.FrameType.OP_FRAME))
+            return reduced
+
+        if not self.cache_dir:
+            return build()
+        cache_path = os.path.join(self.cache_dir, f"_model_cache_ee{ee_offset:g}.pkl")
+        stamp = {"mtime": os.path.getmtime(urdf_path), "size": os.path.getsize(urdf_path)}
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "rb") as f:
+                    blob = pickle.load(f)
+                if blob.get("stamp") == stamp:
+                    logger.info("加载模型缓存 %s", cache_path)
+                    return blob["model"]
+                logger.info("URDF 已变化，重建模型缓存")
+            except Exception as exc:  # 缓存坏了就重建，不影响使用
+                logger.warning("模型缓存不可用(%s)，重建", exc)
+        model = build()
+        try:
+            with open(cache_path, "wb") as f:
+                pickle.dump({"stamp": stamp, "model": model}, f)
+        except Exception as exc:
+            logger.warning("写模型缓存失败: %s", exc)
+        return model
+
+    # ---------------- 正解 ----------------
+    def fk(self, q14: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
+        """正解（locked 坐标系）。返回 (T_L, T_R) 4x4。"""
+        q = np.asarray(q14, dtype=float).reshape(self.model.nq)
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+        return (self.data.oMf[self.L_ee_id].homogeneous.copy(),
+                self.data.oMf[self.R_ee_id].homogeneous.copy())
+
+    def _fk_full_frame(self, q_full: np.ndarray, frame_or_joint_id: int,
+                       is_joint: bool = True) -> np.ndarray:
+        pin.forwardKinematics(self.full_model, self.full_data, q_full)
+        pin.updateFramePlacements(self.full_model, self.full_data)
+        # 用单参数版 getFrameId，兼容 pinocchio 3.1(conda-forge) 与 3.9(pip)
+        fid = (self.full_model.getFrameId(self.full_model.names[frame_or_joint_id])
+               if is_joint else frame_or_joint_id)
+        return self.full_data.oMf[fid].homogeneous.copy()
+
+    def waist_transform(self, q_waist3: Optional[Sequence[float]]) -> np.ndarray:
+        """实测腰角 -> A（4x4）。q_waist3 为 None/全 0 时返回 A0。"""
+        if q_waist3 is None:
+            return self.A0.copy()
+        q_full = pin.neutral(self.full_model)
+        q_full[12:15] = np.asarray(q_waist3, dtype=float).reshape(3)
+        return self._fk_full_frame(q_full, self.root_joint_id)
+
+    def fk_pelvis(self, q14: Sequence[float],
+                  q_waist3: Optional[Sequence[float]] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """正解到 pelvis 坐标系（用实测腰角修正）。"""
+        A = self.waist_transform(q_waist3)
+        T = A @ np.linalg.inv(self.A0)
+        T_L, T_R = self.fk(q14)
+        return T @ T_L, T @ T_R
+
+    def pelvis_to_locked(self, T_pelvis: np.ndarray,
+                         q_waist3: Optional[Sequence[float]] = None) -> np.ndarray:
+        """把 pelvis 系下的目标位姿换算到 locked 坐标系（IK 求解用）。"""
+        if q_waist3 is None:
+            return np.asarray(T_pelvis, dtype=float).copy()
+        A = self.waist_transform(q_waist3)
+        return self.A0 @ np.linalg.inv(A) @ np.asarray(T_pelvis, dtype=float)
+
+    # ---------------- 其它 ----------------
+    def neutral(self) -> np.ndarray:
+        return np.zeros(self.model.nq)
+
+    def clamp(self, q14: Sequence[float]) -> np.ndarray:
+        return np.clip(np.asarray(q14, dtype=float).reshape(-1), self.q_lower, self.q_upper)
+
+    def in_limits(self, q14: Sequence[float], tol: float = 1e-6) -> bool:
+        q = np.asarray(q14, dtype=float).reshape(-1)
+        return bool(np.all(q >= self.q_lower - tol) and np.all(q <= self.q_upper + tol))
+
+    def limits_table(self) -> str:
+        lines = ["  idx  关节名                          下界      上界"]
+        for i, name in enumerate(ARM_JOINT_NAMES):
+            lines.append(f"  {i:>3}  {name:<30} {self.q_lower[i]:>8.4f}  {self.q_upper[i]:>8.4f}")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
+def make_pose(position: Sequence[float], rotation: Optional[np.ndarray] = None) -> np.ndarray:
+    T = np.eye(4)
+    T[:3, 3] = np.asarray(position, dtype=float).reshape(3)
+    if rotation is not None:
+        T[:3, :3] = np.asarray(rotation, dtype=float).reshape(3, 3)
+    return T
+
+
+def rpy_to_rotation(rpy: Sequence[float]) -> np.ndarray:
+    r, p, y = (float(v) for v in rpy)
+    cr, sr, cp, sp, cy, sy = np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(y), np.sin(y)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def rotation_to_rpy(R: np.ndarray) -> np.ndarray:
+    """旋转矩阵 -> rpy（ZYX 约定，与 pin.rpy.matrixToRpy 一致）。"""
+    return np.asarray(pin.rpy.matrixToRpy(np.asarray(R, dtype=float).reshape(3, 3)))
+
+
+def pose_error(T_cur: np.ndarray, T_des: np.ndarray) -> Tuple[float, float, np.ndarray]:
+    """返回 (位置误差 m, 姿态误差 rad, 6维误差向量)。"""
+    dp = np.asarray(T_cur)[:3, 3] - np.asarray(T_des)[:3, 3]
+    dR = np.asarray(T_cur)[:3, :3] @ np.asarray(T_des)[:3, :3].T
+    drot = pin.log3(dR)
+    return float(np.linalg.norm(dp)), float(np.linalg.norm(drot)), np.concatenate([dp, drot])
+
+
+def log3_error(R_cur: np.ndarray, R_des: np.ndarray) -> np.ndarray:
+    """SO(3) 相对旋转的对数映射（世界系）。θ≈π 时 pin.log3 可能退化，这里做有限性兜底。"""
+    v = np.asarray(pin.log3(np.asarray(R_cur) @ np.asarray(R_des).T), dtype=float).reshape(3)
+    if not np.isfinite(v).all():
+        logger.warning("log3 出现非有限值（目标与当前姿态相差约 180°），本次按零旋转误差处理")
+        return np.zeros(3)
+    return v
+
+
+# ---------------------------------------------------------------------------
+# 反解求解器 1：CasADi + IPOPT（忠实移植 xr_teleoperate 的实现）
+# ---------------------------------------------------------------------------
+class ArmIKCasadi:
+    """原版算法：把双臂 IK 写成带限位约束的非线性最小二乘，交给 IPOPT。
+
+    目标位姿用 locked 坐标系（控制器负责 pelvis <-> locked 换算）。
+    唯一与本工程默认值的差异：正则项权重默认 0（原版 0.02），见文件头说明。
+    """
+
+    name = "casadi-ipopt"
+
+    def __init__(self, model: G1ArmModel,
+                 max_iter: int = 30, warm_start: bool = True,
+                 print_time: bool = False, smooth_ref: str = "measured",
+                 w_translation: Optional[float] = None, w_rotation: Optional[float] = None,
+                 w_regularization: Optional[float] = None, w_smooth: Optional[float] = None,
+                 tol: float = 1e-4, acceptable_tol: float = 5e-4):
+        """smooth_ref: 平滑项 0.1*||q - q_ref||² 的参考量
+             "measured" —— q_ref = 本帧传入的实测关节角（**与 xr_teleoperate 完全一致**：
+                           原版每帧 self.init_data = current_lr_arm_motor_q，
+                           并把 var_q_last 也设成它）
+             "previous" —— q_ref = 上一帧求解结果（更经典的"命令时间平滑"）
+        """
+        if smooth_ref not in ("measured", "previous"):
+            raise ValueError("smooth_ref 只能是 measured / previous")
+        self.smooth_ref = smooth_ref
+        # 权重可覆盖。位置/姿态/平滑项默认与原版一致；正则项默认 0（精度优先），
+        # 想要 xr_teleoperate 原版行为请传 w_regularization=W_REGULARIZATION_UNITREE
+        self.w_translation = W_TRANSLATION if w_translation is None else float(w_translation)
+        self.w_rotation = W_ROTATION if w_rotation is None else float(w_rotation)
+        self.w_regularization = W_REGULARIZATION if w_regularization is None else float(w_regularization)
+        self.w_smooth = W_SMOOTH if w_smooth is None else float(w_smooth)
+        import casadi
+        import pinocchio.casadi as cpin
+
+        # xr_teleoperate 依赖 pinocchio.casadi 的这几个接口；缺失时给出可执行的提示，
+        # 而不是在几十行之后抛一个看不懂的 AttributeError。
+        for attr in ("Model", "framesForwardKinematics", "log3"):
+            if not hasattr(cpin, attr):
+                raise RuntimeError(
+                    f"pinocchio.casadi 缺少 {attr}（本工程与 xr_teleoperate 的算法需要它）。"
+                    f"请安装 conda-forge 版：conda install -c conda-forge pinocchio casadi")
+
+        self.casadi = casadi
+        self.model = model
+        rm = model.model
+
+        self.cmodel = cpin.Model(rm)
+        self.cdata = self.cmodel.createData()
+
+        self.cq = casadi.SX.sym("q", rm.nq, 1)
+        self.cTf_l = casadi.SX.sym("tf_l", 4, 4)
+        self.cTf_r = casadi.SX.sym("tf_r", 4, 4)
+        cpin.framesForwardKinematics(self.cmodel, self.cdata, self.cq)
+
+        self.L_hand_id = rm.getFrameId("L_ee")
+        self.R_hand_id = rm.getFrameId("R_ee")
+
+        self.translational_error = casadi.Function(
+            "translational_error",
+            [self.cq, self.cTf_l, self.cTf_r],
+            [casadi.vertcat(
+                self.cdata.oMf[self.L_hand_id].translation - self.cTf_l[:3, 3],
+                self.cdata.oMf[self.R_hand_id].translation - self.cTf_r[:3, 3])])
+        self.rotational_error = casadi.Function(
+            "rotational_error",
+            [self.cq, self.cTf_l, self.cTf_r],
+            [casadi.vertcat(
+                cpin.log3(self.cdata.oMf[self.L_hand_id].rotation @ self.cTf_l[:3, :3].T),
+                cpin.log3(self.cdata.oMf[self.R_hand_id].rotation @ self.cTf_r[:3, :3].T))])
+
+        self.opti = casadi.Opti()
+        self.var_q = self.opti.variable(rm.nq)
+        self.var_q_last = self.opti.parameter(rm.nq)
+        self.param_tf_l = self.opti.parameter(4, 4)
+        self.param_tf_r = self.opti.parameter(4, 4)
+
+        self.translational_cost = casadi.sumsqr(
+            self.translational_error(self.var_q, self.param_tf_l, self.param_tf_r))
+        self.rotation_cost = casadi.sumsqr(
+            self.rotational_error(self.var_q, self.param_tf_l, self.param_tf_r))
+        self.regularization_cost = casadi.sumsqr(self.var_q)
+        self.smooth_cost = casadi.sumsqr(self.var_q - self.var_q_last)
+
+        self.opti.subject_to(self.opti.bounded(
+            rm.lowerPositionLimit, self.var_q, rm.upperPositionLimit))
+        self.opti.minimize(self.w_translation * self.translational_cost
+                           + self.w_rotation * self.rotation_cost
+                           + self.w_regularization * self.regularization_cost
+                           + self.w_smooth * self.smooth_cost)
+
+        opts = {
+            "expand": True,
+            "detect_simple_bounds": True,
+            "calc_lam_p": False,      # 规避 CasADi 的 "NaN detected" 问题
+            "print_time": print_time,
+            "ipopt.sb": "yes",
+            "ipopt.print_level": 0,
+            "ipopt.max_iter": int(max_iter),
+            "ipopt.tol": float(tol),
+            "ipopt.acceptable_tol": float(acceptable_tol),
+            "ipopt.acceptable_iter": 5,
+            "ipopt.warm_start_init_point": "yes" if warm_start else "no",
+            "ipopt.derivative_test": "none",
+            "ipopt.jacobian_approximation": "exact",
+        }
+        self.opti.solver("ipopt", opts)
+
+        self.q_last = model.neutral()
+        self.last_status = "unknown"
+        self.last_ok = False
+        self.last_iters: Optional[int] = None
+
+        # ---- 正解：与 xr_teleoperate 同样的做法，用 cdata.oMf 的符号表达式
+        #      再包成 casadi.Function。这样正解与反解用的是**同一个符号模型**，
+        #      不存在"正解一套模型、反解另一套模型"的不一致。
+        self.fk_fun = self._build_fk_function()
+        # 残差 Function（原版 translational_error / rotational_error 的直接复用）
+        self.residual_fun = casadi.Function(
+            "ee_residual", [self.cq, self.cTf_l, self.cTf_r],
+            [casadi.vertcat(self.translational_error(self.cq, self.cTf_l, self.cTf_r),
+                            self.rotational_error(self.cq, self.cTf_l, self.cTf_r))])
+
+    # ---------------- 正解（符号版，宇树同款） ----------------
+    def _build_fk_function(self):
+        """oMf[L_ee]/oMf[R_ee] 的符号表达式 -> casadi.Function，输出两个 4x4 齐次矩阵(列优先展平)。"""
+        casadi = self.casadi
+
+        def homog(placement):
+            R = placement.rotation
+            p = placement.translation
+            return casadi.vertcat(casadi.hcat([R, p]), casadi.DM([[0.0, 0.0, 0.0, 1.0]]))
+
+        T_L = homog(self.cdata.oMf[self.L_hand_id])
+        T_R = homog(self.cdata.oMf[self.R_hand_id])
+        return casadi.Function("fk_ee", [self.cq],
+                               [casadi.reshape(T_L, 16, 1), casadi.reshape(T_R, 16, 1)])
+
+    def fk(self, q14: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
+        """正解（locked 坐标系）。返回两个 4x4。用的是 CasADi 符号模型，与 IK 完全同源。"""
+        out_l, out_r = self.fk_fun(np.asarray(q14, dtype=float).reshape(self.model.model.nq, 1))
+        return (np.array(out_l).reshape(4, 4, order="F"),
+                np.array(out_r).reshape(4, 4, order="F"))
+
+    def residual(self, q14: Sequence[float], T_L: np.ndarray, T_R: np.ndarray):
+        """用原版的 translational_error / rotational_error 直接算末端残差（6+6 维）。"""
+        r = np.array(self.residual_fun(
+            np.asarray(q14, dtype=float).reshape(self.model.model.nq, 1),
+            np.asarray(T_L, dtype=float), np.asarray(T_R, dtype=float))).reshape(-1)
+        return {"pos_L": r[0:3], "pos_R": r[3:6], "rot_L": r[6:9], "rot_R": r[9:12],
+                "pos_err": float(max(np.linalg.norm(r[0:3]), np.linalg.norm(r[3:6]))),
+                "rot_err": float(max(np.linalg.norm(r[6:9]), np.linalg.norm(r[9:12])))}
+
+    def verify_fk(self, samples: int = 5, tol: float = 1e-9, seed: int = 0) -> dict:
+        """交叉校验：CasADi 符号正解 vs Pinocchio 数值正解（应当逐元素一致）。"""
+        rng = np.random.default_rng(seed)
+        worst = 0.0
+        for _ in range(samples):
+            q = self.model.clamp(rng.uniform(-1.0, 1.0, self.model.model.nq))
+            T_L_c, T_R_c = self.fk(q)
+            T_L_n, T_R_n = self.model.fk(q)
+            worst = max(worst, float(np.abs(T_L_c - T_L_n).max()),
+                        float(np.abs(T_R_c - T_R_n).max()))
+        return {"samples": samples, "max_abs_diff": worst, "ok": worst < tol}
+
+    def solve(self, T_L: np.ndarray, T_R: np.ndarray,
+              q_init: Optional[Sequence[float]] = None) -> np.ndarray:
+        q_guess = self.model.neutral() if q_init is None else np.asarray(q_init, dtype=float)
+        self.opti.set_initial(self.var_q, q_guess)                     # 热启动（原版同）
+        self.opti.set_value(self.param_tf_l, np.asarray(T_L, dtype=float))
+        self.opti.set_value(self.param_tf_r, np.asarray(T_R, dtype=float))
+        q_ref = q_guess if self.smooth_ref == "measured" else self.q_last
+        self.opti.set_value(self.var_q_last, q_ref)                    # 平滑项参考量
+        self.last_iters = None
+        try:
+            self.opti.solve()
+            sol = np.array(self.opti.value(self.var_q)).reshape(-1)
+            self.last_ok, self.last_status = True, "ok"
+            stats = self.opti.stats()
+            iters = stats.get("iter_count") if isinstance(stats, dict) else None
+            self.last_iters = int(iters) if iters is not None else None
+        except Exception as exc:  # 不收敛：取 IPOPT 当前迭代点，别让整条链路崩掉
+            self.last_ok, self.last_status = False, f"ipopt: {exc}"
+            sol = np.array(self.opti.debug.value(self.var_q)).reshape(-1)
+        self.q_last = sol
+        return self.model.clamp(sol)
+
+    def reset(self) -> None:
+        self.q_last = self.model.neutral()
+
+
+# ---------------------------------------------------------------------------
+# 反解求解器 2：阻尼最小二乘 DLS（无 CasADi/IPOPT 依赖，用作回退与交叉验证）
+# ---------------------------------------------------------------------------
+class ArmIKDLS:
+    """Levenberg-Marquardt 迭代求解（阻尼最小二乘），只用 Pinocchio 解析雅可比。
+
+    不是 xr_teleoperate 的原算法，而是在没有 pinocchio.casadi / IPOPT 时的回退，
+    同时可用来交叉验证 IPOPT 的解是否合理。
+
+    **与 CasADi/IPOPT 版的语义差异（重要）**：本求解器只把"末端位姿误差"作为主目标
+    （行权重 sqrt(50):1 与上一版一致），对关节空间只有一个很弱的零空间牵引；
+    而 IPOPT 版是原版代价的完整形式，含 0.02*||q||² 正则项 —— 该项会让解朝零位偏，
+    实测带来约 3mm 的系统性位置偏置。所以 DLS 的末端残差反而更小（亚毫米），
+    但**它不是 xr_teleoperate 的行为**。要复现原版请用 --solver casadi。
+
+    每次迭代：dq = J^T (J J^T + λ²I)^-1 e，λ 自适应（误差下降则减小、上升则增大）。
+    """
+
+    name = "dls"
+
+    def __init__(self, model: G1ArmModel, iterations: int = 30,
+                 damping: float = 1e-2, nullspace_gain: float = 0.02,
+                 tol_pos: float = 1e-4, tol_rot: float = 1e-3,
+                 max_step: float = 0.25, smooth_ref: str = "measured"):
+        self.model = model
+        self.iterations = int(iterations)
+        self.damping0 = float(damping)
+        self.nullspace_gain = float(nullspace_gain)
+        self.tol_pos = float(tol_pos)
+        self.tol_rot = float(tol_rot)
+        self.max_step = float(max_step)
+        self.smooth_ref = smooth_ref if smooth_ref in ("measured", "previous") else "measured"
+        self.q_last = model.neutral()
+        self.last_status = "unknown"
+        self.last_ok = False
+        self._jac_q: Optional[np.ndarray] = None
+
+        sqrt_w = np.sqrt([W_TRANSLATION] * 3 + [W_ROTATION] * 3)
+        self.row_scale = np.tile(sqrt_w, 2)          # 12 维任务的行权重
+
+    def _frame_jacobian(self, frame_id: int) -> np.ndarray:
+        # 注意：getFrameJacobian 依赖 data 里已算好的 joint Jacobians，
+        # 必须显式传 q 调 computeJointJacobians（forwardKinematics 不会刷新它，
+        # 否则拿到的是全零矩阵 —— 这个坑会让 DLS 完全不动）。
+        q = self._jac_q
+        pin.computeJointJacobians(self.model.model, self.model.data, q)
+        pin.updateFramePlacements(self.model.model, self.model.data)
+        return pin.getFrameJacobian(self.model.model, self.model.data, frame_id,
+                                    pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+
+    def _task(self, q: np.ndarray, targets) -> Tuple[np.ndarray, float, float, float]:
+        """返回 (加权误差向量, 加权误差范数, 位置误差 m, 姿态误差 rad)。"""
+        pin.forwardKinematics(self.model.model, self.model.data, q)
+        pin.updateFramePlacements(self.model.model, self.model.data)
+        errs, ep, er = [], 0.0, 0.0
+        for fid, T_des in targets:
+            T_cur = self.model.data.oMf[fid].homogeneous
+            dp = T_cur[:3, 3] - T_des[:3, 3]
+            drot = log3_error(T_cur[:3, :3], T_des[:3, :3])
+            ep = max(ep, float(np.linalg.norm(dp)))
+            er = max(er, float(np.linalg.norm(drot)))
+            errs.append(np.concatenate([dp, drot]))
+        e = np.concatenate(errs)
+        return e * self.row_scale, float(np.linalg.norm(e * self.row_scale)), ep, er
+
+    def solve(self, T_L: np.ndarray, T_R: np.ndarray,
+              q_init: Optional[Sequence[float]] = None) -> np.ndarray:
+        targets = [(self.model.L_ee_id, np.asarray(T_L, dtype=float)),
+                   (self.model.R_ee_id, np.asarray(T_R, dtype=float))]
+        q = self.model.clamp(self.model.neutral() if q_init is None
+                             else np.asarray(q_init, dtype=float).copy())
+        q_ref = q.copy() if self.smooth_ref == "measured" else self.q_last
+        e, cost, ep, er = self._task(q, targets)
+        lam = self.damping0
+        for _ in range(self.iterations):
+            if ep < self.tol_pos and er < self.tol_rot:
+                break
+            self._jac_q = q
+            J = np.vstack([self._frame_jacobian(fid) for fid, _ in targets]) * self.row_scale[:, None]
+            A = J @ J.T + lam ** 2 * np.eye(J.shape[0])
+            # errstate: 某些 BLAS(如 macOS Accelerate) 会在 matmul 内部置起浮点标志位，
+            # numpy 会把它当成"divide by zero/overflow"误报，这里屏蔽掉；
+            # 真正的数值问题由下面的 isfinite 检查兜底。
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                try:
+                    J_pinv = J.T @ np.linalg.inv(A)
+                except np.linalg.LinAlgError:
+                    lam = min(lam * 4.0, 1.0)
+                    continue
+            if not np.isfinite(J_pinv).all():
+                lam = min(lam * 4.0, 1.0)
+                continue
+            # e = [p_cur - p_des ; log3(R_cur @ R_des^T)] 是“当前相对目标”的误差，
+            # 要让末端朝目标运动，需要负号：J @ dq = p_des - p_cur = -dp。
+            dq = -(J_pinv @ e)
+            # 零空间里把关节往上一帧的解拉一点，抑制冗余漂移（很弱，不抢主任务）
+            dq += (np.eye(self.model.model.nq) - J_pinv @ J) @ (self.nullspace_gain * (q_ref - q))
+            step = float(np.linalg.norm(dq))
+            if step > self.max_step:
+                dq *= self.max_step / step
+            q_new = self.model.clamp(q + dq)
+            e_new, cost_new, ep_new, er_new = self._task(q_new, targets)
+            if cost_new < cost:          # 接受：减小阻尼，加速收敛
+                q, e, cost, ep, er = q_new, e_new, cost_new, ep_new, er_new
+                lam = max(lam * 0.5, 1e-4)
+            else:                        # 拒绝：加大阻尼，退化成梯度下降
+                lam = min(lam * 4.0, 1.0)
+        self.q_last = q
+        self.last_ok = ep < max(self.tol_pos * 10, 2e-3) and er < self.tol_rot * 10
+        self.last_status = f"res {ep * 1000:.2f}mm/{np.rad2deg(er):.2f}deg"
+        return q
+
+    def reset(self) -> None:
+        self.q_last = self.model.neutral()
+
+
+# ---------------------------------------------------------------------------
+# 工厂：按可用依赖自动选择求解器
+# ---------------------------------------------------------------------------
+_CASADI_WARNED = False
+
+
+def make_ik(model: G1ArmModel, solver: str = "auto", **kwargs):
+    """solver: auto | casadi | dls"""
+    global _CASADI_WARNED
+    solver = (solver or "auto").lower()
+    if solver in ("auto", "casadi"):
+        try:
+            ik = ArmIKCasadi(model, **{k: v for k, v in kwargs.items()
+                                       if k in ("max_iter", "warm_start", "print_time",
+                                                "smooth_ref", "w_translation", "w_rotation",
+                                                "w_regularization", "w_smooth", "tol",
+                                                "acceptable_tol")})
+            logger.info("IK 求解器: %s (IPOPT)", ik.name)
+            return ik
+        except Exception as exc:
+            if solver == "casadi":
+                raise
+            if not _CASADI_WARNED:
+                _CASADI_WARNED = True
+                logger.warning("CasADi/IPOPT 不可用(%s)，回退到 DLS 求解器。"
+                               "想要和 xr_teleoperate 完全一致的解，请装 conda-forge 的 "
+                               "pinocchio+casadi（见 README §2）", exc)
+    ik = ArmIKDLS(model, **{k: v for k, v in kwargs.items()
+                            if k in ("iterations", "damping", "nullspace_gain",
+                                     "tol_pos", "tol_rot", "max_step", "smooth_ref")})
+    logger.info("IK 求解器: %s", ik.name)
+    return ik
+
+
+# ---------------------------------------------------------------------------
+# 离线自检：FK -> IK -> FK 闭环
+# ---------------------------------------------------------------------------
+def self_test(model: G1ArmModel, ik, samples: int = 20, seed: int = 0,
+              verbose: bool = True, start: str = "neutral") -> dict:
+    """随机取可行关节角 -> FK 得目标 -> IK 回解 -> 比较末端位姿与关节角。
+
+    start="neutral"  : IK 从零位热启动（最严苛，等价于第一次调用）
+    start="perturbed": 从真值加噪声热启动（等价于正常跟踪过程）
+    start="exact"    : 从真值启动（只能验证 FK/IK 一致性，不能验证收敛能力）
+    """
+    rng = np.random.default_rng(seed)
+    lo = np.maximum(model.q_lower, -1.2)
+    hi = np.minimum(model.q_upper, 1.2)
+    res_pos, res_rot, q_err, times, limits_ok = [], [], [], [], []
+    for _ in range(samples):
+        q_true = rng.uniform(lo, hi)
+        T_L, T_R = model.fk(q_true)
+        if start == "neutral":
+            q_init = model.neutral()
+        elif start == "perturbed":
+            q_init = model.clamp(q_true + rng.normal(0.0, 0.1, model.model.nq))
+        else:
+            q_init = q_true
+        t0 = time.perf_counter()
+        q_sol = ik.solve(T_L, T_R, q_init)
+        times.append(time.perf_counter() - t0)
+        limits_ok.append(model.in_limits(q_sol))
+        L2, R2 = model.fk(q_sol)
+        p1, r1, _ = pose_error(L2, T_L)
+        p2, r2, _ = pose_error(R2, T_R)
+        res_pos.append(max(p1, p2))
+        res_rot.append(max(r1, r2))
+        q_err.append(float(np.max(np.abs(q_sol - q_true))))
+    out = {
+        "solver": ik.name,
+        "start": start,
+        "samples": samples,
+        "pos_err_mm_max": float(np.max(res_pos) * 1000),
+        "pos_err_mm_mean": float(np.mean(res_pos) * 1000),
+        "rot_err_deg_max": float(np.rad2deg(np.max(res_rot))),
+        "rot_err_deg_mean": float(np.rad2deg(np.mean(res_rot))),
+        "q_diff_rad_max": float(np.max(q_err)),
+        "in_limits": bool(all(limits_ok)),
+        "solve_ms_mean": float(np.mean(times) * 1000),
+        "solve_ms_max": float(np.max(times) * 1000),
+    }
+    if verbose:
+        print(f"[自检] 求解器 {out['solver']}, {samples} 组随机位姿, 热启动={start}")
+        print(f"  末端位置残差 : max {out['pos_err_mm_max']:.3f} mm, mean {out['pos_err_mm_mean']:.3f} mm")
+        print(f"  末端姿态残差 : max {out['rot_err_deg_max']:.3f} deg, mean {out['rot_err_deg_mean']:.3f} deg")
+        print(f"  关节角差(冗余解) : max {out['q_diff_rad_max']:.4f} rad")
+        print(f"  关节限位内     : {out['in_limits']}")
+        print(f"  单次求解耗时 : mean {out['solve_ms_mean']:.2f} ms, max {out['solve_ms_max']:.2f} ms")
+    return out

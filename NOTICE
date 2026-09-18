@@ -1,0 +1,14 @@
+本工程包含来自以下项目的代码与资产，遵循其原始许可：
+
+1. unitreerobotics/xr_teleoperate  (Apache License 2.0)
+   - teleop/robot_control/robot_arm_ik.py  -> g1_ik.py 中的 IK/FK 实现
+     （双臂 IK 的代价函数、权重、IPOPT 选项、末端 frame 定义均来自该项目）
+   - teleop/utils/weighted_moving_filter.py -> WeightedMovingFilter
+   - assets/g1/g1_body29_hand14.urdf        -> assets/g1/g1_body29_hand14.urdf
+   Copyright [2025] [HangZhou YuShu TECHNOLOGY CO.,LTD. ("Unitree Robotics")]
+
+2. lizqwerscott/unitree_rl_lab @ groot-control 分支
+   - deploy/include/groot/JointNameMap.h        -> joint_map.py 的关节名/顺序表
+   - deploy/include/groot/LowStateBroadcaster.h -> zmq_link.py 的 6001 协议实现
+   - deploy/include/groot/RemoteCommandReceiver.h -> zmq_link.py 的 6002 协议实现
+   - 参考副本保留为 assets/groot_JointNameMap.h.reference

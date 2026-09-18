@@ -1,0 +1,275 @@
+"""ZMQ 协议层：对接 unitree_rl_lab(groot-control) 的 6001/6002 两个端口。
+
+协议来源（逐条对照实现）：
+  deploy/include/groot/LowStateBroadcaster.h    -> 6001 PUB，广播 LowState JSON（上位机 SUB）
+  deploy/include/groot/RemoteCommandReceiver.h  -> 6002 PULL，接收 LeRobot action 帧（上位机 PUSH）
+  deploy/README.md §外部输入                     -> 字段与校验规则说明
+  deploy/robots/g1_29dof/config/config.yaml     -> 端口默认值 state_port=6001 / port=6002
+
+方向（**机器人在 bind，上位机只能 connect**）：
+
+    6001  PUB(bind) ──状态──▶ SUB(connect)   ← 读关节角走这条
+    6002  PULL(bind) ◀──指令── PUSH(connect)  ← 下发关节角走这条，**单向、无回执**
+
+两个必须记住的协议细节：
+  ① 6001 发的是**单帧裸 JSON 字符串，没有 ZMQ topic 前缀** -> SUB 必须 subscribe(b"")，
+     写 subscribe(b"rt/lowstate") 会一个字节都收不到。
+  ② 6002 的 timestamp 必须**严格大于**上一条被接受的包，否则整包被静默丢弃；
+     且一帧里 **14 个手臂关节必须全部给齐**，少一个也整包丢弃。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Dict, List, Optional, Sequence
+
+import numpy as np
+
+from joint_map import (ARM_LEROBOT_NAMES, ARM_START, N_ARM, REMOTE_AXIS_KEYS,
+                       SDK_JOINT_NAMES, arm_q_from_state, waist_q_from_state)
+
+logger = logging.getLogger("zmq_link")
+
+STATE_TOPIC = "rt/lowstate"      # JSON 内部字段，不是 ZMQ 订阅前缀
+MAX_JOINT_ABS = 3.2              # 6002 侧校验：|q| 超过 3.2 整包丢弃
+MAX_PAYLOAD = 16384              # 6002 侧校验：单帧上限
+
+
+# ---------------------------------------------------------------------------
+# 6001：读状态
+# ---------------------------------------------------------------------------
+class RobotStateSubscriber:
+    """订阅机器人 6001 端口（PUB）的 LowState 流。
+
+    - 只保留最新帧（RCVHWM=2），积压直接丢：这是"状态流"而不是可靠队列。
+    - JSON 里没有 tick / 序号字段，所以丢帧无法从协议层检测，只能看本地到达时间。
+    """
+
+    def __init__(self, robot_ip: str, port: int = 6001, rcvhwm: int = 2,
+                 connect: bool = True):
+        import zmq  # 延迟导入：--sim 模式无需 pyzmq
+        self.zmq = zmq
+        self.robot_ip = robot_ip
+        self.port = int(port)
+        self.ctx = zmq.Context.instance()
+        self.sock = self.ctx.socket(zmq.SUB)
+        self.sock.setsockopt(zmq.SUBSCRIBE, b"")      # ★ 协议没有 topic 前缀，必须订阅全部
+        self.sock.setsockopt(zmq.RCVHWM, int(rcvhwm))
+        self.sock.setsockopt(zmq.LINGER, 0)
+        if connect:
+            self.connect()
+
+        self.frames = 0
+        self.bad_frames = 0
+        self.last_rx: Optional[float] = None
+        self._rx_times: List[float] = []
+        self.last_topic: Optional[str] = None
+        self.last_mode_machine: Optional[int] = None
+        self.last_q29: Optional[np.ndarray] = None
+        self.last_dq29: Optional[np.ndarray] = None
+        self.last_tau29: Optional[np.ndarray] = None
+        self.last_imu_rpy: Optional[np.ndarray] = None
+
+    def connect(self) -> None:
+        endpoint = f"tcp://{self.robot_ip}:{self.port}"
+        self.sock.connect(endpoint)
+        logger.info("订阅状态流 %s (SUB, subscribe='')", endpoint)
+
+    # ---------------- 读一帧 ----------------
+    def read(self, timeout_ms: int = 200, drain: bool = True) -> Optional[dict]:
+        """取最新一帧（drain=True 时把积压在 socket 里的旧帧丢掉，只留最新的）。
+
+        返回 None 表示在这段时间内没有收到任何帧。
+        """
+        if self.sock.poll(timeout_ms) == 0:
+            return None
+        out = self._parse(self.sock.recv_string())
+        if drain:
+            # 最多再清 8 帧：始终让 q_meas 尽量接近"当前"
+            for _ in range(8):
+                if self.sock.poll(0) == 0:
+                    break
+                newer = self._parse(self.sock.recv_string())
+                if newer is not None:
+                    out = newer
+        return out
+
+    def _parse(self, payload: str) -> Optional[dict]:
+        self.last_rx = time.time()
+        try:
+            pkt = json.loads(payload)
+            data = pkt["data"]
+            motors = data["motor_state"]
+            n = len(motors)
+            if n < 29:
+                raise ValueError(f"motor_state 只有 {n} 项（应 >=29，协议固定 35 槽）")
+            self.last_topic = pkt.get("topic")
+            self.last_q29 = np.array([m["q"] for m in motors[:29]], dtype=float)
+            self.last_dq29 = np.array([m.get("dq", 0.0) for m in motors[:29]], dtype=float)
+            self.last_tau29 = np.array([m.get("tau_est", 0.0) for m in motors[:29]], dtype=float)
+            imu = data.get("imu_state", {})
+            self.last_imu_rpy = np.array(imu.get("rpy", [0.0, 0.0, 0.0]), dtype=float)
+            self.last_mode_machine = data.get("mode_machine")
+            self.frames += 1
+            self._rx_times.append(self.last_rx)
+            if len(self._rx_times) > 100:
+                self._rx_times.pop(0)
+            return {"q29": self.last_q29, "dq29": self.last_dq29, "tau29": self.last_tau29,
+                    "imu_rpy": self.last_imu_rpy, "mode_machine": self.last_mode_machine,
+                    "rx_time": self.last_rx, "topic": self.last_topic}
+        except Exception as exc:
+            self.bad_frames += 1
+            logger.warning("状态帧解析失败(%s)，原始前 160 字节: %r", exc, payload[:160])
+            return None
+
+    # ---------------- 便利接口 ----------------
+    def q_arm(self) -> Optional[np.ndarray]:
+        """14 维手臂关节角（顺序 = IK 的 q = SDK 15..28）。"""
+        return None if self.last_q29 is None else np.array(arm_q_from_state(self.last_q29))
+
+    def q_waist(self) -> Optional[np.ndarray]:
+        """3 维腰关节角 [yaw, roll, pitch]（电机 12/13/14）。"""
+        return None if self.last_q29 is None else np.array(waist_q_from_state(self.last_q29))
+
+    def age(self) -> float:
+        """距最近一帧的秒数；从未收到过返回 inf。"""
+        return float("inf") if self.last_rx is None else time.time() - self.last_rx
+
+    def rate(self) -> float:
+        """最近约 100 帧的平均接收频率 Hz（没收到足够帧时返回 nan）。"""
+        if len(self._rx_times) < 2:
+            return float("nan")
+        span = self._rx_times[-1] - self._rx_times[0]
+        return float("nan") if span <= 0 else (len(self._rx_times) - 1) / span
+
+    def stats(self) -> str:
+        return (f"frames={self.frames} bad={self.bad_frames} rate={self.rate():.1f}Hz "
+                f"age={self.age() * 1000:.1f}ms topic={self.last_topic} "
+                f"mode_machine={self.last_mode_machine}")
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 6002：下指令
+# ---------------------------------------------------------------------------
+class ArmCommandPublisher:
+    """向机器人 6002 端口（PULL）推送 LeRobot action 帧。
+
+    协议要点（RemoteCommandReceiver.h:29-82）：
+      - 顶层必须有 "action"(map) 与 "timestamp"(number)
+      - action 里 14 个手臂关节按名字匹配（键名 "<LeRobot名>.q"，大小写不敏感）
+      - 每个值必须有限且 |v| <= 3.2；**14 个必须给齐**，否则整包丢弃
+      - timestamp 必须严格大于上一条被接受的包（无 seq 字段）
+      - 单帧 <= 16384 字节
+      - 摇杆轴 remote.lx/ly/rx/ry 可选，缺失按 0；映射 vx=ly, vy=-lx, wz=-rx
+      - 只有机器人处于 VLA 模式(键盘 3 / LB+A)时该流才会真正作用到手臂
+    """
+
+    def __init__(self, robot_ip: str, port: int = 6002, connect: bool = True):
+        import zmq
+        self.zmq = zmq
+        self.robot_ip = robot_ip
+        self.port = int(port)
+        self.ctx = zmq.Context.instance()
+        self.sock = self.ctx.socket(zmq.PUSH)
+        self.sock.setsockopt(zmq.SNDHWM, 2)
+        self.sock.setsockopt(zmq.LINGER, 0)
+        if connect:
+            self.connect()
+        self.sent = 0
+        self.rejected = 0
+        self._last_ts = 0.0
+        self.last_payload: Optional[str] = None
+
+    def connect(self) -> None:
+        endpoint = f"tcp://{self.robot_ip}:{self.port}"
+        self.sock.connect(endpoint)
+        logger.info("连接指令通道 %s (PUSH)", endpoint)
+
+    @staticmethod
+    def velocity_to_axes(vx: float = 0.0, vy: float = 0.0, wz: float = 0.0) -> Dict[str, float]:
+        """(vx, vy, wz) -> 协议摇杆轴。映射来自 RemoteCommandReceiver.h:55-56 的反解。"""
+        return {"remote.lx": -float(vy), "remote.ly": float(vx),
+                "remote.rx": -float(wz), "remote.ry": 0.0}
+
+    def build_frame(self, q14: Sequence[float],
+                    axes: Optional[Dict[str, float]] = None) -> str:
+        q = np.asarray(q14, dtype=float).reshape(-1)
+        if q.size != N_ARM:
+            raise ValueError(f"必须一次给全 {N_ARM} 个手臂关节，实际 {q.size} 个")
+        if not np.isfinite(q).all():
+            raise ValueError("关节角含 NaN/Inf")
+        if np.abs(q).max() > MAX_JOINT_ABS:
+            raise ValueError(f"|q| 超过协议上限 {MAX_JOINT_ABS}: max={np.abs(q).max():.3f}")
+        action = {f"{name}.q": float(v) for name, v in zip(ARM_LEROBOT_NAMES, q)}
+        for key in REMOTE_AXIS_KEYS:
+            action[key] = 0.0
+        if axes:
+            for key, value in axes.items():
+                if key in REMOTE_AXIS_KEYS:
+                    action[key] = float(value)
+        # timestamp 严格递增：即使本机时钟回拨也不会被判成 stale
+        ts = max(time.time(), self._last_ts + 1e-4)
+        frame = {"cmd": "action", "action": action, "timestamp": ts}
+        payload = json.dumps(frame, separators=(",", ":"))
+        if len(payload) > MAX_PAYLOAD:
+            raise ValueError(f"帧长 {len(payload)} 超过协议上限 {MAX_PAYLOAD}")
+        return payload
+
+    def send(self, q14: Sequence[float], axes: Optional[Dict[str, float]] = None,
+             dry_run: bool = False) -> str:
+        payload = self.build_frame(q14, axes)
+        self.last_payload = payload
+        if dry_run:
+            self.sent += 1
+            return payload
+        try:
+            self.sock.send_string(payload, self.zmq.NOBLOCK)
+            self._last_ts = json.loads(payload)["timestamp"]
+            self.sent += 1
+        except self.zmq.Again:
+            self.rejected += 1      # 没连上或发送队列满：丢掉这一帧，不要阻塞控制循环
+        except Exception as exc:
+            self.rejected += 1
+            logger.warning("发送失败: %s", exc)
+        return payload
+
+    def stats(self) -> str:
+        return f"sent={self.sent} dropped={self.rejected}"
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 诊断
+# ---------------------------------------------------------------------------
+def diagnosis(sub: RobotStateSubscriber, timeout_s: float = 3.0) -> str:
+    """在收不到状态时给出可执行的自查清单。"""
+    deadline = time.time() + timeout_s
+    got = None
+    while time.time() < deadline:
+        got = sub.read(timeout_ms=200)
+        if got:
+            break
+    if got:
+        return "状态流正常"
+    return (
+        f"在 {timeout_s:.0f}s 内没有收到 {sub.robot_ip}:{sub.port} 的任何帧。请依次确认：\n"
+        "  1) 机器人 FSM 是否已进入 Groot 状态？（只有 enter() 里才会 bind 6001/6002；\n"
+        "     groot-control 里按 RB+X，或键盘进入 Groot）\n"
+        f"  2) 网络能否通：ping {sub.robot_ip}；上位机与机器人是否同网段\n"
+        "  3) 端口有没有被占用：机器人上 ss -lntp | grep 600\n"
+        "  4) 订阅前缀是否为空（代码里已是 subscribe(b'')；若你改过，请改回）\n"
+        "  5) 是否用了 --sim（--sim 不连机器人）"
+    )

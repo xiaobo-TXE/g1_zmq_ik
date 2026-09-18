@@ -1,0 +1,17 @@
+# 硬依赖（跑正解/反解 + ZMQ 必需）
+numpy>=1.22
+pyzmq>=24
+
+# ---------------------------------------------------------------------------
+# 下面两个请优先用 conda-forge 安装（唯一能一起拿到 pinocchio + pinocchio.casadi 的途径）：
+#
+#   conda create -n g1ik python=3.10 pinocchio=3.1.0 casadi numpy=1.26.4 -c conda-forge
+#   conda activate g1ik
+#   pip install pyzmq
+#
+# 注意：PyPI 的 pin 轮子【不含】pinocchio.casadi，pip 装完只能跑 DLS 回退求解器
+#      （功能可用，但解不会和 xr_teleoperate 的 IPOPT 逐位一致）。
+#      详见 README §3。
+#
+# pin>=3.1.0
+# casadi>=3.6
