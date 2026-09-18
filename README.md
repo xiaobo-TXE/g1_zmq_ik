@@ -14,6 +14,7 @@ G1 双臂：**给一个目标位置 → ZMQ 读当前关节角 → 正解出当�
 ```
  ① 目标位置（pelvis 系 x前 y左 z上，单位 m）
       │   来源：命令行 --pos / 交互输入 p x y z / 内置轨迹 --demo circle
+      │        / ZMQ 6003 端口持续推送（外部程序可以随时一直下发，最新优先）
       ▼
  ② ZMQ 6001 订阅 LowState（机器人 PUB，约 500Hz）
       │   motor_state[15..28].q  →  14 维手臂关节角 q_meas
@@ -151,7 +152,53 @@ h            打印当前实测/目标/误差          j   打印当前下发的
 ?            帮助                            q   退出
 ```
 
-### 2.4 想先不接机器人试一遍
+### 2.4 持续下发目标（外部程序接口，ZMQ 6003）
+
+控制循环本身就是**持续在跑**的（默认 50Hz：读关节角 → 正解 → 反解 → 下发），
+所以机器人一直在收新的关节命令。如果你想让**别的程序**按自己的节奏一直改目标，
+往主程序的 **6003 端口推目标**即可 —— 主程序 bind `PULL`，你的发送端 `PUSH` connect 过来。
+
+帧格式（JSON，只认这几个字段，多余的忽略；`pos` 与 `delta` 二选一）：
+
+```json
+{"pos":   [0.33, -0.22, 0.13]}                 // 绝对位置（pelvis 系, m）
+{"delta": [0.005, 0.0, 0.0]}                   // 相对"上一条目标"的增量
+{"rpy":   [0.0, 0.0, 0.0]}                     // 可选；不给就保持当前锁定的末端朝向
+{"arm":   "right"}                             // 可选：right/left/both，默认用启动时的 --arm
+{"pos_left": [...], "pos_right": [...]}        // 可选：一帧同时给两条手臂
+```
+
+规则：**最新优先**（积压时丢旧帧）、没有新目标时**保持上一条目标**、不合法帧只丢弃并告警。
+
+现成的发送工具：
+
+```bash
+# 一次性：把右臂移到某个位置（发一帧就退出）
+python tools/send_target.py --mode pos --pos 0.33 -0.22 0.13
+
+# 一次性：相对上一条目标推 5mm（反复调用就是一步步挪）
+python tools/send_target.py --mode delta --delta 0.005 0 0
+
+# 连续：按 30Hz 一直推圆轨迹
+python tools/send_target.py --mode circle --rate 30 --radius 0.05 --period 4
+
+# 连续：按固定速度直线推进（位移速度 = delta × rate = 0.001×50 = 5cm/s）
+python tools/send_target.py --mode delta --delta 0.001 0 0 --repeat 500 --rate 50
+
+# 回放 CSV 轨迹（每行 t,x,y,z[,r,p,y]）
+python tools/send_target.py --mode file --file traj.csv --rate 50
+```
+
+你有自己程序的话，直接按上面格式 PUSH 就行（`--target-port 0` 可关闭这个端口）：
+
+```python
+import zmq, json
+s = zmq.Context().socket(zmq.PUSH); s.connect("tcp://127.0.0.1:6003")
+for p in my_trajectory:                      # 想发多快就发多快
+    s.send_string(json.dumps({"pos": list(p)}))
+```
+
+### 2.5 想先不接机器人试一遍
 
 把 `--robot-ip` 换成 `--sim`，脚本会用内部的一阶跟随模型当状态源、不连任何端口：
 
@@ -209,6 +256,8 @@ python main.py --sim --arm right --pos 0.35 -0.20 0.10
 | `--state-timeout` | `0.25` | 状态超时秒数，超时不下发 |
 | `--dry-run` | off | 只打印不下发 |
 | `--interactive` | off | 运行中从 stdin 读目标 |
+| `--target-port` | `6003` | 目标流输入端口（PULL/bind）；`0` 关闭 |
+| `--target-timeout` | `0` | 超过该秒数没新目标就打印失联提示（仍保持上一条目标，不会松手） |
 
 完整参数：`python main.py -h`
 
@@ -231,6 +280,7 @@ g1_zmq_ik/
 ├── controller.py           闭环控制：读→FK→目标→IK→限幅→下发（含安全逻辑）
 ├── zmq_link.py             6001 订阅读状态 / 6002 推送指令（含协议校验）
 ├── joint_map.py            电机序 ↔ SDK 关节名 ↔ LeRobot 键名
+├── target_io.py            目标流输入（ZMQ 6003 PULL，供外部程序持续下发目标）
 ├── sim_arm.py              一阶跟随仿真手臂（--sim 与 mock_robot 共用）
 ├── assets/g1/              G1-29DoF URDF（只需 URDF，不需要 meshes）
 ├── pyproject.toml / requirements.txt    uv 依赖声明（uv sync / uv pip install -r）
@@ -238,6 +288,7 @@ g1_zmq_ik/
 │   ├── mock_robot.py       本地假机器人：复刻 6001/6002 协议，便于不接真机联调
 │   ├── read_state.py       只读 6001，打印 29 个关节角
 │   ├── send_test.py        只写 6002（含 4 种"应当被丢弃"的坏帧）
+│   ├── send_target.py      向 6003 持续/一次性下发目标（pos/delta/circle/line/file）
 │   └── selftest_offline.py 离线检查脚本：正解一致性 / 反解精度 / 轨迹跟踪
 └── docs/                   源码逐行对照、ZMQ 协议详解、实测数据
 ```

@@ -40,6 +40,7 @@ import joint_map
 from controller import ArmController, LEFT, RIGHT, format_step
 from g1_ik import G1ArmModel, make_ik, rotation_to_rpy
 from sim_arm import SimulatedArmState, SimulatedStateSource
+from target_io import TargetReceiver
 from zmq_link import ArmCommandPublisher, RobotStateSubscriber
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -107,6 +108,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--period", type=float, default=6.0, help="circle/line 周期 s")
     g.add_argument("--amp", type=float, default=0.08, help="line 沿 x 的幅值 m")
     g.add_argument("--interactive", action="store_true", help="运行中从 stdin 读新目标")
+    g.add_argument("--target-port", type=int, default=6003,
+                   help="目标流输入端口（PULL/bind，对方 PUSH connect）；0=关闭")
+    g.add_argument("--target-timeout", type=float, default=0.0,
+                   help="超过该秒数没收到新目标就视为失联：0=保持上一条目标（默认），"
+                        ">0 时会在日志里提示失联（仍然保持，不会松手）")
 
     g = p.add_argument_group("安全")
     g.add_argument("--max-step-deg", type=float, default=2.0,
@@ -203,6 +209,55 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
     except Exception as exc:
         log.warning("命令解析失败(%s): %s", cmd, exc)
     return True
+
+
+# ---------------------------------------------------------------------------
+# 目标流 -> 控制器
+# ---------------------------------------------------------------------------
+def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
+    """把一帧目标流数据应用到控制器（最新优先，直接覆盖上一条目标）。"""
+    arms = flags["arms"]
+    arm = pkt.get("arm") or ctrl.controlled
+    rpy = pkt.get("rpy")
+
+    for side, pos in (pkt.get("per_arm") or {}).items():
+        ctrl.set_target_position(side, pos, rpy=rpy)
+        if side not in arms:
+            arms.append(side)
+        flags["last_stream_pos"][side] = np.asarray(pos, dtype=float).copy()
+
+    if pkt.get("pos") is not None or pkt.get("delta") is not None:
+        targets = [LEFT, RIGHT] if arm == "both" else [arm]
+        for a in targets:
+            if a not in arms:
+                arms.append(a)
+            if pkt.get("pos") is not None:
+                ctrl.set_target_position(a, pkt["pos"], rpy=rpy)
+                flags["last_stream_pos"][a] = np.asarray(pkt["pos"], dtype=float).copy()
+            else:
+                # delta：相对"上一条目标位置"叠加（没有上一条时相对当前目标）
+                base = flags["last_stream_pos"].get(a)
+                if base is None:
+                    if ctrl.target[a] is not None:
+                        base = ctrl.target[a][:3, 3].copy()
+                    else:
+                        flags["pending_delta"].append((a, np.asarray(pkt["delta"], dtype=float)))
+                        continue
+                nxt = base + np.asarray(pkt["delta"], dtype=float)
+                ctrl.set_target_position(a, nxt, rpy=rpy)
+                flags["last_stream_pos"][a] = nxt.copy()
+    # 收尾：把首帧收到 delta 但还没有基准的补齐
+    if flags["pending_delta"] and flags["last_stream_pos"]:
+        still = []
+        for a, d in flags["pending_delta"]:
+            base = flags["last_stream_pos"].get(a)
+            if base is None:
+                still.append((a, d))
+                continue
+            nxt = base + d
+            ctrl.set_target_position(a, nxt)
+            flags["last_stream_pos"][a] = nxt.copy()
+        flags["pending_delta"] = still
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +454,10 @@ def main(argv=None) -> int:
         log.info("轨迹: %s 半径/幅值=%s 周期=%.1fs", args.demo, args.radius if args.demo == "circle" else args.amp,
                  args.period)
 
-    flags = {"arms": arms, "force_print": False, "print_joints": args.print_joints}
+    flags = {"arms": arms, "force_print": False, "print_joints": args.print_joints,
+             "last_stream_pos": {}, "pending_delta": []}
+    target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
+    last_target_warn = 0.0
     console = None
     if args.interactive:
         print(HELP_TEXT)
@@ -422,6 +480,19 @@ def main(argv=None) -> int:
                 while console.queue:
                     if not apply_console_command(console.queue.pop(0), ctrl, flags):
                         raise KeyboardInterrupt
+
+            # 外部持续下发的目标（最新优先）
+            stream_pkt = target_rx.poll()
+            if stream_pkt is not None:
+                apply_stream_target(ctrl, stream_pkt, flags)
+
+            # 目标流失联提示（仍然保持上一条目标，不会松手）
+            if (target_rx.enabled and args.target_timeout > 0 and target_rx.frames > 0
+                    and target_rx.age() > args.target_timeout
+                    and elapse - last_target_warn > args.target_timeout):
+                last_target_warn = elapse
+                log.warning("目标流已 %.0fms 没有新目标（--target-timeout %.2fs），"
+                            "手臂保持在上一条目标位置", target_rx.age() * 1000, args.target_timeout)
 
             demo.update(ctrl, flags["arms"], elapse)
 
@@ -454,9 +525,11 @@ def main(argv=None) -> int:
         if console is not None:
             console.alive = False
         log.info("状态统计: %s", state.stats())
+        log.info("目标流统计: %s", target_rx.stats())
         log.info("下发统计: %s", pub.stats())
         log.info("停止下发：机器人侧 VLA 指令超时后会保持最后一个有效 arm_q（不会松手）。"
                  "要交还控制权，在机器人上切回 Gamepad(LB+X / 键 1)，手臂会按 Bezier 回到 safe_home_q。")
+        target_rx.close()
         state.close()
         pub.close()
     return status
