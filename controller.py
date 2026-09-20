@@ -41,6 +41,11 @@ logger = logging.getLogger("controller")
 
 LEFT, RIGHT = "left", "right"
 
+#: 目标位姿变化超过这个量才算"目标变了"（否则 ZMQ 目标流重复下发同一条目标时
+#: 会被当成新目标，到位判定的驻留计时永远清零）。位置 m / 旋转矩阵元素差。
+TARGET_EPS_POS = 1e-4
+TARGET_EPS_ROT = 1e-4
+
 
 @dataclass
 class StepInfo:
@@ -67,10 +72,13 @@ class StepInfo:
     ee_rot_speed_dps: float = 0.0
     waist_bias_mm: float = 0.0     # --waist zero 时：真实 pelvis 系与 locked 系的位置偏差
     ik_status: str = ""
+    target_rev: Dict[str, int] = field(default_factory=dict)   # 目标变更计数（到位判定用）
+    controlled: str = ""           # 本帧实际驱动哪条臂：left/right/both（到位判定用）
 
 
-def format_step(info: StepInfo, arm: str, with_joints: bool = False) -> str:
-    """把一帧信息格式化成一行日志。"""
+def format_step(info: StepInfo, arm: str, with_joints: bool = False,
+                arrive: str = "") -> str:
+    """把一帧信息格式化成一行日志。arrive = 到位判定的短标注（arrival.ArrivalMonitor.line）。"""
     if info.ee_meas.get(arm) is None:
         return f"[{info.t:7.2f}s] #{info.cycle:<5d} {info.state_age_ms:6.1f}ms  {'; '.join(info.notes)}"
     p_m = info.ee_meas[arm][:3, 3]
@@ -93,6 +101,8 @@ def format_step(info: StepInfo, arm: str, with_joints: bool = False) -> str:
         line += f" [腰未参与换算, 偏差{info.waist_bias_mm:.1f}mm]"
     if info.notes:
         line += " " + "; ".join(info.notes)
+    if arrive:
+        line += " " + arrive
     if with_joints and info.q_cmd is not None:
         line += "\n    q_cmd = [" + ", ".join(f"{v:+.3f}" for v in info.q_cmd) + "]"
     return line
@@ -152,8 +162,11 @@ class ArmController:
 
         self.target: Dict[str, Optional[np.ndarray]] = {LEFT: None, RIGHT: None}
         self.target_rpy: Dict[str, Optional[np.ndarray]] = {}
+        self.target_rev: Dict[str, int] = {LEFT: 0, RIGHT: 0}   # 目标真的变了才自增
         self._ref_rot: Optional[Dict[str, np.ndarray]] = None
-        self._pending_position: Optional[Tuple[str, np.ndarray]] = None
+        # 参考姿态还没锁定时收到的位置目标，按手臂排队（原实现是单槽，
+        # --arm both 时先到的左臂会被右臂覆盖，导致左臂目标被丢掉）
+        self._pending_positions: List[Tuple[str, np.ndarray]] = []
 
         self.q_cmd: Optional[np.ndarray] = None
         self.q_meas: Optional[np.ndarray] = None
@@ -165,8 +178,26 @@ class ArmController:
         self._prev_ee_speed: Dict[str, Optional[float]] = {LEFT: None, RIGHT: None}
 
     # ------------------------------------------------------------------ 目标
+    def _assign_target(self, arm: str, T_new: np.ndarray) -> None:
+        """写入目标位姿；**只有位姿真的变了**才让 target_rev 自增。
+
+        到位判定（arrival.py）靠 target_rev 区分"目标动了"和"同一条目标又发了一遍"：
+        ZMQ 目标流会以 30Hz 重复下发同一条目标，若每次都算变更，驻留计时会被反复清零，
+        静态目标永远判不出到位。
+        """
+        T_new = np.asarray(T_new, dtype=float).copy()
+        old = self.target.get(arm)
+        changed = True
+        if old is not None:
+            dp = float(np.linalg.norm(T_new[:3, 3] - old[:3, 3]))
+            dr = float(np.linalg.norm(T_new[:3, :3] - old[:3, :3]))
+            changed = dp > TARGET_EPS_POS or dr > TARGET_EPS_ROT
+        self.target[arm] = T_new
+        if changed:
+            self.target_rev[arm] = self.target_rev.get(arm, 0) + 1
+
     def set_target_pose(self, arm: str, T_pelvis: np.ndarray) -> None:
-        self.target[arm] = np.asarray(T_pelvis, dtype=float).copy()
+        self._assign_target(arm, T_pelvis)
 
     def set_target_position(self, arm: str, position: Sequence[float],
                             rpy: Optional[Sequence[float]] = None) -> None:
@@ -178,32 +209,32 @@ class ArmController:
         elif self._ref_rot is not None:
             rot = self._ref_rot[arm]
         else:
-            self._pending_position = (arm, pos)      # 参考姿态还没锁定，等第一帧补上
+            self._pending_positions.append((arm, pos))   # 参考姿态还没锁定，等第一帧补上
             return
         T = np.eye(4)
         T[:3, 3] = pos
         T[:3, :3] = rot
-        self.target[arm] = T
+        self._assign_target(arm, T)
 
     def set_target_rpy(self, arm: str, rpy: Sequence[float]) -> None:
         self.target_rpy[arm] = np.asarray(rpy, dtype=float).reshape(3)
         rot = rpy_to_rotation(self.target_rpy[arm])
         T = self.target[arm].copy() if self.target[arm] is not None else np.eye(4)
         T[:3, :3] = rot
-        self.target[arm] = T
+        self._assign_target(arm, T)
 
     def move_target_by(self, arm: str, delta: Sequence[float]) -> None:
         """在当前目标位置上叠加位移（pelvis 系）。"""
         d = np.asarray(delta, dtype=float).reshape(3)
         T = self.target[arm].copy() if self.target[arm] is not None else np.eye(4)
         T[:3, 3] += d
-        self.target[arm] = T
+        self._assign_target(arm, T)
 
     def hold(self, arm: str) -> None:
         """保持该臂当前指令位姿（把目标设回当前指令的 FK）。"""
         if self.q_cmd is not None:
             T_L, T_R = self.model.fk_pelvis(self.q_cmd, self.waist_for_kinematics())
-            self.target[arm] = (T_L if arm == LEFT else T_R).copy()
+            self._assign_target(arm, T_L if arm == LEFT else T_R)
 
     def lock_reference_orientation(self) -> None:
         if self.q_meas is None:
@@ -211,10 +242,10 @@ class ArmController:
         T_L, T_R = self.model.fk_pelvis(self.q_meas, self.waist_for_kinematics())
         self._ref_rot = {LEFT: T_L[:3, :3].copy(), RIGHT: T_R[:3, :3].copy()}
         logger.info("已锁定参考姿态（纯位置指令将保持该末端朝向）")
-        if self._pending_position is not None:
-            arm, pos = self._pending_position
-            self._pending_position = None
-            self.set_target_position(arm, pos)
+        if self._pending_positions:
+            pending, self._pending_positions = self._pending_positions, []
+            for arm, pos in pending:
+                self.set_target_position(arm, pos)
 
     # ------------------------------------------------------------------ 辅助
     def waist_for_kinematics(self) -> Optional[np.ndarray]:
@@ -349,6 +380,8 @@ class ArmController:
                 self.ik.reset()
             for arm, T in ((LEFT, T_L_meas), (RIGHT, T_R_meas)):
                 if self.target[arm] is None and self.controlled in (arm, "both"):
+                    # 注意：这里刻意不经过 _assign_target，target_rev 保持 0 =
+                    # "还没有显式目标"，到位判定不会对启动时的保持位姿报"到位"
                     self.target[arm] = T.copy()
 
         # 4) 目标 -> locked 系 -> IK（直接解真目标；速度限制在下面用雅可比钳制）
@@ -443,6 +476,8 @@ class ArmController:
             info.err_ik_pos[arm], info.err_ik_rot[arm] = p, r
             p2, r2, _ = pose_error(T_true, T_tgt_pelvis)
             info.err_track_pos[arm], info.err_track_rot[arm] = p2, r2
+        info.target_rev = dict(self.target_rev)      # 到位判定用它识别"目标真的变了"
+        info.controlled = self.controlled            # 到位判定用它识别"这条臂压根没被驱动"
         return info
 
     # ------------------------------------------------------------------ 状态

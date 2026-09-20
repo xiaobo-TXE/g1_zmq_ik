@@ -21,6 +21,10 @@
   # 5) 交互模式：运行中随时输入新目标
   python main.py --robot-ip 192.168.123.161 --arm right --interactive
 
+  # 6) 到位判定：到位就打印一行 ✅（残差/耗时），并可选择到位后动作
+  python main.py --robot-ip 192.168.123.161 --arm right --pos 0.35 -0.20 0.10 \
+      --arrive-pos 2 --arrive-rot 1 --on-arrive freeze
+
 坐标系：目标与打印的所有末端位置都在 **pelvis 系**（URDF 根 link，x 前 y 左 z 上，单位 m）。
 """
 
@@ -37,6 +41,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 
 import joint_map
+from arrival import ArrivalMonitor, ArrivalThresholds, format_event
 from controller import ArmController, LEFT, RIGHT, format_step
 from g1_ik import G1ArmModel, make_ik, rotation_to_rpy
 from sim_arm import SimulatedArmState, SimulatedStateSource
@@ -116,6 +121,29 @@ def build_parser() -> argparse.ArgumentParser:
                    help="超过该秒数没收到新目标就视为失联：0=保持上一条目标（默认），"
                         ">0 时会在日志里提示失联（仍然保持，不会松手）")
 
+    g = p.add_argument_group("到位判定（实测末端是否已稳定到达目标）")
+    g.add_argument("--no-arrive", action="store_true", help="关闭到位判定（默认开启）")
+    g.add_argument("--arrive-pos", type=float, default=2.0, metavar="MM",
+                   help="判据①：实测位置残差上限（track_err）")
+    g.add_argument("--arrive-rot", type=float, default=1.0, metavar="DEG",
+                   help="判据①：实测姿态残差上限")
+    g.add_argument("--arrive-ik-pos", type=float, default=3.0, metavar="MM",
+                   help="判据②可达性：反解位置残差上限，超过视为目标不可达（手臂停在能到的"
+                        "最近处，不会判到位）；0=不判可达性")
+    g.add_argument("--arrive-ik-rot", type=float, default=2.0, metavar="DEG",
+                   help="判据②可达性：反解姿态残差上限；0=不判")
+    g.add_argument("--arrive-dwell", type=float, default=0.2, metavar="S",
+                   help="判据③：以上判据需连续满足的时长（单帧压线不算到位）")
+    g.add_argument("--arrive-speed", type=float, default=15.0, metavar="MM_S",
+                   help="判据④：末端速度上限（EMA），防止目标快速移动时'路过'目标点被判到位")
+    g.add_argument("--arrive-joint-speed", type=float, default=10.0, metavar="DEG_S",
+                   help="判据⑤：关节速度上限（EMA），防止在零空间里还在漂")
+    g.add_argument("--arrive-timeout", type=float, default=5.0, metavar="S",
+                   help="目标变更后多久仍未到位就报告一次原因（只报告，不影响控制）；0=不报告")
+    g.add_argument("--on-arrive", default="none", choices=["none", "freeze", "exit"],
+                   help="到位后的动作：none=只报告 / freeze=停止自动目标推进(demo 轨迹、"
+                        "ZMQ 目标流)，交互命令 p/d/r 可解冻 / exit=到位即退出")
+
     g = p.add_argument_group("安全")
     g.add_argument("--max-step-deg", type=float, default=2.0,
                    help="单周期(1/rate 秒)每个关节最大增量，0=不限（关节侧兜底限速）")
@@ -156,7 +184,8 @@ HELP_TEXT = """
   d DX DY DZ     在当前目标上叠加位移                例: d 0.02 0 0.03
   r R P Y        设置目标姿态 rpy (rad)              例: r 0 0 0     r=复位朝向
   a left|right|both   切换受控手臂
-  h              打印当前实测/目标/误差
+  t POS_MM ROT_DEG    设置到位判据（实测残差）       例: t 2 1      t 5 2 = 放宽
+  h              打印当前实测/目标/误差/到位状态
   j              打印当前下发的 14 个关节角
   ?              显示本帮助
   q              退出
@@ -184,6 +213,13 @@ class InteractiveConsole(threading.Thread):
                 self.queue.append(line)
 
 
+def unfreeze(flags: Dict, why: str) -> None:
+    """--on-arrive freeze 之后，被人工接管时解冻自动目标推进。"""
+    if flags.get("frozen"):
+        flags["frozen"] = False
+        log.info("已解冻（%s）：demo 轨迹 / ZMQ 目标流恢复生效", why)
+
+
 def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
     """返回 False 表示要退出。"""
     parts = cmd.split()
@@ -192,6 +228,9 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
     head, args = parts[0].lower(), parts[1:]
     flags["force_print"] = True          # 每条命令都在下一个周期回一行状态
     try:
+        # 人工给目标 = 接管，解冻（--on-arrive freeze 之后）
+        if head in ("p", "d", "r") and len(args) == 3:
+            unfreeze(flags, f"收到交互命令 {head}")
         if head == "p" and len(args) == 3:
             pos = [float(v) for v in args]
             for arm in flags["arms"]:
@@ -207,6 +246,14 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
             for arm in flags["arms"]:
                 ctrl.set_target_rpy(arm, rpy)
             log.info("目标姿态 rpy -> %s rad", np.round(rpy, 4))
+        elif head == "t" and len(args) == 2:
+            mon = flags.get("arrival")
+            if mon is None:
+                log.warning("到位判定已关闭（--no-arrive），t 命令无效")
+            else:
+                mon.th.pos_m = abs(float(args[0])) / 1000.0
+                mon.th.rot_rad = float(np.deg2rad(abs(float(args[1]))))
+                log.info("到位判据 -> %s", mon.th.describe())
         elif head == "a" and len(args) == 1 and args[0] in ("left", "right", "both"):
             ctrl.controlled = args[0]
             flags["arms"] = [LEFT, RIGHT] if args[0] == "both" else [args[0]]
@@ -479,8 +526,28 @@ def main(argv=None) -> int:
     print_every = args.print_every
     if print_every is None:
         print_every = 0 if args.interactive else 5
+
+    # 到位判定
+    arrival = None
+    if not args.no_arrive:
+        arrival = ArrivalMonitor(ArrivalThresholds(
+            pos_m=args.arrive_pos / 1000.0,
+            rot_rad=float(np.deg2rad(args.arrive_rot)),
+            ik_pos_m=args.arrive_ik_pos / 1000.0,
+            ik_rot_rad=float(np.deg2rad(args.arrive_ik_rot)),
+            dwell_s=args.arrive_dwell,
+            speed_mps=args.arrive_speed / 1000.0,
+            joint_speed_rps=float(np.deg2rad(args.arrive_joint_speed)),
+            timeout_s=args.arrive_timeout), on_arrive=args.on_arrive)
+        log.info("到位判定: %s", arrival.describe())
+        if args.on_arrive != "none":
+            log.info("到位后动作=%s（首次到位时生效；freeze 可用交互命令 p/d/r 解冻）", args.on_arrive)
+    else:
+        log.info("到位判定: 关闭（--no-arrive）")
+
     flags = {"arms": arms, "force_print": False, "print_joints": args.print_joints,
-             "last_stream_pos": {}, "pending_delta": [], "hint_time": 0.0}
+             "last_stream_pos": {}, "pending_delta": [], "hint_time": 0.0,
+             "arrival": arrival, "frozen": False}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
     last_target_warn = 0.0
     console = None
@@ -488,7 +555,8 @@ def main(argv=None) -> int:
         print(HELP_TEXT)
         print("交互模式已静默：状态不再刷屏，直接输入即可（无需提示符）。\n"
               "  · 每条命令都会在下一个控制周期（约 20ms）回一行状态\n"
-              "  · h 看完整状态、j 看当前下发的 14 个关节角、? 看全部命令\n")
+              "  · h 看完整状态（含到位状态）、j 看当前下发的 14 个关节角、"
+              "t 调到位判据、? 看全部命令\n")
         console = InteractiveConsole([])
         console.start()
 
@@ -510,8 +578,10 @@ def main(argv=None) -> int:
                         raise KeyboardInterrupt
 
             # 外部持续下发的目标（最新优先）
+            #   --on-arrive freeze 期间照常 poll 但丢弃（避免 socket 里积压过期目标，
+            #   解冻时一上来就应用一堆旧目标）
             stream_pkt = target_rx.poll()
-            if stream_pkt is not None:
+            if stream_pkt is not None and not flags["frozen"]:
                 apply_stream_target(ctrl, stream_pkt, flags)
 
             # 目标流失联提示（仍然保持上一条目标，不会松手）
@@ -522,7 +592,8 @@ def main(argv=None) -> int:
                 log.warning("目标流已 %.0fms 没有新目标（--target-timeout %.2fs），"
                             "手臂保持在上一条目标位置", target_rx.age() * 1000, args.target_timeout)
 
-            demo.update(ctrl, flags["arms"], elapse)
+            if not flags["frozen"]:
+                demo.update(ctrl, flags["arms"], elapse)
 
             info = ctrl.step(dt)
 
@@ -534,15 +605,41 @@ def main(argv=None) -> int:
                     ctrl.move_target_by(arm, args.delta)
                 delta_done = True
 
+            # 到位判定（只读诊断：只比较实测/目标误差，不改任何控制行为）
+            arrive_events = ([] if arrival is None
+                             else arrival.update(info, flags["arms"], elapse, dt))
+
             # 打印
             if flags["force_print"] or (print_every > 0 and ctrl.cycle % print_every == 0):
                 flags["force_print"] = False
                 for arm in flags["arms"]:
-                    print(format_step(info, arm, flags["print_joints"]))
+                    print(format_step(info, arm, flags["print_joints"],
+                                      arrive="" if arrival is None else arrival.line(arm))
+                          + (" [已冻结]" if flags["frozen"] else ""))
                 sys.stdout.flush()
 
+            # 到位 / 离开 / 超时事件（每条目标最多各报一次，不会刷屏）
+            if arrive_events:
+                for ev in arrive_events:
+                    print("  " + format_event(ev))
+                sys.stdout.flush()
+
+            # --on-arrive：所有受控臂都到位后才执行
+            if (arrival is not None and args.on_arrive != "none"
+                    and any(ev.kind == "arrived" for ev in arrive_events)
+                    and arrival.all_arrived(flags["arms"])):
+                if args.on_arrive == "exit":
+                    log.info("已到位（--on-arrive exit）-> 退出")
+                    break
+                if not flags["frozen"]:
+                    flags["frozen"] = True
+                    log.warning("已到位（--on-arrive freeze）：停止 demo 轨迹 / ZMQ 目标流推进，"
+                                "继续下发最后一条命令锁住位姿；输入 p/d/r 可解冻")
+
             # 目标不可达/被限位时的提示（限频，避免刷屏）
-            if info.sent and info.ee_meas:
+            #   开了到位判定时由 arrival 负责（每行状态都带 ✗不可达/✗疑似被挡 标注，
+            #   超时后还会给一次完整原因），这里只作为 --no-arrive 的兜底。
+            if arrival is None and info.sent and info.ee_meas:
                 arm0 = flags["arms"][0]
                 eik = info.err_ik_pos.get(arm0, 0.0)
                 etr = info.err_track_pos.get(arm0, 0.0)
@@ -568,6 +665,8 @@ def main(argv=None) -> int:
         log.info("状态统计: %s", state.stats())
         log.info("目标流统计: %s", target_rx.stats())
         log.info("下发统计: %s", pub.stats())
+        if arrival is not None:
+            log.info("%s", arrival.stats())
         log.info("停止下发：机器人侧 VLA 指令超时后会保持最后一个有效 arm_q（不会松手）。"
                  "要交还控制权，在机器人上切回 Gamepad(LB+X / 键 1)，手臂会按 Bezier 回到 safe_home_q。")
         target_rx.close()
