@@ -188,6 +188,15 @@ class G1ArmModel:
         self.root_joint_id = self.full_model.getJointId(ARM_CHAIN_ROOT_JOINT)
         self.A0 = self._fk_full_frame(pin.neutral(self.full_model), self.root_joint_id)
 
+        # torso 系（躯干）与 locked 系（腰=0 的 pelvis 系）之间只差一个**常量**：
+        #   C = FK(腰=0) 里 torso_link 的位姿（实测量级：平移 (-3.96, 0, +44.0) mm，姿态 = I）
+        # 因为手臂链挂在 torso_link 上，"目标相对躯干"时腰角完全不参与手臂几何：
+        #   T_locked = C @ T_torso        （torso_to_locked）
+        #   T_torso  = inv(C) @ T_locked  （locked_to_torso）
+        torso_fid = self.full_model.getFrameId("torso_link")
+        self.C_torso = self._fk_full_frame(pin.neutral(self.full_model), torso_fid, is_joint=False)
+        self.C_torso_inv = np.linalg.inv(self.C_torso)
+
         # 关节限位（URDF）
         self.q_lower = np.array(self.model.lowerPositionLimit, dtype=float).copy()
         self.q_upper = np.array(self.model.upperPositionLimit, dtype=float).copy()
@@ -280,6 +289,19 @@ class G1ArmModel:
             return np.asarray(T_pelvis, dtype=float).copy()
         A = self.waist_transform(q_waist3)
         return self.A0 @ np.linalg.inv(A) @ np.asarray(T_pelvis, dtype=float)
+
+    # ---------------- torso 系（躯干） <-> locked 系 ----------------
+    def torso_to_locked(self, T_torso: np.ndarray) -> np.ndarray:
+        """torso_link 系下的目标位姿 -> locked 系（IK 求解用）。常量变换，与腰角无关。"""
+        return self.C_torso @ np.asarray(T_torso, dtype=float)
+
+    def locked_to_torso(self, T_locked: np.ndarray) -> np.ndarray:
+        """locked 系下的位姿 -> torso_link 系（诊断/日志用）。常量变换，与腰角无关。"""
+        return self.C_torso_inv @ np.asarray(T_locked, dtype=float)
+
+    def torso_offset_mm(self) -> float:
+        """torso 原点相对 pelvis 原点的距离（mm），仅用于日志核对。"""
+        return float(np.linalg.norm(self.C_torso[:3, 3]) * 1000.0)
 
     # ---------------- 其它 ----------------
     def neutral(self) -> np.ndarray:

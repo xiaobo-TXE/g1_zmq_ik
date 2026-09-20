@@ -8,7 +8,7 @@
 
 帧格式（只认这几个字段，多余的忽略；`pos` 与 `delta` 二选一）：
 
-    {"pos":   [0.33, -0.22, 0.13]}          # 绝对位置（pelvis 系, m）
+    {"pos":   [0.33, -0.22, 0.13]}          # 绝对位置（目标系, m；默认 torso_link，见 README §3）
     {"delta": [0.01, 0.0, -0.02]}           # 相对"上一条目标"的增量
     {"rpy":   [0.0, 0.0, 0.0]}              # 可选；不给就保持当前锁定的末端朝向
     {"arm":   "right"}                      # 可选: right/left/both；默认用启动时的 --arm
@@ -109,7 +109,8 @@ class TargetReceiver:
                 raise ValueError("timestamp 不是数字")
         for key, vec in (("pos", out["pos"]), ("delta", out["delta"])):
             if vec is not None and np.linalg.norm(vec) > MAX_TARGET_DIST:
-                logger.warning("%s 距 pelvis 原点 %.2f m（超过 %.1f m，请确认是 pelvis 系且单位是 m）",
+                logger.warning("%s 距目标系原点 %.2f m（超过 %.1f m，请确认坐标系与单位："
+                               "默认 torso_link 系 + 米，见 README §3）",
                                key, np.linalg.norm(vec), MAX_TARGET_DIST)
         return out
 

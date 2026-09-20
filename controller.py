@@ -70,7 +70,7 @@ class StepInfo:
     ee_accel_m_s2: float = 0.0        # 本周期实测末端加速度
     ee_speed_mm_s: float = 0.0        # 上一帧指令位姿 -> 本帧，末端实际移动速度
     ee_rot_speed_dps: float = 0.0
-    waist_bias_mm: float = 0.0     # --waist zero 时：真实 pelvis 系与 locked 系的位置偏差
+    waist_bias_mm: float = 0.0     # 仅 target_frame=pelvis 且 --waist zero：真实 pelvis 系与 locked 系的偏差
     ik_status: str = ""
     target_rev: Dict[str, int] = field(default_factory=dict)   # 目标变更计数（到位判定用）
     controlled: str = ""           # 本帧实际驱动哪条臂：left/right/both（到位判定用）
@@ -115,7 +115,8 @@ class ArmController:
                  state,                              # RobotStateSubscriber 或 SimulatedStateSource
                  publisher: ArmCommandPublisher,
                  controlled: str = RIGHT,
-                 waist_source: str = "state",        # state | zero
+                 waist_source: str = "state",        # state | zero（仅 target_frame=pelvis 时有用）
+                 target_frame: str = "torso",        # torso | pelvis（目标位姿表达在哪个系）
                  use_filter: bool = True,
                  max_step_deg: float = 2.0,
                  ee_speed: float = 0.10,      # 默认 10cm/s：由 tools/tune_motion.py 标定
@@ -129,12 +130,15 @@ class ArmController:
                  velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0)):
         if controlled not in (LEFT, RIGHT, "both"):
             raise ValueError("controlled 只能是 left / right / both")
+        if target_frame not in ("torso", "pelvis"):
+            raise ValueError("target_frame 只能是 torso / pelvis")
         self.model = model
         self.ik = ik
         self.state = state
         self.pub = publisher
         self.controlled = controlled
         self.waist_source = waist_source
+        self.target_frame = target_frame
         self.max_step = np.deg2rad(float(max_step_deg))
         # 末端笛卡尔速度上限（m/s，0=不限）；姿态上限（rad/s，0=不限）
         # 默认值 0.10m/s + 0.20m/s² 来自 tools/tune_motion.py 的网格扫描：
@@ -201,7 +205,7 @@ class ArmController:
 
     def set_target_position(self, arm: str, position: Sequence[float],
                             rpy: Optional[Sequence[float]] = None) -> None:
-        """设置目标位置（pelvis 系，m）。姿态：给了 rpy 用 rpy，否则用启动时锁定的参考姿态。"""
+        """设置目标位置（目标系：torso 或 pelvis，m）。姿态：给了 rpy 用 rpy，否则用启动时锁定的参考姿态。"""
         pos = np.asarray(position, dtype=float).reshape(3)
         if rpy is not None:
             self.target_rpy[arm] = np.asarray(rpy, dtype=float).reshape(3)
@@ -224,22 +228,22 @@ class ArmController:
         self._assign_target(arm, T)
 
     def move_target_by(self, arm: str, delta: Sequence[float]) -> None:
-        """在当前目标位置上叠加位移（pelvis 系）。"""
+        """在当前目标位置上叠加位移（目标系）。"""
         d = np.asarray(delta, dtype=float).reshape(3)
         T = self.target[arm].copy() if self.target[arm] is not None else np.eye(4)
         T[:3, 3] += d
         self._assign_target(arm, T)
 
     def hold(self, arm: str) -> None:
-        """保持该臂当前指令位姿（把目标设回当前指令的 FK）。"""
+        """保持该臂当前指令位姿（把目标设回当前指令的 FK，目标系下）。"""
         if self.q_cmd is not None:
-            T_L, T_R = self.model.fk_pelvis(self.q_cmd, self.waist_for_kinematics())
+            T_L, T_R = self.ee_in_target_frame(self.q_cmd)
             self._assign_target(arm, T_L if arm == LEFT else T_R)
 
     def lock_reference_orientation(self) -> None:
         if self.q_meas is None:
             return
-        T_L, T_R = self.model.fk_pelvis(self.q_meas, self.waist_for_kinematics())
+        T_L, T_R = self.ee_in_target_frame(self.q_meas)
         self._ref_rot = {LEFT: T_L[:3, :3].copy(), RIGHT: T_R[:3, :3].copy()}
         logger.info("已锁定参考姿态（纯位置指令将保持该末端朝向）")
         if self._pending_positions:
@@ -247,17 +251,42 @@ class ArmController:
             for arm, pos in pending:
                 self.set_target_position(arm, pos)
 
+    # ------------------------------------------------------------------ 坐标系
+    def ee_in_target_frame(self, q14: Sequence[float],
+                           q_waist3: Optional[Sequence[float]] = None,
+                           use_true_waist: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+        """给定手臂关节角，返回【目标系】下的两个末端位姿。
+
+        target_frame="torso" ：T = inv(C) @ FK_locked(q) —— **与腰角无关**
+                               （手臂挂在 torso_link 上，腰怎么动都不影响手臂相对躯干的位姿）
+        target_frame="pelvis"：T = FK_pelvis(q, 腰角)   —— 用实测腰角换算
+        """
+        if self.target_frame == "torso":
+            T_L, T_R = self.model.fk(q14)
+            return self.model.locked_to_torso(T_L), self.model.locked_to_torso(T_R)
+        waist = q_waist3 if (use_true_waist or q_waist3 is not None) else self.waist_for_kinematics()
+        return self.model.fk_pelvis(q14, waist)
+
+    def _target_to_locked(self, T_target: np.ndarray) -> np.ndarray:
+        """目标系的位姿 -> locked 系（IK 求解用）。"""
+        if self.target_frame == "torso":
+            return self.model.torso_to_locked(T_target)     # 常量变换，与腰角无关
+        return self.model.pelvis_to_locked(T_target, self.waist_for_kinematics())
+
     # ------------------------------------------------------------------ 辅助
     def waist_for_kinematics(self) -> Optional[np.ndarray]:
-        """IK/FK 使用的腰角：state=用实测值换算坐标；zero=按腰=0 处理(与 xr_teleoperate 相同)。"""
+        """IK/FK 使用的腰角：state=用实测值换算坐标；zero=按腰=0 处理(与 xr_teleoperate 相同)。
+
+        注意：target_frame="torso" 时目标相对躯干，腰角不参与手臂几何，本函数对目标无影响
+        （仅在 target_frame="pelvis" 的换算里用）。
+        """
         return None if self.waist_source == "zero" else self.q_waist
 
     def _ik_targets(self, T_L_meas: np.ndarray, T_R_meas: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        waist = self.waist_for_kinematics()
         out = {}
         for arm, T_meas in ((LEFT, T_L_meas), (RIGHT, T_R_meas)):
             T = self.target[arm] if self.target[arm] is not None else T_meas
-            out[arm] = self.model.pelvis_to_locked(T, waist)
+            out[arm] = self._target_to_locked(T)
         return out[LEFT], out[RIGHT]
 
     # ------------------------------------------------------------------ 末端速度限制
@@ -360,15 +389,19 @@ class ArmController:
             info.notes.append(f"状态超时 {info.state_age_ms:.0f}ms -> 不下发")
             return info
 
-        # 2) 正解
-        #    waist_ik   : IK/目标换算所用的腰角（--waist zero 时为 None = 按腰=0，与 xr_teleoperate 一致）
-        #    waist_true : 实测腰角，**只用于诊断**，保证打印的是真实 pelvis 系位置
+        # 2) 正解（全部表达在【目标系】里：torso=躯干系 / pelvis=骨盆系）
+        #    waist_ik   : pelvis 系换算所用的腰角（--waist zero 时为 None = 按腰=0，与原版一致）
+        #    waist_true : 实测腰角，**只用于诊断**
+        #    target_frame="torso" 时，"实测末端相对躯干"的位姿与腰角无关（手臂挂在 torso_link 上），
+        #    所以下面这两个 T_meas/T_true 在躯干系下是同一个值，waist_bias 也就没有意义（恒为 0）。
         waist_ik = self.waist_for_kinematics()
         waist_true = self.q_waist
-        T_L_meas, T_R_meas = self.model.fk_pelvis(q14, waist_ik)      # 内部一致（命令/目标）用
-        T_L_true, T_R_true = self.model.fk_pelvis(q14, waist_true)    # 诊断用（真实 pelvis 系）
+        T_L_meas, T_R_meas = self.ee_in_target_frame(q14, waist_ik)      # 内部一致（命令/目标）用
+        T_L_true, T_R_true = self.ee_in_target_frame(q14, waist_true,    # 诊断用
+                                                     use_true_waist=True)
         info.ee_meas = {LEFT: T_L_true, RIGHT: T_R_true}
-        if waist_ik is None and waist_true is not None and np.any(np.abs(waist_true) > 1e-6):
+        if (self.target_frame == "pelvis" and waist_ik is None
+                and waist_true is not None and np.any(np.abs(waist_true) > 1e-6)):
             info.waist_bias_mm = 1000.0 * float(np.linalg.norm(T_R_true[:3, 3] - T_R_meas[:3, 3]))
 
         # 3) 首帧初始化：锁定参考姿态、以实测姿态作为起点
@@ -446,16 +479,17 @@ class ArmController:
         info.sent = True
         info.q_cmd = q_send.copy()
 
-        # 9) 诊断
-        #    ik_err   : 在 locked 系里比较"指令 FK"与"IK 目标"  -> 纯求解精度
-        #    track_err: 在真实 pelvis 系里比较"实测 FK"与"pelvis 目标" -> 真实物理偏差
-        #               （含腰部换算偏置 + 伺服滞后）
+        # 9) 诊断（全部在【目标系】里比较，与 target_frame 一致）
+        #    ik_err   : 目标系下比较"指令 FK"与"IK 目标"    -> 纯求解精度
+        #    track_err: 目标系下比较"实测 FK"与"目标"        -> 真实物理偏差（伺服滞后等）
+        #    注：target_frame="torso" 时目标相对躯干，腰角不进入这两个误差；
+        #        target_frame="pelvis" 时 track_err 还含腰部换算偏置（见 info.waist_bias_mm）
         T_L_raw_lk, T_R_raw_lk = self.model.fk(q_raw)      # IK 原始解（未限幅）-> 纯求解质量
         T_L_cmd_lk, T_R_cmd_lk = self.model.fk(q_send)
-        T_L_cmd_tr, T_R_cmd_tr = self.model.fk_pelvis(q_send, waist_true)
-        info.ee_cmd = {LEFT: T_L_cmd_tr, RIGHT: T_R_cmd_tr}
+        T_L_cmd_tf, T_R_cmd_tf = self.ee_in_target_frame(q_send, waist_true, use_true_waist=True)
+        info.ee_cmd = {LEFT: T_L_cmd_tf, RIGHT: T_R_cmd_tf}
         # 本周期指令末端实际移动速度（用于核对速度上限是否生效）
-        for arm, T_now in ((LEFT, T_L_cmd_tr), (RIGHT, T_R_cmd_tr)):
+        for arm, T_now in ((LEFT, T_L_cmd_tf), (RIGHT, T_R_cmd_tf)):
             T_prev = self._prev_ee_cmd.get(arm)
             if T_prev is not None and dt > 0:
                 v = float(np.linalg.norm(T_now[:3, 3] - T_prev[:3, 3])) / dt
@@ -470,11 +504,11 @@ class ArmController:
             self._prev_ee_cmd[arm] = np.array(T_now, copy=True)
         for arm, T_raw_lk, T_tgt_lk, T_true in ((LEFT, T_L_raw_lk, T_L_tgt, T_L_true),
                                                (RIGHT, T_R_raw_lk, T_R_tgt, T_R_true)):
-            T_tgt_pelvis = self.target[arm] if self.target[arm] is not None else T_true
-            info.ee_target[arm] = T_tgt_pelvis
+            T_tgt_frame = self.target[arm] if self.target[arm] is not None else T_true
+            info.ee_target[arm] = T_tgt_frame
             p, r, _ = pose_error(T_raw_lk, T_tgt_lk)
             info.err_ik_pos[arm], info.err_ik_rot[arm] = p, r
-            p2, r2, _ = pose_error(T_true, T_tgt_pelvis)
+            p2, r2, _ = pose_error(T_true, T_tgt_frame)
             info.err_track_pos[arm], info.err_track_rot[arm] = p2, r2
         info.target_rev = dict(self.target_rev)      # 到位判定用它识别"目标真的变了"
         info.controlled = self.controlled            # 到位判定用它识别"这条臂压根没被驱动"
@@ -488,7 +522,8 @@ class ArmController:
                   + (f" jerk={self.ee_jerk:.1f}m/s³" if self.ee_jerk > 0 else ""))
         else:
             ee = "末端限速=关"
-        return (f"受控臂={self.controlled} 腰参考={self.waist_source} "
+        return (f"受控臂={self.controlled} 目标系={'torso_link（躯干）' if self.target_frame == 'torso' else 'pelvis（骨盆）'} "
+                f"腰参考={self.waist_source} "
                 f"滤波={'on' if self.filter else 'off'} "
                 f"单周期限速={np.rad2deg(self.max_step):.2f}° "
                 f"{ee} "

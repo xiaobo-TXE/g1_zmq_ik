@@ -12,7 +12,7 @@ G1 双臂：**给一个目标位置 → ZMQ 读当前关节角 → 正解出当�
 ## 1. 工作流程
 
 ```
- ① 目标位置（pelvis 系 x前 y左 z上，单位 m）
+ ① 目标位置（默认 torso_link 系；x前 y左 z上，单位 m）
       │   来源：命令行 --pos / 交互输入 p x y z / 内置轨迹 --demo circle
       │        / ZMQ 6003 端口持续推送（外部程序可以随时一直下发，最新优先）
       ▼
@@ -23,7 +23,9 @@ G1 双臂：**给一个目标位置 → ZMQ 读当前关节角 → 正解出当�
  ③ 正解 FK(q_meas)  ─────────────▶  当前末端位姿（日志里的 meas=）
       │   与反解共用同一个 CasADi 符号模型（内置正解，或 pinocchio.casadi）
       ▼
- ④ 目标换算：pelvis 系目标 ──▶ 求解坐标系（用实测腰角做刚体换算）
+ ④ 目标换算：目标系 ──▶ 求解坐标系（locked 系）
+      │   torso 系（默认）：常量平移 C = torso 原点相对 pelvis 44.18mm，**与腰角无关**
+      │   pelvis 系       ：用实测腰角做刚体换算（含腰角旋转）
       ▼
  ⑤ 反解 IK：CasADi Opti + IPOPT
       │   变量 = 14 个手臂关节角；硬约束 = URDF 关节限位
@@ -126,7 +128,7 @@ python main.py --robot-ip 192.168.123.161 --arm right --pos 0.35 -0.20 0.10
 ### 2.3 目标的几种给法
 
 ```bash
-# ① 启动时给绝对位置（pelvis 系, m）+ 保持启动时锁定的末端朝向
+# ① 启动时给绝对位置（默认 torso 系, m）+ 保持启动时锁定的末端朝向
 python main.py --robot-ip <IP> --arm right --pos 0.35 -0.20 0.10
 
 # ② 相对当前位姿的位移（前移 5cm、上移 3cm）
@@ -148,7 +150,7 @@ python main.py --robot-ip <IP> --arm right --interactive
 交互命令：
 
 ```
-p X Y Z      设置目标位置(pelvis 系, m)      d DX DY DZ   在当前目标上叠加位移
+p X Y Z      设置目标位置(默认 torso 系, m)   d DX DY DZ   在当前目标上叠加位移
 r R P Y      设置目标姿态 rpy (rad)          a left|right|both  切换受控臂
 t POS_MM ROT_DEG  设置到位判据（见 §5）       h   打印当前实测/目标/误差/到位状态
 j            打印当前下发的 14 个关节角        ?   帮助              q   退出
@@ -194,7 +196,7 @@ j            打印当前下发的 14 个关节角        ?   帮助            
 帧格式（JSON，只认这几个字段，多余的忽略；`pos` 与 `delta` 二选一）：
 
 ```json
-{"pos":   [0.33, -0.22, 0.13]}                 // 绝对位置（pelvis 系, m）
+{"pos":   [0.33, -0.22, 0.13]}                 // 绝对位置（目标系, m；默认 torso_link）
 {"delta": [0.005, 0.0, 0.0]}                   // 相对"上一条目标"的增量
 {"rpy":   [0.0, 0.0, 0.0]}                     // 可选；不给就保持当前锁定的末端朝向
 {"arm":   "right"}                             // 可选：right/left/both，默认用启动时的 --arm
@@ -300,13 +302,33 @@ python main.py --robot-ip <IP> --arm right --pos 0.35 -0.20 0.10 --ee-speed 0 --
 
 ## 3. 坐标系与目标定义
 
+### 3.1 目标系：`torso_link`（默认）还是 `pelvis`
+
+| 坐标系 | 定义 | 什么时候用 |
+|---|---|---|
+| **`torso_link` 系（默认）** | 躯干 link 的坐标系 —— **手臂就挂在它上面**（`left/right_shoulder_pitch_joint` 的 parent 是 `torso_link`） | `--target-frame torso`（默认）。**腰怎么转都不影响手臂解算**：目标是"相对躯干的位置"，Tag 检测/抓取通常就是这种语义 |
+| **`pelvis` 系** | URDF 根 link `pelvis`（**骨盆**）；x 前、y 左、z 上；pinocchio 的世界系与它重合 | `--target-frame pelvis`（旧行为）。腰角参与换算：同一个骨盆系目标，腰一转就需要不同的手臂构型 |
+
+两个系之间只差一个**常量**（实测自 URDF）：
+
+```
+C = FK(腰=0) 时 torso_link 的位姿 = 平移 (-3.964, 0, +44.000) mm，姿态 = 单位阵
+torso 系目标  ──▶ 求解系：T_locked = C @ T_torso            （与腰角无关）
+pelvis 系目标 ──▶ 求解系：T_locked = A0 @ inv(A) @ T_pelvis  （A = FK_full(腰=实测值) 的手臂链根帧）
+```
+
+`--check` 会把这两个数打印出来核对；`tools/test_target_frame.py` 专门验证这套语义（13 项）。
+
+**要点**：`pos` 目标、日志里的 `tgt=`/`meas=`、`track_err`、到位判定**全都用同一个目标系**，所以两组数字可以直接相减对比。`--waist state|zero` 只在 `--target-frame pelvis` 下有意义。
+
+### 3.2 末端点与腰部
+
 | 名称 | 含义 |
 |---|---|
-| **pelvis 系** | URDF 根 link 为 `pelvis`：**x 前、y 左、z 上**，单位 m。目标位置与日志里的位置都用这个系。 |
 | **末端点（EE）** | `L_ee`/`R_ee` 挂在 `*_wrist_yaw_joint` 上、沿轴偏 `--ee-offset`（默认 **0.152m** = Dex1 夹爪抓取中心）。**目标位置、`track_err`、到位判定说的都是这个点**。 |
-| **腰部** | 反解只输出 14 个手臂关节，腰由机器人全身策略驱动。程序默认用 6001 读到的**实测腰角**做坐标换算（`--waist state`）；想按 xr_teleoperate 的"腰=0"假设走，用 `--waist zero`。 |
+| **腰部** | 反解只输出 14 个手臂关节，腰由机器人全身策略驱动。`--target-frame torso`（默认）下腰角**不参与**手臂解算；`--target-frame pelvis` 时用 6001 读到的实测腰角换算（`--waist state`），或按 xr_teleoperate 的"腰=0"假设（`--waist zero`）。 |
 
-### 3.1 模型变体（手 / 夹爪）与 `--ee-offset` 怎么选
+### 3.3 模型变体（手 / 夹爪）与 `--ee-offset` 怎么选
 
 仓库里有两份官方 URDF，同一份代码都能用（换 URDF 时"要锁定的关节"由程序自己从 URDF 推导，不用改代码）：
 
@@ -340,7 +362,7 @@ python main.py --robot-ip <IP> --arm right --pos 0.35 -0.20 0.10 --ee-speed 0 --
 |---|---|
 | `#50` | 第几个控制周期 |
 | `0.0ms` | 状态帧延迟；持续超过 `--state-timeout` 就不再下发 |
-| `meas` / `tgt` | 实测末端位置 / 目标位置（pelvis 系, m） |
+| `meas` / `tgt` | 实测末端位置 / 目标位置（**目标系**, m；默认 torso_link） |
 | `ik_err` | 反解精度（在求解坐标系里比较，与腰无关） |
 | `track_err` | 实测离目标的真实偏差 |
 | `ik=7.4ms` | 本周期 IK 耗时 |
@@ -437,7 +459,9 @@ python main.py --robot-ip 192.168.123.161 --arm right --interactive --on-arrive 
 |---|---|---|
 | `--robot-ip` | `192.168.123.161` | 机器人 IP |
 | `--arm` | `right` | `right` / `left` / `both`；未受控臂的 7 个关节被冻结保持 |
-| `--pos` / `--pos-left` / `--pos-right` | — | 目标位置（pelvis 系, m） |
+| `--pos` / `--pos-left` / `--pos-right` | — | 目标位置（默认 torso 系, m） |
+| `--target-frame` | `torso` | 目标位置/姿态表达在哪个系：`torso`=torso_link（躯干系，Tag 用这个）/ `pelvis`=骨盆系（旧行为） |
+| `--sim-waist` | `0 0 0` | 仅 `--sim`：把仿真腰摆成该角度(rad)，用于验证 torso 系的腰不变性 |
 | `--delta` | — | 相对当前位姿的位移，例 `--delta 0.05 0 0` |
 | `--rpy` | 保持启动朝向 | 目标姿态（rad） |
 | `--demo` | `none` | `circle` / `line` 轨迹测试 |

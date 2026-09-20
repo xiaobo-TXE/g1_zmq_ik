@@ -9,7 +9,7 @@
   # 1) 仿真闭环（没有机器人也能跑通整条链路）
   python main.py --sim --arm right --pos 0.35 -0.20 0.10 --duration 8
 
-  # 2) 真机：右臂末端（夹爪抓取中心）移到 pelvis 系下的 (0.35, -0.20, 0.10)，姿态保持不变
+  # 2) 真机：右臂末端（夹爪抓取中心）移到 torso 系下的 (0.35, -0.20, 0.10)，姿态保持不变
   python main.py --robot-ip 192.168.123.161 --arm right --pos 0.35 -0.20 0.10
 
   # 3) 先干跑（只打印不下发），确认数值合理再上真机
@@ -25,7 +25,9 @@
   python main.py --robot-ip 192.168.123.161 --arm right --pos 0.35 -0.20 0.10 \
       --arrive-pos 2 --arrive-rot 1 --on-arrive freeze
 
-坐标系：目标与打印的所有末端位置都在 **pelvis 系**（URDF 根 link，x 前 y 左 z 上，单位 m）。
+坐标系：目标与打印的所有末端位置都在 **同一个目标系**（x 前 y 左 z 上，单位 m）：
+  默认 **torso_link（躯干系）** —— 手臂挂在躯干上，腰怎么转都不影响手臂解算，Tag 抓取用这个；
+  用 --target-frame pelvis 可切回 **pelvis（骨盆）系**（旧行为，腰角参与换算）。
 """
 
 from __future__ import annotations
@@ -71,6 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--state-port", type=int, default=6001, help="状态 PUB 端口")
     g.add_argument("--cmd-port", type=int, default=6002, help="指令 PULL 端口")
     g.add_argument("--sim", action="store_true", help="不连机器人，用内部仿真状态源")
+    g.add_argument("--sim-waist", nargs=3, type=float, default=(0.0, 0.0, 0.0),
+                   metavar=("YAW", "ROLL", "PITCH"),
+                   help="仅 --sim：把仿真机器人的腰摆成这个角度(rad)，用于验证"
+                        "『目标系=torso 时腰不参与手臂几何』")
     g.add_argument("--dry-run", action="store_true", help="不发 6002，只打印将要发送的帧")
     g.add_argument("--rate", type=float, default=50.0, help="控制循环频率 Hz")
     g.add_argument("--duration", type=float, default=0.0, help="运行秒数，0=一直跑")
@@ -105,12 +111,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "调小会让冗余关节更自由")
     g.add_argument("--no-filter", action="store_true", help="关闭加权滑动平均滤波")
     g.add_argument("--waist", default="state", choices=["state", "zero"],
-                   help="state=用 6001 读到的实测腰角做坐标换算；zero=按 xr_teleoperate 的假设(腰=0)")
+                   help="【仅 --target-frame pelvis 有效】state=用 6001 读到的实测腰角做坐标换算；"
+                        "zero=按 xr_teleoperate 的假设(腰=0)。torso 系下腰角不参与手臂几何，本项无作用")
+    g.add_argument("--target-frame", default="torso", choices=["torso", "pelvis"],
+                   help="所有目标位置/姿态表达在哪个坐标系：torso=torso_link（躯干系，默认；"
+                        "Tag 检测给的就是这个系）；pelvis=骨盆系（URDF 根 link，旧行为）")
 
     g = p.add_argument_group("目标")
     g.add_argument("--arm", default="right", choices=["right", "left", "both"], help="控制哪条手臂")
     g.add_argument("--pos", nargs=3, type=float, metavar=("X", "Y", "Z"),
-                   help="目标位置(pelvis 系, m)")
+                   help="目标位置(默认 torso 系, m；--target-frame pelvis 则按骨盆系)")
     g.add_argument("--pos-left", nargs=3, type=float, metavar=("X", "Y", "Z"), help="左臂目标位置")
     g.add_argument("--pos-right", nargs=3, type=float, metavar=("X", "Y", "Z"), help="右臂目标位置")
     g.add_argument("--rpy", nargs=3, type=float, metavar=("R", "P", "Y"),
@@ -188,7 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 HELP_TEXT = """
 交互命令（直接输入回车执行）：
-  p X Y Z        设置目标位置 (pelvis 系, m)         例: p 0.35 -0.20 0.10
+  p X Y Z        设置目标位置 (默认 torso 系, m)      例: p 0.35 -0.20 0.10
   d DX DY DZ     在当前目标上叠加位移                例: d 0.02 0 0.03
   r R P Y        设置目标姿态 rpy (rad)              例: r 0 0 0     r=复位朝向
   a left|right|both   切换受控手臂
@@ -348,7 +358,8 @@ class DemoTrajectory:
         if self.mode == "none":
             return
         if self.center is None and ctrl.q_cmd is not None:
-            T_L, T_R = ctrl.model.fk_pelvis(ctrl.q_cmd, ctrl.waist_for_kinematics())
+            # 轨迹中心取"当前指令位姿"，且表达在**目标系**里（torso / pelvis 都适用）
+            T_L, T_R = ctrl.ee_in_target_frame(ctrl.q_cmd)
             self.center = {LEFT: T_L[:3, 3].copy(), RIGHT: T_R[:3, 3].copy()}
         if self.center is None:
             return
@@ -398,6 +409,9 @@ def run_check(args) -> int:
         from g1_ik import end_effector_joint_names
         print(f"         末端变体: {', '.join(end_effector_joint_names(model.full_model)) or '无（裸腕）'}")
         print(f"         末端点(EE) = wrist_yaw + x{args.ee_offset:.3f}m  ← 所有目标位置指的都是这个点")
+        print(f"         目标系 = {'torso_link（躯干系）' if args.target_frame == 'torso' else 'pelvis（骨盆系）'}"
+              f"；torso 原点相对 pelvis = {model.torso_offset_mm():.2f}mm"
+              f"（常量，与腰角无关）")
         T_L, T_R = model.fk(model.neutral())
         print(f"         零位 FK: L_ee={np.round(T_L[:3, 3], 4)}  R_ee={np.round(T_R[:3, 3], 4)}")
         print("\n" + model.limits_table())
@@ -492,7 +506,7 @@ def main(argv=None) -> int:
     # 通信
     if args.sim:
         from sim_arm import SimulatedCommandSink
-        state = SimulatedStateSource(SimulatedArmState(),
+        state = SimulatedStateSource(SimulatedArmState(waist=args.sim_waist),
                                      dt=1.0 / max(args.rate, 1e-3))
         # 只借用 ArmCommandPublisher 的协议打包/校验能力（不 connect）
         fmt = ArmCommandPublisher("127.0.0.1", args.cmd_port, connect=False)
@@ -506,6 +520,7 @@ def main(argv=None) -> int:
     ctrl = ArmController(model, ik, state, pub,
                          controlled=args.arm,
                          waist_source=args.waist,
+                         target_frame=args.target_frame,
                          use_filter=not args.no_filter,
                          max_step_deg=args.max_step_deg,
                          ee_speed=args.ee_speed,
@@ -530,7 +545,12 @@ def main(argv=None) -> int:
     log.info("%s", ctrl.describe())
     if hasattr(ik, "backend"):
         log.info("符号正解后端: %s", ik.backend)
-    log.info("目标系=pelvis(x前 y左 z上, m)；受控臂=%s；求解器=%s", args.arm, ik.name)
+    if args.target_frame == "torso":
+        log.info("目标系=torso_link（躯干系，x前 y左 z上，m）—— Tag 检测给的就是这个系；"
+                 "手臂挂在躯干上，**腰角不参与手臂解算**（--target-frame pelvis 可切回骨盆系）")
+    else:
+        log.info("目标系=pelvis（骨盆系/URDF 根 link，x前 y左 z上，m）；腰参考=%s", args.waist)
+    log.info("受控臂=%s；求解器=%s", args.arm, ik.name)
     log.info("末端点(EE)=wrist_yaw + x%.3fm（--ee-offset）；目标位置/到位判定都指这个点", args.ee_offset)
     if args.demo != "none":
         log.info("轨迹: %s 半径/幅值=%s 周期=%.1fs", args.demo, args.radius if args.demo == "circle" else args.amp,
