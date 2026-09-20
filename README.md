@@ -303,8 +303,30 @@ python main.py --robot-ip <IP> --arm right --pos 0.35 -0.20 0.10 --ee-speed 0 --
 | 名称 | 含义 |
 |---|---|
 | **pelvis 系** | URDF 根 link 为 `pelvis`：**x 前、y 左、z 上**，单位 m。目标位置与日志里的位置都用这个系。 |
-| **末端点** | `L_ee`/`R_ee` 挂在 `*_wrist_yaw_joint` 上并沿轴偏 **0.05m**（约掌根，与 xr_teleoperate 一致）；用 `--ee-offset` 可改。 |
+| **末端点（EE）** | `L_ee`/`R_ee` 挂在 `*_wrist_yaw_joint` 上、沿轴偏 `--ee-offset`（默认 **0.152m** = Dex1 夹爪抓取中心）。**目标位置、`track_err`、到位判定说的都是这个点**。 |
 | **腰部** | 反解只输出 14 个手臂关节，腰由机器人全身策略驱动。程序默认用 6001 读到的**实测腰角**做坐标换算（`--waist state`）；想按 xr_teleoperate 的"腰=0"假设走，用 `--waist zero`。 |
+
+### 3.1 模型变体（手 / 夹爪）与 `--ee-offset` 怎么选
+
+仓库里有两份官方 URDF，同一份代码都能用（换 URDF 时"要锁定的关节"由程序自己从 URDF 推导，不用改代码）：
+
+| 变体 | URDF | 全模型 nq | 末端关节 | `--ee-offset` 建议值 |
+|---|---|---|---|---|
+| **G1-29DoF + Dex1 夹爪**（默认，`mode_machine=15`） | `assets/g1/g1_29dof_mode_15_with_dex1_1.urdf` | **33**（腿12+腰3+夹爪4+臂14） | `left/right_dex1_finger_joint_1/2`（2 个/手，prismatic） | **0.152** = 抓取中心 |
+| G1-29DoF + Dex3 三指手（原默认） | `assets/g1/g1_body29_hand14.urdf` | 43（腿12+腰3+手指14+臂14） | `left/right_hand_*`（7 个/手） | 0.05 = 掌根（xr_teleoperate 口径） |
+
+两份 URDF 的**关节限位完全相同**，手臂链几何差 5.0mm（腕部不同批次），所以换模型后 IK 约束不变、末端点只按 `--ee-offset` 平移。
+
+`--ee-offset` 是"从腕部 yaw 关节沿夹爪接近方向往前多少米"。Dex1 夹爪的实测几何（官方 mesh 量出来的，距 `wrist_yaw` 关节）：
+
+| 你想要的"末端点" | 建议 `--ee-offset` | 说明 |
+|---|---|---|
+| 抓取中心（**默认、推荐**） | `0.152` | 两指之间、抓取段中点：Tag 标在"物体该被夹住的位置"时用这个 |
+| 指尖平面 | `0.185` | 手指最前端：Tag 标在"指尖该碰到哪里"时用 |
+| 夹爪根部（法兰） | `0.111` | 夹爪底座外端 |
+| 掌根（旧 Dex3 口径） | `0.05` | 落在夹爪体内，仅用于和旧数据对齐 |
+
+> 换模型后**先把 `--dry-run` 跑一遍**：日志里 `meas=` 就是当前末端点位置，确认它和你用尺子量到的夹爪位置一致，再上目标。
 
 ---
 
@@ -420,6 +442,8 @@ python main.py --robot-ip 192.168.123.161 --arm right --interactive --on-arrive 
 | `--rpy` | 保持启动朝向 | 目标姿态（rad） |
 | `--demo` | `none` | `circle` / `line` 轨迹测试 |
 | `--rate` | `50` | 控制循环频率 Hz |
+| `--urdf` | Dex1 夹爪版 | 模型文件。默认 `assets/g1/g1_29dof_mode_15_with_dex1_1.urdf`；Dex3 三指手用 `assets/g1/g1_body29_hand14.urdf`（见 §3.1） |
+| `--ee-offset` | `0.152` | 末端点相对 `wrist_yaw` 的 x 偏移 m。**目标位置指的就是这个点**；0.185=指尖、0.111=夹爪根部、0.05=Dex3 掌根（见 §3.1） |
 | `--solver` | `auto` | `auto` 优先 CasADi/IPOPT；`casadi` 强制原算法（缺依赖直接报错）；`dls` 用回退求解器 |
 | `--fk-backend` | `auto` | 符号正解后端：`auto` 优先 `pinocchio.casadi`、否则用内置实现；也可强制 `pinocchio` / `builtin` |
 | `--w-trans` `--w-rot` `--w-reg` `--w-smooth` | `50` `1.0` `0` `0.1` | IK 权重。**正则项默认 0（精度优先）**；填 `--w-reg 0.02` 回到 xr_teleoperate 原版（会带来约 3mm 系统性偏置与静止漂移，见 docs） |
@@ -466,7 +490,9 @@ g1_zmq_ik/
 ├── joint_map.py            电机序 ↔ SDK 关节名 ↔ LeRobot 键名
 ├── target_io.py            目标流输入（ZMQ 6003 PULL，供外部程序持续下发目标）
 ├── sim_arm.py              一阶跟随仿真手臂（--sim 与 mock_robot 共用）
-├── assets/g1/              G1-29DoF URDF（只需 URDF，不需要 meshes）
+├── assets/g1/              官方 URDF（只需 URDF，不需要 meshes）：
+│                            g1_29dof_mode_15_with_dex1_1.urdf（默认，Dex1 夹爪）
+│                            g1_body29_hand14.urdf（Dex3 三指手）
 ├── pyproject.toml / requirements.txt    uv 依赖声明（uv sync / uv pip install -r）
 ├── tools/
 │   ├── mock_robot.py       本地假机器人：复刻 6001/6002 协议，便于不接真机联调

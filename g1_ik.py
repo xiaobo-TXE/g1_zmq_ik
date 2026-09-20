@@ -54,20 +54,38 @@ W_REGULARIZATION = 0.0   # 正则项权重（**本工程默认 0 = 精度优先*
 W_REGULARIZATION_UNITREE = 0.02   # xr_teleoperate 原值，供对照/复现
 W_SMOOTH = 0.1           # 平滑项：抑制关节抖动（原版值）
 
-# 锁定的关节（腿 12 + 腰 3 + 手指 14），G1-29 手臂链只剩 14 个自由度
-LOCKED_JOINT_NAMES = [
+# 腿 + 腰（15 个关节，换手/换夹爪都不变），仅作参考与日志用
+LEG_WAIST_JOINT_NAMES = [
     "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
     "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
     "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
     "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
     "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
-    "left_hand_thumb_0_joint", "left_hand_thumb_1_joint", "left_hand_thumb_2_joint",
-    "left_hand_middle_0_joint", "left_hand_middle_1_joint",
-    "left_hand_index_0_joint", "left_hand_index_1_joint",
-    "right_hand_thumb_0_joint", "right_hand_thumb_1_joint", "right_hand_thumb_2_joint",
-    "right_hand_index_0_joint", "right_hand_index_1_joint",
-    "right_hand_middle_0_joint", "right_hand_middle_1_joint",
 ]
+
+#: 手部/夹爪关节名的识别关键字（只用于日志里报"检测到哪种末端"）
+HAND_KEYWORDS = ("hand", "dex1", "dex3", "gripper", "finger", "thumb", "index", "middle")
+
+
+def locked_joint_names(model) -> List[str]:
+    """从全模型推导"需要锁定的关节" = 除 14 个手臂关节以外的所有可动关节。
+
+    同一份代码因此能吃下面两种（以及以后更多）末端变体：
+      * G1-29 + Dex3 三指手（assets/g1/g1_body29_hand14.urdf）
+        腿 12 + 腰 3 + 手指 14 = 29 个锁定 → 全模型 nq=43，缩链后 14
+      * G1-29 + Dex1 夹爪（assets/g1/g1_29dof_mode_15_with_dex1_1.urdf）
+        腿 12 + 腰 3 + 夹爪  4 = 19 个锁定 → 全模型 nq=33，缩链后 14
+
+    （旧实现把这 14 个手指名字写死，换成夹爪 URDF 会直接报 "URDF 缺少待锁定关节"。）
+    """
+    arm = set(ARM_JOINT_NAMES)
+    return [model.names[i] for i in range(1, model.njoints) if model.names[i] not in arm]
+
+
+def end_effector_joint_names(model) -> List[str]:
+    """手部/夹爪关节名（只用于日志：告诉你当前加载的是手还是夹爪）。"""
+    return [n for n in locked_joint_names(model)
+            if any(k in n.lower() for k in HAND_KEYWORDS)]
 
 # 手臂链在 pelvis 之后的“根参考帧”所挂的关节：用它定义 腰部->手臂 的变换 A
 ARM_CHAIN_ROOT_JOINT = "left_shoulder_pitch_joint"
@@ -122,9 +140,11 @@ class WeightedMovingFilter:
 class G1ArmModel:
     """G1-29 双臂运动学模型。
 
-    两套模型：
-      full     : 完整 43 自由度（腿12 + 腰3 + 左臂7 + 左手7 + 右臂7 + 右手7）
-      reduced  : 锁掉腿/腰/手指后只剩 14 个手臂关节（与 IK 的 q 维度一致）
+    两套模型（nq 随末端变体而变）：
+      full     : 完整自由度。Dex3 三指手 = 43（腿12 + 腰3 + 臂14 + 手指14）；
+                 Dex1 夹爪 = 33（腿12 + 腰3 + 臂14 + 夹爪4）
+      reduced  : 锁掉腿/腰/末端后只剩 14 个手臂关节（与 IK 的 q 维度一致）
+      要锁哪些关节由 locked_joint_names() 从 URDF 推导，不写死名字（见 README §3.1）。
 
     坐标系约定（非常重要）：
       "locked 坐标系" = reduced 模型的基座，等价于「腰关节全部为 0 时的 pelvis 系」。
@@ -144,9 +164,14 @@ class G1ArmModel:
         self.cache_dir = cache_dir
 
         self.full_model = pin.buildModelFromUrdf(urdf_path)
-        if self.full_model.nq != 43:
-            logger.warning("URDF 自由度 %d != 43，本工具按 G1-29DoF(g1_body29_hand14.urdf) 设计",
-                           self.full_model.nq)
+        if self.full_model.nq < N_ARM:
+            raise RuntimeError(
+                f"URDF 自由度 {self.full_model.nq} < 手臂关节数 {N_ARM}，不是 G1 模型")
+        ee_joints = end_effector_joint_names(self.full_model)
+        logger.info("URDF %s：全模型 nq=%d = 腿12 + 腰3 + 末端%d + 手臂%d；末端关节: %s",
+                    os.path.basename(urdf_path), self.full_model.nq,
+                    self.full_model.nq - 15 - N_ARM, N_ARM,
+                    ", ".join(ee_joints) if ee_joints else "无（裸腕，只锁腿+腰）")
 
         self.model = self._build_reduced(urdf_path, ee_offset)
         if self.model.nq != N_ARM:
@@ -159,6 +184,7 @@ class G1ArmModel:
         self.R_ee_id = self.model.getFrameId("R_ee")
 
         # 腰部投影用：手臂链根参考帧（腰之后）
+        self._waist_names = ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint")
         self.root_joint_id = self.full_model.getJointId(ARM_CHAIN_ROOT_JOINT)
         self.A0 = self._fk_full_frame(pin.neutral(self.full_model), self.root_joint_id)
 
@@ -170,10 +196,13 @@ class G1ArmModel:
     def _build_reduced(self, urdf_path: str, ee_offset: float) -> pin.Model:
         def build() -> pin.Model:
             full = pin.buildModelFromUrdf(urdf_path)
-            missing = [n for n in LOCKED_JOINT_NAMES if not full.existJointName(n)]
-            if missing:
-                raise RuntimeError(f"URDF 缺少待锁定关节: {missing}")
-            lock_ids = [full.getJointId(n) for n in LOCKED_JOINT_NAMES]
+            # 缺了手臂关节 = 根本不是 G1-29 模型，直接报错
+            missing_arm = [n for n in ARM_JOINT_NAMES if not full.existJointName(n)]
+            if missing_arm:
+                raise RuntimeError(f"URDF 缺少手臂关节 {missing_arm}，不是 G1-29DoF 模型")
+            # 其余可动关节（腿 12 + 腰 3 + 手/夹爪）全部锁定 -> 只剩 14 个手臂自由度
+            lock_names = locked_joint_names(full)
+            lock_ids = [full.getJointId(n) for n in lock_names]
             reduced = pin.buildReducedModel(full, lock_ids, pin.neutral(full))
             for side, joint in (("L", "left_wrist_yaw_joint"), ("R", "right_wrist_yaw_joint")):
                 reduced.addFrame(pin.Frame(
@@ -184,8 +213,11 @@ class G1ArmModel:
 
         if not self.cache_dir:
             return build()
-        cache_path = os.path.join(self.cache_dir, f"_model_cache_ee{ee_offset:g}.pkl")
-        stamp = {"mtime": os.path.getmtime(urdf_path), "size": os.path.getsize(urdf_path)}
+        # 缓存键要带 URDF 文件名：手版(43)与夹爪版(33)在同一个目录下共享 offset 时不能串味
+        stem = os.path.splitext(os.path.basename(urdf_path))[0]
+        cache_path = os.path.join(self.cache_dir, f"_model_cache_{stem}_ee{ee_offset:g}.pkl")
+        stamp = {"urdf": stem, "mtime": os.path.getmtime(urdf_path),
+                 "size": os.path.getsize(urdf_path)}
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, "rb") as f:
@@ -227,7 +259,10 @@ class G1ArmModel:
         if q_waist3 is None:
             return self.A0.copy()
         q_full = pin.neutral(self.full_model)
-        q_full[12:15] = np.asarray(q_waist3, dtype=float).reshape(3)
+        # 按关节名写腰角（不按索引）：所有 G1 变体里腰都是 12..14，但这里不再依赖布局顺序
+        for name, v in zip(self._waist_names, np.asarray(q_waist3, dtype=float).reshape(3)):
+            j = self.full_model.joints[self.full_model.getJointId(name)]
+            q_full[j.idx_q] = float(v)
         return self._fk_full_frame(q_full, self.root_joint_id)
 
     def fk_pelvis(self, q14: Sequence[float],

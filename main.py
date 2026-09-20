@@ -9,7 +9,7 @@
   # 1) 仿真闭环（没有机器人也能跑通整条链路）
   python main.py --sim --arm right --pos 0.35 -0.20 0.10 --duration 8
 
-  # 2) 真机：右臂末端移到 pelvis 系下的 (0.35, -0.20, 0.10)，姿态保持不变
+  # 2) 真机：右臂末端（夹爪抓取中心）移到 pelvis 系下的 (0.35, -0.20, 0.10)，姿态保持不变
   python main.py --robot-ip 192.168.123.161 --arm right --pos 0.35 -0.20 0.10
 
   # 3) 先干跑（只打印不下发），确认数值合理再上真机
@@ -49,7 +49,11 @@ from target_io import TargetReceiver
 from zmq_link import ArmCommandPublisher, RobotStateSubscriber
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_URDF = os.path.join(HERE, "assets", "g1", "g1_body29_hand14.urdf")
+# 默认模型 = 官方 G1-29DoF + Dex1 夹爪（mode_machine=15）。
+# 换成 Dex3 三指手：--urdf assets/g1/g1_body29_hand14.urdf --ee-offset 0.05
+DEFAULT_URDF = os.path.join(HERE, "assets", "g1", "g1_29dof_mode_15_with_dex1_1.urdf")
+#: 末端点默认值 = Dex1 夹爪的抓取中心（详见 README §3「末端点」）
+DEFAULT_EE_OFFSET = 0.152
 DEFAULT_IP = "192.168.123.161"
 
 log = logging.getLogger("main")
@@ -76,9 +80,13 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--print-joints", action="store_true", help="同时打印 14 个下发关节角")
 
     g = p.add_argument_group("模型与求解")
-    g.add_argument("--urdf", default=DEFAULT_URDF, help="URDF 路径（只需 URDF，不需要 meshes）")
-    g.add_argument("--ee-offset", type=float, default=0.05,
-                   help="末端 frame 相对 wrist_yaw 关节的 x 偏移 m（与 xr_teleoperate 一致）")
+    g.add_argument("--urdf", default=DEFAULT_URDF,
+                   help="URDF 路径（只需 URDF，不需要 meshes）。默认 = G1-29DoF + Dex1 夹爪；"
+                        "Dex3 三指手用 assets/g1/g1_body29_hand14.urdf")
+    g.add_argument("--ee-offset", type=float, default=DEFAULT_EE_OFFSET,
+                   help="末端点(EE)相对 wrist_yaw 关节的 x 偏移 m —— 目标位置指的就是这个点。"
+                        "默认 0.152 = Dex1 夹爪抓取中心；0.185=指尖平面、0.111=夹爪根部；"
+                        "Dex3 三指手用 0.05=掌根")
     g.add_argument("--solver", default="auto", choices=["auto", "casadi", "dls"],
                    help="casadi=IPOPT(与 xr_teleoperate 一致) / dls=雅可比迭代回退")
     g.add_argument("--ik-max-iter", type=int, default=30,
@@ -387,6 +395,9 @@ def run_check(args) -> int:
                            cache_dir=None if args.no_cache else HERE)
         print(f"  [OK]   URDF {args.urdf}")
         print(f"         full nq={model.full_model.nq}  reduced nq={model.model.nq} (应=14)")
+        from g1_ik import end_effector_joint_names
+        print(f"         末端变体: {', '.join(end_effector_joint_names(model.full_model)) or '无（裸腕）'}")
+        print(f"         末端点(EE) = wrist_yaw + x{args.ee_offset:.3f}m  ← 所有目标位置指的都是这个点")
         T_L, T_R = model.fk(model.neutral())
         print(f"         零位 FK: L_ee={np.round(T_L[:3, 3], 4)}  R_ee={np.round(T_R[:3, 3], 4)}")
         print("\n" + model.limits_table())
@@ -481,7 +492,8 @@ def main(argv=None) -> int:
     # 通信
     if args.sim:
         from sim_arm import SimulatedCommandSink
-        state = SimulatedStateSource(SimulatedArmState(), dt=1.0 / max(args.rate, 1e-3))
+        state = SimulatedStateSource(SimulatedArmState(),
+                                     dt=1.0 / max(args.rate, 1e-3))
         # 只借用 ArmCommandPublisher 的协议打包/校验能力（不 connect）
         fmt = ArmCommandPublisher("127.0.0.1", args.cmd_port, connect=False)
         pub = SimulatedCommandSink(state, fmt)
@@ -519,6 +531,7 @@ def main(argv=None) -> int:
     if hasattr(ik, "backend"):
         log.info("符号正解后端: %s", ik.backend)
     log.info("目标系=pelvis(x前 y左 z上, m)；受控臂=%s；求解器=%s", args.arm, ik.name)
+    log.info("末端点(EE)=wrist_yaw + x%.3fm（--ee-offset）；目标位置/到位判定都指这个点", args.ee_offset)
     if args.demo != "none":
         log.info("轨迹: %s 半径/幅值=%s 周期=%.1fs", args.demo, args.radius if args.demo == "circle" else args.amp,
                  args.period)

@@ -31,7 +31,9 @@ import g1_ik  # noqa: E402
 from g1_ik import G1ArmModel, make_ik, pose_error, self_test  # noqa: E402
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_URDF = os.path.join(HERE, "assets", "g1", "g1_body29_hand14.urdf")
+# 与 main.py 的默认保持一致：G1-29DoF + Dex1 夹爪
+DEFAULT_URDF = os.path.join(HERE, "assets", "g1", "g1_29dof_mode_15_with_dex1_1.urdf")
+DEFAULT_EE_OFFSET = 0.152
 
 
 def tracking_test(model: G1ArmModel, ik, steps: int = 200, radius: float = 0.05,
@@ -58,7 +60,8 @@ def tracking_test(model: G1ArmModel, ik, steps: int = 200, radius: float = 0.05,
 def main() -> int:
     p = argparse.ArgumentParser(description="正反解离线自检")
     p.add_argument("--urdf", default=DEFAULT_URDF)
-    p.add_argument("--ee-offset", type=float, default=0.05)
+    p.add_argument("--ee-offset", type=float, default=DEFAULT_EE_OFFSET,
+                   help="末端点相对 wrist_yaw 的 x 偏移 m（默认 0.152 = Dex1 夹爪抓取中心）")
     p.add_argument("--solver", default="auto", choices=["auto", "casadi", "dls"])
     p.add_argument("--samples", type=int, default=50)
     p.add_argument("--tracking", action="store_true", help="额外做轨迹跟踪测试")
@@ -78,9 +81,19 @@ def main() -> int:
     import pinocchio as pin
     rng = np.random.default_rng(7)
     qf = pin.neutral(model.full_model)
-    qf[12:15] = [0.25, -0.15, 0.10]                      # 腰不为 0
-    qf[15:22] = rng.uniform(-0.6, 0.6, 7)                # 左臂
-    qf[29:36] = rng.uniform(-0.6, 0.6, 7)                # 右臂（全模型里右臂在 29..35）
+
+    def set_q(name: str, value) -> None:
+        """按关节名写值（不假设索引 —— 手版 nq=43 与夹爪版 nq=33 的布局不同）。"""
+        j = model.full_model.joints[model.full_model.getJointId(name)]
+        v = np.atleast_1d(np.asarray(value, dtype=float))
+        qf[j.idx_q:j.idx_q + j.nq] = v
+
+    waist = np.array([0.25, -0.15, 0.10])                 # 腰不为 0
+    for n, v in zip(("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"), waist):
+        set_q(n, v)
+    q_arm = rng.uniform(-0.6, 0.6, 14)                    # 左臂 7 + 右臂 7（顺序 = IK 的 q）
+    for n, v in zip(g1_ik.ARM_JOINT_NAMES, q_arm):
+        set_q(n, v)
     d = model.full_model.createData()
     pin.forwardKinematics(model.full_model, d, qf)
     pin.updateFramePlacements(model.full_model, d)
@@ -89,7 +102,7 @@ def main() -> int:
     max_err = 0.0
     for i, joint in enumerate(("left_wrist_yaw_joint", "right_wrist_yaw_joint")):
         T_true = d.oMf[model.full_model.getFrameId(joint)].homogeneous @ off
-        T_got = model.fk_pelvis(np.concatenate([qf[15:22], qf[29:36]]), qf[12:15])[i]
+        T_got = model.fk_pelvis(q_arm, waist)[i]
         max_err = max(max_err, float(np.abs(T_true - T_got).max()))
     print(f"\n[1] 腰部坐标换算校验（实测腰角 -> pelvis 系 FK）: 最大逐元素误差 = {max_err:.2e} "
           f"{'✓' if max_err < 1e-9 else '✗ 检查 fk_pelvis/pelvis_to_locked'}")
