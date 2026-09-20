@@ -132,7 +132,9 @@ class ArmController:
         self.target_rpy: Dict[str, Optional[np.ndarray]] = {}
         self.target_rev: Dict[str, int] = {LEFT: 0, RIGHT: 0}   # 目标真的变了才自增
         self._ref_rot: Optional[Dict[str, np.ndarray]] = None
-        self._pending_position: Optional[Tuple[str, np.ndarray]] = None
+        # 参考姿态还没锁定时收到的位置目标，按手臂排队（原实现是单槽，
+        # --arm both 时先到的左臂会被右臂覆盖，导致左臂目标被丢掉）
+        self._pending_positions: List[Tuple[str, np.ndarray]] = []
 
         self.q_cmd: Optional[np.ndarray] = None
         self.q_meas: Optional[np.ndarray] = None
@@ -173,7 +175,7 @@ class ArmController:
         elif self._ref_rot is not None:
             rot = self._ref_rot[arm]
         else:
-            self._pending_position = (arm, pos)      # 参考姿态还没锁定，等第一帧补上
+            self._pending_positions.append((arm, pos))   # 参考姿态还没锁定，等第一帧补上
             return
         T = np.eye(4)
         T[:3, 3] = pos
@@ -206,10 +208,10 @@ class ArmController:
         T_L, T_R = self.model.fk_pelvis(self.q_meas, self.waist_for_kinematics())
         self._ref_rot = {LEFT: T_L[:3, :3].copy(), RIGHT: T_R[:3, :3].copy()}
         logger.info("已锁定参考姿态（纯位置指令将保持该末端朝向）")
-        if self._pending_position is not None:
-            arm, pos = self._pending_position
-            self._pending_position = None
-            self.set_target_position(arm, pos)
+        if self._pending_positions:
+            pending, self._pending_positions = self._pending_positions, []
+            for arm, pos in pending:
+                self.set_target_position(arm, pos)
 
     # ------------------------------------------------------------------ 辅助
     def waist_for_kinematics(self) -> Optional[np.ndarray]:
