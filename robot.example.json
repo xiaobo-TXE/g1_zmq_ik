@@ -16,6 +16,7 @@
     "arm": "right",
     "target_frame": "torso",
     "interactive": true,
+    "target_timeout": 3,
     "_夹爪标定": "open_cm/qmax/qmin 是真机量出来的量程；改之前先核对机器人侧 config.yaml 的 FSM.Groot.gripper",
     "grip_open_cm": 8.5,
     "grip_qmax_rad": 5.6217,
@@ -49,5 +50,6 @@
     "print_axes": true,
     "send_quat": true,
     "_标定提示": "先用 --no-send 看 axes(marker/torso) 与 axes(ee/torso)，确认偏移方向和手指开合方向"
-  }
+  },
+  "_视觉流程": "看 README §2.2.1：机器人先进 Groot+VLA → 先起 main.py（不给 --pos）→ 再起 tools/detect_aruco_zmq.py；到位后按 main.grip_on_arrive_soft 自动力限闭爪"
 }

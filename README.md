@@ -169,12 +169,31 @@ python main.py --config robot.json --pos 0.35 -0.20 0.15
 }
 ```
 
-于是两个终端各一行：
+于是两个终端各一行（**视觉抓取流程**）：
 
 ```bash
-python main.py --config robot.json --pos 0.35 -0.20 0.15            # 终端 A：控制
-python tools/detect_aruco_zmq.py --config robot.json                # 终端 B：Tag 检测 → 6003
+# 终端 A：控制端（bind 6003 / 读 6001 / 发 6002）
+python main.py --config robot.json
+# 终端 B：Tag 检测端（检出标记 → 算抓取点 → PUSH 6003）
+python tools/detect_aruco_zmq.py --config robot.json
 ```
+
+**顺序**：机器人侧先进 Groot 状态、再切 VLA（键盘 `3` / 手柄 `LB+A`）→ 起 **A** → 起 **B**。
+B 先起也能跑（6003 是 A 绑的，A 起来之前目标发不出去而已），但先 A 后 B 更好排查。
+
+**视觉流程不要给 `--pos`**：目标应当全部来自 6003；给了 `--pos` 手臂会先跑到那个点、等第一帧标记
+目标到了再改道（限速下不会猛，但纯属白跑）。只有"不用相机的联调"才需要 `--pos`，见上一节。
+
+**跑通了看这三行**：
+
+```
+✅ 到位 [right] 实测残差 0.2mm/0.2° …                  ← 到位判定通过
+开始软闭合[到位后 --grip-on-arrive-soft 0.3] …          ← 到位后自动力限软闭合
+软闭合: right 接触冻结：接触（|τ|=0.31 ≥ 0.3） …        ← 夹住并冻住，不再加压
+```
+
+示例配置的 `main` 段已经带了 `"target_timeout": 3`：检测端挂掉时日志会提示"目标流失联"
+（手臂保持在最后一条目标，不会松手也不会乱动）。
 
 只想配一个程序时也可以不分段：所有键直接写在顶层（程序读"顶层 + 自己那段"）。
 
@@ -308,6 +327,20 @@ python tools/detect_aruco_zmq.py --marker-to-grasp 0 0 -0.015
 #   ↑ 参数也能写进 robot.json 的 aruco 段，之后就是：
 #   python tools/detect_aruco_zmq.py --config robot.json
 ```
+
+**真机完整流程**（两个终端 + 顺序）：
+
+```bash
+# 机器人侧：手柄 RB+X 进 Groot → 键盘 3 / 手柄 LB+A 切 VLA
+# 终端 A：控制端（先起它；不要给 --pos，目标全部来自 6003）
+python main.py --config robot.json
+# 终端 B：Tag 检测端
+python tools/detect_aruco_zmq.py --config robot.json
+```
+
+顺序与判据：**先 A 后 B**（6003 由 A bind；A 未起时 B 的目标发不出去，B 会先按 SNDTIMEO 丢几帧
+而不会卡死）。B 起来后看终端 A 的日志依次出现 `✅ 到位` → `开始软闭合[到位后 --grip-on-arrive-soft …]`
+→ `接触冻结`，就说明"检测 → 6003 → 手臂移动 → 到位 → 力限闭爪"整条链路通了。
 
 **标记位姿 ≠ 抓取点**：检测给的是 **25mm 标记中心**的位姿，所以要用 `--marker-to-grasp DX DY DZ`
 补上"标记中心 → 抓取点"的偏移。这个偏移是在**标记自身坐标系**里给的（由 solvePnP 的
