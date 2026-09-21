@@ -924,11 +924,16 @@ g1_zmq_ik/
 │   ├── mock_gripper_box.py 假夹爪 + 假盒子（离线量化「位置闭合 vs 力限软闭合」）
 │   ├── detect_aruco_zmq.py ArUco/AprilTag 检测 → torso 系目标 → 6003（需 opencv-contrib）
 │   ├── test_arrival.py     到位判定离线单测（合成 StepInfo 序列，44 项检查）
-│   ├── test_target_frame.py 目标系/pelvis 兼容/quat 单测（19 项检查）
+│   ├── test_target_frame.py 目标系/pelvis 兼容/quat 单测（20 项检查）
 │   ├── test_target_io.py   6003 字段解析单测（动作型帧、失败隔离，24 项检查）
 │   ├── test_config.py      --config 单测（类型转换/命令行优先/坏输入，23 项检查）
 │   ├── tune_motion.py      速度/加速度标定工具（扫描网格，量化平滑度）
 │   ├── selftest_offline.py 离线检查脚本：正解一致性 / 反解精度 / 轨迹跟踪
+│   ├── audit_torso_frame.py          独立核对躯干系正解/反解（手写 URDF 正解，不复用 g1_ik）
+│   ├── audit_aruco_torso_transform.py 独立核对 Tag→torso 换算公式（合成真值投影 + 负对照）
+│   ├── audit_aruco_e2e.py            端到端：合成相机图 → 检测端 → 6003 → main.py --sim
+│   ├── audit_y_offset.py             y 偏移定量归因（外参/内参/标签贴合/IPPE 双解的灵敏度）
+│   └── audit_motion_path.py          末端轨迹是直线还是曲线（与弦的偏离、路径长度比）
 └── docs/                   源码逐行对照、ZMQ 协议详解、实测数据
 ```
 
