@@ -13,18 +13,26 @@
 
 发送的帧（g1_zmq_ik 的 6003 契约，一行 JSON）::
 
-    {"pos": [x, y, z]}                         # torso_link 系；本工具只发位置
+    {"pos": [x, y, z], "quat": [x, y, z, w]}   # 都在 torso_link 系
+                                               # pos 必填；quat 让夹爪跟着标记转向
+                                               # （--no-quat 可只发位置，回到"保持锁定朝向"）
 
-**抓取点怎么算出来的**：先取标记位姿 T_marker（torso 系），再右乘一个固定的位置偏移::
+**抓取位姿怎么算出来的**：先取标记位姿 T_marker（torso 系），再右乘一个固定的"工具对准"变换::
 
-    T_ee_target = T_marker @ [ I | offset ]            # offset 来自 --marker-to-grasp
+    T_ee_target = T_marker @ [ R_align | offset ]      # R_align 来自 --grasp-align-rpy
+                                                       # offset 来自 --marker-to-grasp
 
-`--marker-to-grasp DX DY DZ` 是**在标记自身坐标系里**给的三维偏移：标记 x/y 在标签平面内，
-z 垂直于标签向外。标记贴在盒子顶面、面朝上时标记 z ≈ torso +z，所以"从顶面往下 1.5cm
-（盒子腰部）"就是 `--marker-to-grasp 0 0 -0.015`。
+`--grasp-align-rpy R P Y` 是**在标记自身坐标系里**表达的旋转（ZYX 顺序），用来把"夹爪的姿态"
+对准到标记上。常见取值（标记贴在盒子顶面、面朝上时）::
 
-> 真机上先用 `--no-send` 看打印出来的 `axes(marker/torso)`，确认标记轴指向，再定量偏移。
-> 朝向暂不下发（帧里只有 pos）：末端保持启动时锁定的朝向。
+    0 0 0     水平探入（EE.x = 标记 x），手指沿标记 y 开合     ← 默认
+    0 0 90    水平探入，手指沿标记 x 开合（把开合方向转 90°）
+    0 90 0    从正上方垂直向下探入（EE.x = −标记 z），手指沿标记 y
+    0 90 90   从正上方垂直向下探入，手指沿标记 x
+
+> 哪个方向对，取决于你打算从哪边夹盒子（桌面上通常水平探入）。
+> 真机上先用 `--no-send` 看打印出来的 `axes(ee)`，确认夹爪的 x（探入方向）与 y（开合方向）
+> 是不是你想要的；不对就调 `--grasp-align-rpy`。
 
 夹爪不在这一帧里下发：请用 g1_zmq_ik 的 `--grip-on-arrive-soft TAU`
 （到位后力限软闭合，见 README §2.7），或运行中敲 `gc`。
@@ -211,8 +219,10 @@ class TargetSender:
       * 跳变拒绝    ：单帧跳变 > --jump-reject-mm 判为误检，丢弃并告警
     """
 
-    def __init__(self, endpoint, hz, deadband_mm, jump_reject_mm, enabled=True):
+    def __init__(self, endpoint, hz, deadband_mm, jump_reject_mm,
+                 send_quat=False, enabled=True):
         self.enabled = bool(enabled)
+        self.send_quat = bool(send_quat)
         self.period = 1.0 / max(float(hz), 1e-3)
         self.deadband = float(deadband_mm) / 1000.0
         self.jump_reject = float(jump_reject_mm) / 1000.0
@@ -235,7 +245,7 @@ class TargetSender:
               '跳变拒绝 {:.0f}mm'.format(endpoint, hz, deadband_mm, jump_reject_mm),
               flush=True)
 
-    def maybe_send(self, position_torso, now=None):
+    def maybe_send(self, position_torso, quaternion_torso=None, now=None):
         """返回 True 表示本帧真的发出去了。"""
         if not self.enabled or self.socket is None:
             return False
@@ -257,6 +267,9 @@ class TargetSender:
                 self.skipped += 1
                 return False
         frame = {'pos': [round(float(v), 6) for v in p]}
+        if self.send_quat and quaternion_torso is not None:
+            q = np.asarray(quaternion_torso, dtype=np.float64).reshape(4)
+            frame['quat'] = [round(float(v), 6) for v in q]
         self.socket.send_string(json.dumps(frame))
         self.last_sent = p.copy()
         self.last_time = now
@@ -420,7 +433,7 @@ def _quat_to_rotation(quaternion):
     ], dtype=np.float64)
 
 
-def print_marker_axes(result):
+def print_marker_axes(result, align_rpy=(0.0, 0.0, 0.0)):
     """打印标记三个轴在 torso 系下的单位方向，用来决定 --marker-to-grasp 的偏移方向。
 
     标记坐标系（由 solvePnP 的 object_points 定义）：x/y 在标记平面内，**z 垂直于标记向外**
@@ -434,6 +447,11 @@ def print_marker_axes(result):
     print('    axes(marker/torso) x={} y={} z={}'.format(
         vector_text(rotation[:, 0]), vector_text(rotation[:, 1]),
         vector_text(rotation[:, 2])), flush=True)
+    if align_rpy is not None:
+        ee = rotation @ rotation_from_rpy(*align_rpy)
+        print('    axes(ee/torso)     x={} (探入方向) y={} (手指开合方向) z={}'.format(
+            vector_text(ee[:, 0]), vector_text(ee[:, 1]),
+            vector_text(ee[:, 2])), flush=True)
 
 
 def parse_args():
@@ -472,11 +490,19 @@ def parse_args():
                         help='单帧跳变超过它就判为误检并丢弃')
     parser.add_argument('--no-send', action='store_true',
                         help='只检测不发送（回到原脚本行为）')
+    parser.add_argument('--send-quat', dest='send_quat', action='store_true', default=True,
+                        help='帧里附带抓取朝向 quat（默认开；用 --no-quat 关掉）')
     parser.add_argument('--print-axes', dest='print_axes', action='store_true',
                         default=True,
                         help='打印标记三轴在 torso 系下的指向（判断 --marker-to-grasp 该往哪偏）')
     parser.add_argument('--no-print-axes', dest='print_axes', action='store_false',
                         help='关掉上面的轴打印')
+    parser.add_argument('--grasp-align-rpy', type=float, nargs=3, default=(0.0, 0.0, 0.0),
+                        metavar=('R', 'P', 'Y'),
+                        help='夹爪相对标记的对准旋转(rad, ZYX, 在标记坐标系里)；'
+                             '0 0 0=水平探入 / 0 90 0=从上方垂直向下 / 0 90 90=向下但手指转90°')
+    parser.add_argument('--no-quat', dest='send_quat', action='store_false',
+                        help='只发位置，不发朝向（g1_zmq_ik 会保持启动时锁定的末端朝向）')
     parser.add_argument('--marker-to-grasp', type=float, nargs=3, default=(0.0, 0.0, 0.0),
                         metavar=('DX', 'DY', 'DZ'),
                         help='标记中心 -> 抓取点的偏移（米，标记自身坐标系）。'
@@ -505,14 +531,16 @@ def main():
     poller.register(socket, zmq.POLLIN)
 
     print('[INFO] connecting to {}'.format(args.endpoint))
-    print('[INFO] 抓取点偏移: --marker-to-grasp {}'.format(
-        tuple(args.marker_to_grasp)))
+    print('[INFO] 抓取对准: --marker-to-grasp {}  --grasp-align-rpy {}  quat={}'.format(
+        tuple(args.marker_to_grasp), tuple(args.grasp_align_rpy),
+        'on' if args.send_quat else 'off'))
     print('[INFO] camera={}, dictionary={}, marker_size={} m, ids={}'.format(
         args.camera_name, args.dictionary, args.marker_size,
         args.ids if args.ids else 'ALL'))
     # 目标发送器
     sender = TargetSender(args.target_endpoint, args.target_hz, args.deadband_mm,
-                          args.jump_reject_mm, enabled=not args.no_send)
+                          args.jump_reject_mm, send_quat=args.send_quat,
+                          enabled=not args.no_send)
     last_log_time = 0.0
     send_log_time = 0.0
     warned_resolution = False
@@ -547,18 +575,21 @@ def main():
             if results and now - last_log_time >= args.log_interval:
                 print_results(results)
                 if args.print_axes:
-                    print_marker_axes(min(results, key=lambda r: float(r['distance'])))
+                    print_marker_axes(min(results, key=lambda r: float(r['distance'])),
+                                      args.grasp_align_rpy)
                 last_log_time = now
 
-            # 把（已确认的）标记位姿换算成抓取点，发给 6003
+            # 把（已确认的）标记位姿换算成抓取位姿（位置 + 朝向），发给 6003
             if results:
                 best = min(results, key=lambda r: float(r['distance']))
-                # T_ee = T_marker @ [I | offset]：偏移在"标记自身坐标系"里给
+                # T_ee = T_marker @ [R_align | offset]：偏移与对准旋转都在"标记自身坐标系"里给
                 offset = np.asarray(args.marker_to_grasp, dtype=np.float64).reshape(3)
                 R_marker = _quat_to_rotation(best['torso_quaternion'])
+                R_align = rotation_from_rpy(*args.grasp_align_rpy)
                 target_torso = np.asarray(best['torso_position'], dtype=np.float64) \
                     + R_marker @ offset
-                sent = sender.maybe_send(target_torso, now=now)
+                target_quat = matrix_to_quaternion(R_marker @ R_align)
+                sent = sender.maybe_send(target_torso, target_quat, now=now)
                 if now - send_log_time >= args.log_interval:
                     send_log_time = now
                     if not sender.enabled:
@@ -567,8 +598,8 @@ def main():
                         state = '已下发(累计 {} 帧)'.format(sender.sent)
                     else:
                         state = '跳过(死区/限频)'
-                    print('[INFO] 抓取点 torso p={}  (id={}, {})'.format(
-                        vector_text(target_torso),
+                    print('[INFO] 抓取位姿 torso p={} q={}  (id={}, {})'.format(
+                        vector_text(target_torso), vector_text(target_quat),
                         best['id'], state), flush=True)
 
             if not args.no_display:

@@ -22,7 +22,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from g1_ik import G1ArmModel, make_ik  # noqa: E402
+import pinocchio as pin  # noqa: E402
+from g1_ik import G1ArmModel, make_ik, rotation_to_quat  # noqa: E402
 from controller import ArmController, LEFT, RIGHT  # noqa: E402
 
 HERE = Path(__file__).resolve().parent.parent
@@ -205,6 +206,58 @@ def main() -> int:
     check("track_err 与目标系下的位姿差一致",
           abs(info.err_track_pos[RIGHT] - err) < 1e-9,
           f"track_err={info.err_track_pos[RIGHT]*1000:.2f}mm 直接算={err*1000:.2f}mm")
+
+    print("\n[6] 目标姿态：四元数（quat）目标")
+    from g1_ik import quat_to_rotation, rotation_to_rpy
+    q_ident = [0.0, 0.0, 0.0, 1.0]
+    # 绕 torso 的 x 轴转 30°：四元数 (sin15°, 0, 0, cos15°)
+    ang = np.deg2rad(30.0)
+    q_30 = [float(np.sin(ang / 2)), 0.0, 0.0, float(np.cos(ang / 2))]
+    tgt_pos = [0.30, -0.10, 0.05]
+
+    ctrl_n = make_ctrl(model, ik, q14, waist0, "torso")
+    ctrl_q = make_ctrl(model, ik, q14, waist0, "torso")
+    for _ in range(6):
+        ctrl_n.set_target_position(RIGHT, tgt_pos)                       # 不带 quat
+        ctrl_q.set_target_position(RIGHT, tgt_pos, quat=q_30)            # 带 quat
+        ctrl_n.step(0.02)
+        ctrl_q.step(0.02)
+    R_n = ctrl_n.target[RIGHT][:3, :3]
+    R_q = ctrl_q.target[RIGHT][:3, :3]
+    check("quat 被写进目标位姿（与 quat_to_rotation 一致）",
+          np.allclose(R_q, quat_to_rotation(q_30), atol=1e-12),
+          f"姿态差 {np.abs(R_q - quat_to_rotation(q_30)).max():.2e}")
+    check("不给 quat 时仍用启动锁定的朝向（和给 quat 的结果不同）",
+          np.abs(R_n - R_q).max() > 0.1, f"两者姿态最大差 {np.abs(R_n - R_q).max():.3f}")
+    # 直接问 IK（不经限速爬坡）：带 quat 的位姿目标本身能不能解到。
+    #   注意：目标要"可达、且离起点不远" —— 离起点 35cm 又要求大幅改姿态时，
+    #   IPOPT(max_iter=30) 会落在局部极小，那与 quat 无关（实测两者残差一样）。
+    T_L_m, T_R_m = ctrl_q.ee_in_target_frame(q14)
+    tilt = np.deg2rad(15.0)
+    Rx = np.array([[1, 0, 0], [0, np.cos(tilt), -np.sin(tilt)], [0, np.sin(tilt), np.cos(tilt)]])
+    quat_tilt = rotation_to_quat(Rx @ T_R_m[:3, :3])   # 实测朝向再绕 torso x 倾斜 15°
+    pos_near = T_R_m[:3, 3] + np.array([0.02, 0.0, 0.0])
+    ctrl_q.set_target_position(RIGHT, pos_near, quat=quat_tilt)
+    T_R_tgt_lk = model.torso_to_locked(ctrl_q.target[RIGHT])
+    q_sol = ik.solve(model.torso_to_locked(T_L_m), T_R_tgt_lk, q14)
+    _, T_R_fk = model.fk(q_sol)
+    rot_err = np.rad2deg(np.linalg.norm(pin.log3(T_R_fk[:3, :3] @ T_R_tgt_lk[:3, :3].T)))
+    pos_err = np.linalg.norm(T_R_fk[:3, 3] - T_R_tgt_lk[:3, 3]) * 1000
+    check("带 quat 的（可达）位姿目标能解到（姿态 <4°、位置 <6mm）",
+          rot_err < 4.0 and pos_err < 6.0, f"姿态残差 {rot_err:.2f}°，位置残差 {pos_err:.2f}mm")
+    # 对照：同一个位置、只把那 15° 倾斜去掉 → 两者得到的关节角必须不同
+    ctrl_q.set_target_position(RIGHT, pos_near)          # 不带 quat（锁定朝向）
+    T_R_flat = model.torso_to_locked(ctrl_q.target[RIGHT])
+    q_flat = ik.solve(model.torso_to_locked(T_L_m), T_R_flat, q14)
+    check("倾斜 15° 与不倾斜给出不同解（说明朝向真的进了反解）",
+          np.abs(q_sol - q_flat).max() > 1e-3,
+          f"最大关节差 {np.rad2deg(np.abs(q_sol - q_flat).max()):.2f}°")
+    check("set_target_rpy 会清掉 quat（改成不跟标记转）",
+          (ctrl_q.set_target_rpy(RIGHT, [0.0, 0.0, 0.0]), ctrl_q.quat_target[RIGHT] is None)[1])
+    # 起效：带 quat 的最终关节角应与不带的不同
+    check("带/不带 quat 的手臂构型不同（说明朝向真的参与了反解）",
+          np.abs(ctrl_n.q_cmd - ctrl_q.q_cmd).max() > 1e-3,
+          f"最大关节差 {np.rad2deg(np.abs(ctrl_n.q_cmd - ctrl_q.q_cmd).max()):.2f}°")
 
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
     print("\n" + "=" * 74)

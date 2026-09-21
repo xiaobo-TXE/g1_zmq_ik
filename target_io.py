@@ -13,6 +13,7 @@
     {"rpy":   [0.0, 0.0, 0.0]}              # 可选；不给就保持当前锁定的末端朝向
     {"arm":   "right"}                      # 可选: right/left/both；默认用启动时的 --arm
     {"pos_left": [...], "pos_right": [...]}# 可选：一次给两条手臂（优先于 pos/arm）
+    {"quat":  [0,0,0,1]}                    # 可选：目标朝向四元数 (x,y,z,w)；不给则保持锁定朝向
     {"grip": 0}                             # 可选：夹爪开合百分比 0=闭 100=全开（也可 {"right":0}）
     {"grip_rad": {"right": 0.0}}            # 可选：直接给夹爪弧度（输出侧量纲，跳过百分比换算）
     {"grip_close_tau": 0.3}                 # 可选：力限软闭合请求（|τ|≥0.3 就冻结）；**可单独成帧**
@@ -128,7 +129,7 @@ class TargetReceiver:
         if not isinstance(pkt, dict):
             raise ValueError("帧必须是 JSON 对象")
         out = {"arm": None, "pos": None, "rpy": None, "delta": None, "per_arm": {},
-               "grip": None, "grip_rad": None,
+               "grip": None, "grip_rad": None, "quat": None,
                "timestamp": None, "raw_size": len(payload)}
         arm = pkt.get("arm")
         if arm is not None:
@@ -143,6 +144,21 @@ class TargetReceiver:
             v = _vec3(pkt.get(f"pos_{side}"), f"pos_{side}")
             if v is not None:
                 out["per_arm"][side] = v
+        # 可选目标朝向：四元数 (x, y, z, w)。给了就用它，不给则保持启动时锁定的末端朝向
+        quat = pkt.get("quat")
+        if quat is not None:
+            try:
+                q = np.asarray(quat, dtype=float).reshape(-1)
+                if q.size != 4:
+                    raise ValueError(f"需要 4 个数 (x,y,z,w)，收到 {q.size} 个")
+                if not np.isfinite(q).all():
+                    raise ValueError("含 NaN/Inf")
+                if float(np.linalg.norm(q)) < 1e-9:
+                    raise ValueError("模长≈0")
+                out["quat"] = q / float(np.linalg.norm(q))
+            except Exception as exc:
+                logger.warning("quat 被忽略: %s（原始前 120 字节: %r）", exc, payload[:120])
+
         # 可选夹爪字段：grip = 开合百分比(0=闭,100=全开)；grip_rad = 直接给弧度(输出侧量纲)
         # 夹爪部分的错误只丢弃夹爪更新（warn），手臂目标照旧 —— 与上游 6002 的失败隔离一致
         try:

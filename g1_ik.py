@@ -27,6 +27,7 @@ IK 的数学模型与权重完全保留原版（这样才能和 xr_teleoperate �
 from __future__ import annotations
 
 import logging
+import math
 import os
 import pickle
 import time
@@ -354,6 +355,55 @@ def rpy_to_rotation(rpy: Sequence[float]) -> np.ndarray:
     Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
     Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
     return Rz @ Ry @ Rx
+
+
+def quat_to_rotation(quat: Sequence[float]) -> np.ndarray:
+    """四元数 (x, y, z, w) -> 3x3 旋转矩阵（自动归一化）。
+
+    与 `matrix_to_quaternion` 互逆；退化输入（模长≈0）返回单位阵并告警。
+    """
+    q = np.asarray(quat, dtype=float).reshape(-1)
+    if q.size != 4:
+        raise ValueError(f"四元数需要 4 个数 (x,y,z,w)，收到 {q.size} 个")
+    if not np.isfinite(q).all():
+        raise ValueError("四元数含 NaN/Inf")
+    x, y, z, w = q
+    n = float(np.sqrt(x * x + y * y + z * z + w * w))
+    if n < 1e-12:
+        logger.warning("四元数模长≈0，按单位阵处理")
+        return np.eye(3)
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ], dtype=float)
+
+
+def rotation_to_quat(R: np.ndarray) -> np.ndarray:
+    """3x3 旋转矩阵 -> 四元数 (x, y, z, w)（与 quat_to_rotation 互逆）。"""
+    m = np.asarray(R, dtype=float).reshape(3, 3)
+    trace = float(np.trace(m))
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        q = np.array([(m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s,
+                      (m[1, 0] - m[0, 1]) / s, 0.25 * s])
+    else:
+        i = int(np.argmax(np.diag(m)))
+        if i == 0:
+            s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+            q = np.array([0.25 * s, (m[0, 1] + m[1, 0]) / s,
+                          (m[0, 2] + m[2, 0]) / s, (m[2, 1] - m[1, 2]) / s])
+        elif i == 1:
+            s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+            q = np.array([(m[0, 1] + m[1, 0]) / s, 0.25 * s,
+                          (m[1, 2] + m[2, 1]) / s, (m[0, 2] - m[2, 0]) / s])
+        else:
+            s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+            q = np.array([(m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s,
+                          0.25 * s, (m[1, 0] - m[0, 1]) / s])
+    n = float(np.linalg.norm(q))
+    return q / n if n > 1e-12 else np.array([0.0, 0.0, 0.0, 1.0])
 
 
 def rotation_to_rpy(R: np.ndarray) -> np.ndarray:

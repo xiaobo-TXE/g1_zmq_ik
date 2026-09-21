@@ -33,7 +33,8 @@ import numpy as np
 
 import pinocchio as pin
 
-from g1_ik import G1ArmModel, WeightedMovingFilter, log3_error, pose_error, rpy_to_rotation
+from g1_ik import (G1ArmModel, WeightedMovingFilter, log3_error, pose_error,
+                   quat_to_rotation, rpy_to_rotation)
 from joint_map import N_ARM
 from zmq_link import (GRIPPER_Q_MAX_DEFAULT, GRIPPER_Q_MIN_DEFAULT,
                       ArmCommandPublisher)
@@ -174,6 +175,8 @@ class ArmController:
 
         self.target: Dict[str, Optional[np.ndarray]] = {LEFT: None, RIGHT: None}
         self.target_rpy: Dict[str, Optional[np.ndarray]] = {}
+        #: 显式给过的目标四元数（仅供日志/显示；位姿本身存在 self.target）
+        self.quat_target: Dict[str, Optional[np.ndarray]] = {LEFT: None, RIGHT: None}
         self.target_rev: Dict[str, int] = {LEFT: 0, RIGHT: 0}   # 目标真的变了才自增
         self._ref_rot: Optional[Dict[str, np.ndarray]] = None
         # 参考姿态还没锁定时收到的位置目标，按手臂排队（原实现是单槽，
@@ -221,14 +224,24 @@ class ArmController:
         self._assign_target(arm, T_pelvis)
 
     def set_target_position(self, arm: str, position: Sequence[float],
-                            rpy: Optional[Sequence[float]] = None) -> None:
-        """设置目标位置（目标系：torso 或 pelvis，m）。姿态：给了 rpy 用 rpy，否则用启动时锁定的参考姿态。"""
+                            rpy: Optional[Sequence[float]] = None,
+                            quat: Optional[Sequence[float]] = None) -> None:
+        """设置目标位置（目标系：torso 或 pelvis，m）。
+
+        姿态优先级：**quat（四元数 x,y,z,w）> rpy > 启动时锁定的参考姿态**。
+        quat 用来"让夹爪跟着标记/物体转向"（例如 ArUco 给出的标记朝向）。
+        """
         pos = np.asarray(position, dtype=float).reshape(3)
-        if rpy is not None:
+        if quat is not None:
+            rot = quat_to_rotation(quat)
+            self.quat_target[arm] = np.asarray(quat, dtype=float).reshape(4).copy()
+        elif rpy is not None:
             self.target_rpy[arm] = np.asarray(rpy, dtype=float).reshape(3)
             rot = rpy_to_rotation(self.target_rpy[arm])
+            self.quat_target[arm] = None
         elif self._ref_rot is not None:
             rot = self._ref_rot[arm]
+            self.quat_target[arm] = None
         else:
             self._pending_positions.append((arm, pos))   # 参考姿态还没锁定，等第一帧补上
             return
@@ -238,6 +251,8 @@ class ArmController:
         self._assign_target(arm, T)
 
     def set_target_rpy(self, arm: str, rpy: Sequence[float]) -> None:
+        """显式指定 rpy（会清掉 quat：即"不再跟标记转"）。"""
+        self.quat_target[arm] = None
         self.target_rpy[arm] = np.asarray(rpy, dtype=float).reshape(3)
         rot = rpy_to_rotation(self.target_rpy[arm])
         T = self.target[arm].copy() if self.target[arm] is not None else np.eye(4)

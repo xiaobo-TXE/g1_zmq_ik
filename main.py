@@ -137,6 +137,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--pos-right", nargs=3, type=float, metavar=("X", "Y", "Z"), help="右臂目标位置")
     g.add_argument("--rpy", nargs=3, type=float, metavar=("R", "P", "Y"),
                    help="目标姿态(rad)；不给则保持启动时锁定的末端朝向")
+    g.add_argument("--quat", nargs=4, type=float, metavar=("X", "Y", "Z", "W"),
+                   help="目标姿态四元数 x y z w（优先级高于 --rpy）；例 0 0 0 1 = 与目标系同向；"
+                        "用于「夹爪跟着标记转向」")
     g.add_argument("--delta", nargs=3, type=float, metavar=("DX", "DY", "DZ"),
                    help="相对当前指令位姿的位移（与 --pos 互斥）")
     g.add_argument("--demo", default="none", choices=["none", "circle", "line"],
@@ -432,8 +435,9 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
     arm = pkt.get("arm") or ctrl.controlled
     rpy = pkt.get("rpy")
 
+    quat = pkt.get("quat")            # 可选目标朝向（四元数 x,y,z,w）
     for side, pos in (pkt.get("per_arm") or {}).items():
-        ctrl.set_target_position(side, pos, rpy=rpy)
+        ctrl.set_target_position(side, pos, rpy=rpy, quat=quat)
         if side not in arms:
             arms.append(side)
         flags["last_stream_pos"][side] = np.asarray(pos, dtype=float).copy()
@@ -444,7 +448,7 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
             if a not in arms:
                 arms.append(a)
             if pkt.get("pos") is not None:
-                ctrl.set_target_position(a, pkt["pos"], rpy=rpy)
+                ctrl.set_target_position(a, pkt["pos"], rpy=rpy, quat=quat)
                 flags["last_stream_pos"][a] = np.asarray(pkt["pos"], dtype=float).copy()
             else:
                 # delta：相对"上一条目标位置"叠加（没有上一条时相对当前目标）
@@ -456,7 +460,7 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
                         flags["pending_delta"].append((a, np.asarray(pkt["delta"], dtype=float)))
                         continue
                 nxt = base + np.asarray(pkt["delta"], dtype=float)
-                ctrl.set_target_position(a, nxt, rpy=rpy)
+                ctrl.set_target_position(a, nxt, rpy=rpy, quat=quat)
                 flags["last_stream_pos"][a] = nxt.copy()
     # 收尾：把首帧收到 delta 但还没有基准的补齐
     if flags["pending_delta"] and flags["last_stream_pos"]:
@@ -467,7 +471,7 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
                 still.append((a, d))
                 continue
             nxt = base + d
-            ctrl.set_target_position(a, nxt)
+            ctrl.set_target_position(a, nxt, quat=pkt.get("quat"))
             flags["last_stream_pos"][a] = nxt.copy()
         flags["pending_delta"] = still
 
@@ -671,7 +675,7 @@ def main(argv=None) -> int:
     targets = parse_initial_targets(args)
     for arm, pos in targets.items():
         if pos is not None:
-            ctrl.set_target_position(arm, pos, rpy=args.rpy)
+            ctrl.set_target_position(arm, pos, rpy=args.rpy, quat=args.quat)
     for arm in (LEFT, RIGHT):
         if arm not in arms and targets.get(arm) is None:
             ctrl.hold(arm)
@@ -686,6 +690,8 @@ def main(argv=None) -> int:
             return ctrl.grip_cm_to_rad(v)
         return float(v)
 
+    if args.quat is not None:
+        log.info("目标姿态来自 --quat %s（覆盖启动时锁定的朝向）", args.quat)
     if args.grip is not None or args.grip_right is not None or args.grip_left is not None:
         base = args.grip
         try:
