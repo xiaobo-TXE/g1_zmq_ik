@@ -30,7 +30,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from joint_map import ARM_LEROBOT_NAMES, ARM_SLICE, N_ARM, SDK_JOINT_NAMES  # noqa: E402
+from joint_map import ARM_LEROBOT_NAMES, ARM_SLICE, N_ARM  # noqa: E402
 from sim_arm import SimulatedArmState  # noqa: E402
 
 MAX_JOINT_ABS = 3.2
@@ -82,7 +82,7 @@ class MockRobot:
         return ('{"topic":"rt/lowstate","data":{"motor_state":[' + motors +
                 '],"imu_state":{"quaternion":[1,0,0,0],"gyroscope":[0,0,0],'
                 '"accelerometer":[0,0,9.81],"rpy":[0,0,0],"temperature":30},'
-                '"wireless_remote":"","mode_machine":5}}')
+                '"wireless_remote":"","mode_machine":15}}')
 
     def state_loop(self, ctx) -> None:
         sock = ctx.socket(self.zmq.PUB)

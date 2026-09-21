@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -24,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pinocchio as pin  # noqa: E402
 from g1_ik import G1ArmModel, make_ik, rotation_to_quat  # noqa: E402
-from controller import ArmController, LEFT, RIGHT  # noqa: E402
+from controller import ArmController, RIGHT  # noqa: E402
 
 HERE = Path(__file__).resolve().parent.parent
 URDF = str(HERE / "assets" / "g1" / "g1_29dof_mode_15_with_dex1_1.urdf")
@@ -200,16 +199,17 @@ def main() -> int:
     T_tgt = info.ee_target[RIGHT]
     T_meas = info.ee_meas[RIGHT]
     err = float(np.linalg.norm(T_meas[:3, 3] - T_tgt[:3, 3]))
-    check("info.ee_target/ee_meas 都在 torso 系（与 target 自比较=0）",
-          np.abs(np.asarray(T_tgt) - np.asarray(T_tgt)).max() == 0.0 and err > 0,
+    # 与**独立参照**比：target 是自己写的，拿它跟自己比恒为真（原来的写法等于没测）
+    check("info.ee_target 与 controller 锁存的目标一致（torso 系）",
+          np.abs(np.asarray(T_tgt) - ctrl.target[RIGHT]).max() < 1e-12 and err > 0,
+          f"与锁存目标最大差 {np.abs(np.asarray(T_tgt) - ctrl.target[RIGHT]).max():.2e}；"
           f"当前到目标距离 {err*1000:.1f}mm（应有值，因为还没动）")
     check("track_err 与目标系下的位姿差一致",
           abs(info.err_track_pos[RIGHT] - err) < 1e-9,
           f"track_err={info.err_track_pos[RIGHT]*1000:.2f}mm 直接算={err*1000:.2f}mm")
 
     print("\n[6] 目标姿态：四元数（quat）目标")
-    from g1_ik import quat_to_rotation, rotation_to_rpy
-    q_ident = [0.0, 0.0, 0.0, 1.0]
+    from g1_ik import quat_to_rotation
     # 绕 torso 的 x 轴转 30°：四元数 (sin15°, 0, 0, cos15°)
     ang = np.deg2rad(30.0)
     q_30 = [float(np.sin(ang / 2)), 0.0, 0.0, float(np.cos(ang / 2))]

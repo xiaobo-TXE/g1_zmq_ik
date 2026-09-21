@@ -27,8 +27,8 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from joint_map import (ARM_LEROBOT_NAMES, ARM_START, N_ARM, REMOTE_AXIS_KEYS,
-                       SDK_JOINT_NAMES, arm_q_from_state, waist_q_from_state)
+from joint_map import (ARM_LEROBOT_NAMES, N_ARM, REMOTE_AXIS_KEYS,
+                       arm_q_from_state, waist_q_from_state)
 
 logger = logging.getLogger("zmq_link")
 
@@ -40,7 +40,23 @@ MAX_PAYLOAD = 16384              # 6002 侧校验：单帧上限
 # ---------------------------------------------------------------------------
 # 6001：读状态
 # ---------------------------------------------------------------------------
-class RobotStateSubscriber:
+class _WarnThrottle:
+    """坏帧告警限频（同一条告警最多每秒一条）。
+
+    100/500Hz 的端口上，一个格式错误（上游改了字段名、混入别的话题）就能刷爆日志。
+    注意 last_rx 的语义：三个订阅器都**只在解析成功后**刷新它 —— 否则"数据超时就不下发"
+    这类保护会因为端口一直在推坏帧而永不触发。
+    """
+
+    def _warn_bad(self, what: str, exc, payload) -> None:
+        now = time.time()
+        if now - getattr(self, "_last_warn", 0.0) < 1.0:
+            return
+        self._last_warn = now
+        logger.warning("%s(%s)（同类告警最多每秒一条），原始前 120 字节: %r", what, exc, payload)
+
+
+class RobotStateSubscriber(_WarnThrottle):
     """订阅机器人 6001 端口（PUB）的 LowState 流。
 
     - 只保留最新帧（RCVHWM=2），积压直接丢：这是"状态流"而不是可靠队列。
@@ -97,7 +113,8 @@ class RobotStateSubscriber:
         return out
 
     def _parse(self, payload: str) -> Optional[dict]:
-        self.last_rx = time.time()
+        # 注意：last_rx 只在**解析成功**后更新（见末尾）。若坏帧也刷新它，"状态超时就不下发"
+        # 这道保护会因为端口一直在推坏帧而永不触发 —— 程序会拿冻结的旧关节角继续下发。
         try:
             pkt = json.loads(payload)
             data = pkt["data"]
@@ -106,11 +123,21 @@ class RobotStateSubscriber:
             if n < 29:
                 raise ValueError(f"motor_state 只有 {n} 项（应 >=29，协议固定 35 槽）")
             self.last_topic = pkt.get("topic")
-            self.last_q29 = np.array([m["q"] for m in motors[:29]], dtype=float)
-            self.last_dq29 = np.array([m.get("dq", 0.0) for m in motors[:29]], dtype=float)
-            self.last_tau29 = np.array([m.get("tau_est", 0.0) for m in motors[:29]], dtype=float)
+            q29 = np.array([m["q"] for m in motors[:29]], dtype=float)
+            # 关节角必须全是有限值：NaN/Inf 会一路穿过正解、反解和 np.clip（clip(nan)==nan）
+            # 直达 6002，日志却还在正常刷 —— 所以这里整帧拒绝（不更新 last_q29，本帧按"没有新状态"处理）。
+            if not np.isfinite(q29).all():
+                raise ValueError(f"motor_state 里有 {int(np.sum(~np.isfinite(q29)))} 个非有限关节角")
+            self.last_q29 = q29
+            # dq/tau/imu 只用于诊断与显示，含 NaN 时清洗即可，不必因此丢帧
+            self.last_dq29 = np.nan_to_num(
+                np.array([m.get("dq", 0.0) for m in motors[:29]], dtype=float))
+            self.last_tau29 = np.nan_to_num(
+                np.array([m.get("tau_est", 0.0) for m in motors[:29]], dtype=float))
             imu = data.get("imu_state", {})
-            self.last_imu_rpy = np.array(imu.get("rpy", [0.0, 0.0, 0.0]), dtype=float)
+            self.last_imu_rpy = np.nan_to_num(
+                np.array(imu.get("rpy", [0.0, 0.0, 0.0]), dtype=float))
+            self.last_rx = time.time()
             self.last_mode_machine = data.get("mode_machine")
             self.frames += 1
             self._rx_times.append(self.last_rx)
@@ -121,7 +148,7 @@ class RobotStateSubscriber:
                     "rx_time": self.last_rx, "topic": self.last_topic}
         except Exception as exc:
             self.bad_frames += 1
-            logger.warning("状态帧解析失败(%s)，原始前 160 字节: %r", exc, payload[:160])
+            self._warn_bad("状态帧解析失败", exc, payload[:160])
             return None
 
     # ---------------- 便利接口 ----------------
@@ -239,8 +266,25 @@ class ArmCommandPublisher:
         # timestamp 严格递增：即使本机时钟回拨也不会被判成 stale
         # 可选夹爪块：只读 q（kp/kd/mode 属于机器人侧 config，帧里传会被忽略并 warn）
         if gripper:
-            block = (gripper if set(gripper) <= {"right", "left"}
-                     else self.gripper_block(gripper.get("right"), gripper.get("left")))
+            # 只认一种形状：{side: {"q": finite}}（或 {side: finite} 交给 gripper_block 组装）。
+            # 不能把调用方给的字典原样塞进帧里：{"right": NaN} 会产出裸 NaN 字面量，
+            # Python 能 parse、机器人侧的 C++ JSON 解析不能 —— 整帧（含 14 个手臂角）会被丢弃。
+            block = None
+            try:
+                if all(isinstance(v, dict) for v in gripper.values()):
+                    block = {}
+                    for side, node in gripper.items():
+                        if side not in ("right", "left"):
+                            raise ValueError(f"gripper 里出现未知侧 {side!r}")
+                        q = float(node.get("q"))
+                        if not np.isfinite(q):
+                            raise ValueError(f"gripper.{side}.q 非有限值")
+                        block[side] = {"q": q}
+                else:
+                    block = self.gripper_block(gripper.get("right"), gripper.get("left"))
+            except Exception as exc:
+                logger.warning("夹爪块非法，本帧省略夹爪（手臂指令照常下发）：%s", exc)
+                block = None
             if block:
                 action["gripper"] = block
         ts = max(time.time(), self._last_ts + 1e-4)
@@ -252,7 +296,14 @@ class ArmCommandPublisher:
 
     def send(self, q14: Sequence[float], axes: Optional[Dict[str, float]] = None,
              dry_run: bool = False, gripper: Optional[dict] = None) -> str:
-        payload = self.build_frame(q14, axes, gripper=gripper)
+        try:
+            payload = self.build_frame(q14, axes, gripper=gripper)
+        except Exception as exc:
+            # 一帧不合法（关节角含 NaN、数量不对、超 |q|≤3.2）只该丢这一帧，
+            # 不能让它穿到控制循环外面把程序干掉
+            self.rejected += 1
+            logger.error("本帧未通过校验，已丢弃：%s", exc)
+            return ""
         self.last_payload = payload
         if dry_run:
             self.sent += 1
@@ -289,7 +340,7 @@ GRIPPER_Q_MIN_DEFAULT = 0.0
 GRIPPER_Q_MAX_DEFAULT = 5.6217
 
 
-class GripperStateSubscriber:
+class GripperStateSubscriber(_WarnThrottle):
     """订阅 6004（PUB，100 Hz）的 Dex1_1 夹爪实测状态。
 
     帧格式（上游 deploy/include/groot/GripperStateBroadcaster.h）::
@@ -314,7 +365,8 @@ class GripperStateSubscriber:
         self.bad_frames = 0
         self.last_rx: Optional[float] = None
         self.last_topic: Optional[str] = None
-        # side -> {"q","dq","tau_est"}
+        self._last_warn = 0.0
+        # side -> {"q","dq","tau_est"}（tau_est 为 None = 上游没给力反馈，力控必须据此收手）
         self.state: Dict[str, Dict[str, float]] = {}
 
         import zmq
@@ -344,9 +396,15 @@ class GripperStateSubscriber:
         return got
 
     def _parse(self, payload: str) -> None:
-        self.last_rx = time.time()
+        # last_rx 只在解析成功后刷新：否则端口一直推坏帧会让"6004 超时中止"永不触发
         try:
             pkt = json.loads(payload)
+            topic = pkt.get("topic")
+            # 这个 socket 是 subscribe(b"")（上游把 topic 放在 JSON 体里，没有 ZMQ 前缀），
+            # 所以必须自己按 topic 过滤：力控读的是 τ，不能拿别的话题的 q/dq/tau 当夹爪状态。
+            # 没有 topic 字段时按兼容处理（极简广播端可能不带）。
+            if topic is not None and self.topic_prefix and not str(topic).startswith(self.topic_prefix):
+                raise ValueError(f"topic={topic!r} 不是 {self.topic_prefix}*，不当夹爪状态用")
             data = pkt.get("data") or {}
             if not isinstance(data, dict):
                 raise ValueError("data 不是对象")
@@ -358,17 +416,26 @@ class GripperStateSubscriber:
                 q = float(node["q"])
                 if not np.isfinite(q):
                     raise ValueError(f"{side}.q 非有限值")
+                # tau_est 缺失/非有限 → **None** = "这一侧没有力反馈"。绝不能当成 0.0：
+                # 力限软闭合会把"τ 一直是 0"理解为"还没碰到"，一路把夹爪推到底。
+                tau_raw = node.get("tau_est")
+                tau = None
+                if tau_raw is not None:
+                    tau = float(tau_raw)
+                    if not np.isfinite(tau):
+                        tau = None
                 out[side] = {"q": q,
                              "dq": float(node.get("dq", 0.0) or 0.0),
-                             "tau_est": float(node.get("tau_est", 0.0) or 0.0)}
+                             "tau_est": tau}
             if not out:
                 raise ValueError("data 里没有 right/left")
-            self.state = out
+            self.state.update(out)          # 按侧合并：某侧这一帧缺失时保留它上次的有效值
             self.last_topic = pkt.get("topic")
+            self.last_rx = time.time()      # 只在解析成功后刷新（坏帧不能续命超时保护）
             self.frames += 1
         except Exception as exc:
             self.bad_frames += 1
-            logger.warning("夹爪状态帧解析失败(%s)，原始前 120 字节: %r", exc, payload[:120])
+            self._warn_bad("夹爪状态帧解析失败", exc, payload[:120])
 
     # ---------------- 便利接口 ----------------
     def q(self, side: str) -> Optional[float]:
@@ -408,7 +475,7 @@ class GripperStateSubscriber:
             pass
 
 
-class ControlModeSubscriber:
+class ControlModeSubscriber(_WarnThrottle):
     """订阅 6000（PUB，50 Hz）的控制模式。
 
     帧格式（上游 deploy/include/groot/ControlStateBroadcaster.h）::
@@ -428,6 +495,7 @@ class ControlModeSubscriber:
         self.frames = 0
         self.bad_frames = 0
         self.last_rx: Optional[float] = None
+        self._last_warn = 0.0
         self.mode: Optional[str] = None
 
         import zmq
@@ -455,17 +523,22 @@ class ControlModeSubscriber:
         return got
 
     def _parse(self, payload: str) -> None:
-        self.last_rx = time.time()
         try:
             pkt = json.loads(payload)
-            mode = str(pkt["state"]).lower()
+            mode = str(pkt["state"]).strip().lower()
             if mode not in self.MODES:
                 raise ValueError(f"未知模式 {mode!r}")
             self.mode = mode
+            self.last_rx = time.time()      # 只在解析成功后刷新
+            self.bad_frames = 0
             self.frames += 1
         except Exception as exc:
             self.bad_frames += 1
-            logger.warning("控制模式帧解析失败(%s)，原始前 80 字节: %r", exc, payload[:80])
+            # 连续 3 帧不认识就把模式视为"未知"：否则上游换了枚举名之后，程序会一直以为
+            # 还在 VLA，--require-vla 的门控就失效了
+            if self.bad_frames >= 3:
+                self.mode = None
+            self._warn_bad("控制模式帧解析失败", exc, payload[:80])
 
     def age(self) -> float:
         return float("inf") if self.last_rx is None else time.time() - self.last_rx

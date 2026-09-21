@@ -33,13 +33,12 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import sys
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 
@@ -48,7 +47,7 @@ from config_file import add_config_argument, describe_applied, parse_args_with_c
 from arrival import ArrivalMonitor, ArrivalThresholds, format_event
 from controller import ArmController, LEFT, RIGHT, format_step
 from grip_control import SoftClose, SoftCloseConfig
-from g1_ik import G1ArmModel, make_ik, rotation_to_rpy
+from g1_ik import G1ArmModel, make_ik
 from sim_arm import SimulatedArmState, SimulatedStateSource
 from target_io import TargetReceiver
 from zmq_link import (GRIPPER_Q_MAX_DEFAULT, GRIPPER_Q_MIN_DEFAULT,
@@ -565,7 +564,8 @@ def run_check(args) -> int:
                  **{k: v for k, v in (("w_regularization", args.w_reg),
                                       ("w_translation", args.w_trans),
                                       ("w_rotation", args.w_rot),
-                                      ("w_smooth", args.w_smooth)) if v is not None})
+                                      ("w_smooth", args.w_smooth),
+                                      ("fk_backend", args.fk_backend)) if v is not None})
         from g1_ik import self_test
         if hasattr(ik, "backend"):
             print(f"求解器后端: {ik.name}  |  符号正解: {ik.backend}")
@@ -588,7 +588,7 @@ def run_check(args) -> int:
         print(f"  [FAIL] 自检失败: {exc}")
         return 1
     print("\n结论: " + ("环境与模型可用" if ok else "有可选依赖缺失（见上）"))
-    return 0 if ok else 0
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +632,18 @@ def main(argv=None) -> int:
         if args.config_ignored:
             log.warning("配置里有不认识的键（已忽略）：%s（键名应是参数名去掉 -- 并把 - 换成 _）",
                         ", ".join(args.config_ignored))
+
+    if args.sim and args.require_vla:
+        log.warning("--sim：仿真不连 6002，已忽略 --require-vla（否则机器人不在 VLA 时会静默停发）")
+        args.require_vla = False
+
+    # 目标参数必须有限：NaN 会让 CasADi 的 set_value 抛异常（穿出 step），
+    # np.clip(NaN)=NaN 也拦不住。这里在启动时就拒绝，而不是让它进控制回路。
+    for _name in ("pos", "pos_left", "pos_right", "delta", "rpy", "quat"):
+        _v = getattr(args, _name, None)
+        if _v is not None and not np.isfinite(np.asarray(_v, dtype=float)).all():
+            log.error("--%s 含 NaN/Inf：%s", _name.replace("_", "-"), _v)
+            return 2
 
     if args.print_mapping:
         joint_map.print_mapping()
@@ -792,9 +804,9 @@ def main(argv=None) -> int:
 
     demo = DemoTrajectory(args.demo, args.radius, args.period, args.amp)
     delta_done = False
+    step_errors = 0
     dt = 1.0 / max(args.rate, 1e-3)
     t_start = time.time()
-    last_print = 0.0
     status = 0
     try:
         while True:
@@ -803,9 +815,16 @@ def main(argv=None) -> int:
 
             # 交互命令
             if console is not None:
-                while console.queue:
-                    if not apply_console_command(console.queue.pop(0), ctrl, flags):
-                        raise KeyboardInterrupt
+                # 每周期最多消费 8 条：粘一屏命令进来时不能把这一周期的下发全挤掉
+                for _ in range(min(8, len(console.queue))):
+                    cmd = console.queue.pop(0)
+                    try:
+                        if not apply_console_command(cmd, ctrl, flags):
+                            raise KeyboardInterrupt
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as exc:
+                        log.error("命令 %r 执行失败（已忽略）：%s", cmd, exc)
 
             # 外部持续下发的目标（最新优先）
             #   --on-arrive freeze 期间照常 poll 但丢弃（避免 socket 里积压过期目标，
@@ -825,7 +844,20 @@ def main(argv=None) -> int:
             if not flags["frozen"]:
                 demo.update(ctrl, flags["arms"], elapse)
 
-            info = ctrl.step(dt)
+            try:
+                info = ctrl.step(dt)
+            except Exception as exc:
+                # 任何一帧的异常（IK/数值/API）都只该丢掉这一周期：直接退出会停止下发，
+                # 而这是会动机器人的程序 —— 连续失败太多才停手并报错退出。
+                step_errors += 1
+                log.exception("控制步异常（第 %d 次，跳过本周期）：%s", step_errors, exc)
+                if step_errors >= 100:
+                    log.error("连续 100 个周期异常，停止控制循环（机器人保持最后一条有效指令）")
+                    status = 1
+                    break
+                time.sleep(0.02)
+                continue
+            step_errors = 0
 
             # --delta：等首帧拿到 q_cmd（=测量位姿）后再叠加相对位移
             if args.delta is not None and info.q_cmd is not None and not delta_done:
@@ -844,12 +876,22 @@ def main(argv=None) -> int:
                 grip_rx.poll()
             if mode_rx is not None:
                 mode_rx.poll()
-                not_vla = mode_rx.is_vla() is False
+                # 模式"未知"也算不满足 VLA：6000 断流或上游改了枚举名时，
+                # 旧实现会一直认为"还在 VLA"，--require-vla 的保护就形同虚设（fail-open）
+                mode_age = mode_rx.age()
+                mode_unknown = mode_rx.is_vla() is None or mode_age > 1.0
+                not_vla = (mode_rx.is_vla() is False) or mode_unknown
                 if not_vla and elapse - last_mode_warn > 5.0:
                     last_mode_warn = elapse
-                    log.warning("机器人当前不在 VLA 模式（模式=%s）→ 6002 里的手臂关节角不会被"
-                                "写进电机，手臂不会动。请在机器人上切到 VLA（键盘 3 / 手柄 LB+A）",
-                                mode_rx.mode)
+                    if mode_unknown:
+                        log.warning("控制模式未知/已 %.1fs 没有新帧（6000）→ %s",
+                                    mode_age,
+                                    "按 --require-vla 暂停下发" if args.require_vla
+                                    else "无法确认机器人是否在 VLA")
+                    else:
+                        log.warning("机器人当前不在 VLA 模式（模式=%s）→ 6002 里的手臂关节角不会被"
+                                    "写进电机，手臂不会动。请在机器人上切到 VLA（键盘 3 / 手柄 LB+A）",
+                                    mode_rx.mode)
                 if args.require_vla:
                     # --require-vla：非 VLA 时干脆不发（回到 VLA 时 controller 会自动重新锚定）
                     ctrl.set_send_enabled(not not_vla,

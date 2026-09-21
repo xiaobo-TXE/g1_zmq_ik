@@ -31,8 +31,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-import pinocchio as pin
-
 from g1_ik import (G1ArmModel, WeightedMovingFilter, log3_error, pose_error,
                    quat_to_rotation, rpy_to_rotation)
 from joint_map import N_ARM
@@ -84,7 +82,6 @@ def format_step(info: StepInfo, arm: str, with_joints: bool = False,
     if info.ee_meas.get(arm) is None:
         return f"[{info.t:7.2f}s] #{info.cycle:<5d} {info.state_age_ms:6.1f}ms  {'; '.join(info.notes)}"
     p_m = info.ee_meas[arm][:3, 3]
-    p_c = info.ee_cmd[arm][:3, 3]
     p_t = info.ee_target[arm][:3, 3]
     eik = info.err_ik_pos.get(arm, float("nan")) * 1000
     rik = np.rad2deg(info.err_ik_rot.get(arm, float("nan")))
@@ -198,11 +195,24 @@ class ArmController:
         self.grip_q_min = float(grip_q_min)
         self.grip_q_max = float(grip_q_max)
         self.grip_open_cm = float(grip_open_cm)
+        # 量程必须是"张开 > 闭合"且开口 > 0，否则 np.clip(v, q_min, q_max) 在 a_min>a_max 时
+        # 返回 a_max、百分比显示也会反号 —— 这种配置错误要在启动时就报出来
+        if not (np.isfinite(self.grip_q_max) and np.isfinite(self.grip_q_min)
+                and np.isfinite(self.grip_open_cm)):
+            raise ValueError("夹爪量程必须是有限值（--grip-qmin-rad/--grip-qmax-rad/--grip-open-cm）")
+        if self.grip_q_max <= self.grip_q_min:
+            raise ValueError(f"夹爪量程无效：q_max({self.grip_q_max}) 必须 > q_min({self.grip_q_min})")
+        if self.grip_open_cm <= 0:
+            raise ValueError(f"夹爪内壁全开必须 > 0 cm，收到 {self.grip_open_cm}")
         #: 每侧已锁存的目标（rad）；None = 这一侧还没下发过目标 → 帧里不带它
         self.grip: Dict[str, Optional[float]] = {"right": None, "left": None}
 
     # ------------------------------------------------------------------ 目标
     def _assign_target(self, arm: str, T_new: np.ndarray) -> None:
+        # NaN/Inf 目标必须在这里拦下：CasADi 的 set_value 遇到 NaN 会抛异常（穿出 step），
+        # 而 np.clip(NaN)=NaN；更糟的是 NaN 位姿一旦锁存，target_rev 不会自增、也不会恢复。
+        if not np.isfinite(np.asarray(T_new, dtype=float)).all():
+            raise ValueError(f"{arm} 的目标位姿含 NaN/Inf，已拒绝")
         """写入目标位姿；**只有位姿真的变了**才让 target_rev 自增。
 
         到位判定（arrival.py）靠 target_rev 区分"目标动了"和"同一条目标又发了一遍"：
@@ -250,19 +260,33 @@ class ArmController:
         T[:3, :3] = rot
         self._assign_target(arm, T)
 
+    def _base_pose(self, arm: str) -> np.ndarray:
+        """"叠加位移 / 只改姿态"用的基准位姿。
+
+        优先用已锁存的目标；还没有目标就用**当前指令位姿**；两者都没有（例如还没收到状态帧）
+        就报错 —— 绝不能用 np.eye(4)：那是目标系原点（躯干内部），手臂会朝身体里走。
+        """
+        T = self.target[arm]
+        if T is not None:
+            return T.copy()
+        if self.q_cmd is not None:
+            T_L, T_R = self.ee_in_target_frame(self.q_cmd)
+            return (T_L if arm == LEFT else T_R).copy()
+        raise ValueError(f"{arm} 还没有目标位姿（未收到状态帧），拒绝以目标系原点为基准")
+
     def set_target_rpy(self, arm: str, rpy: Sequence[float]) -> None:
         """显式指定 rpy（会清掉 quat：即"不再跟标记转"）。"""
         self.quat_target[arm] = None
         self.target_rpy[arm] = np.asarray(rpy, dtype=float).reshape(3)
         rot = rpy_to_rotation(self.target_rpy[arm])
-        T = self.target[arm].copy() if self.target[arm] is not None else np.eye(4)
+        T = self._base_pose(arm)
         T[:3, :3] = rot
         self._assign_target(arm, T)
 
     def move_target_by(self, arm: str, delta: Sequence[float]) -> None:
         """在当前目标位置上叠加位移（目标系）。"""
         d = np.asarray(delta, dtype=float).reshape(3)
-        T = self.target[arm].copy() if self.target[arm] is not None else np.eye(4)
+        T = self._base_pose(arm)
         T[:3, 3] += d
         self._assign_target(arm, T)
 
@@ -354,6 +378,8 @@ class ArmController:
             self.filter = WeightedMovingFilter(self._filter_weights, N_ARM)
         self._ee_v = {LEFT: 0.0, RIGHT: 0.0}
         self._ee_w = {LEFT: 0.0, RIGHT: 0.0}
+        self._ee_a = {LEFT: 0.0, RIGHT: 0.0}      # 末端加速度记忆也要清，否则恢复首周期沿用旧加速度
+        self._ee_wa = {LEFT: 0.0, RIGHT: 0.0}
         self._prev_ee_cmd = {LEFT: None, RIGHT: None}
         self._prev_ee_speed = {LEFT: None, RIGHT: None}
         if reason:
@@ -450,8 +476,14 @@ class ArmController:
                 v_cap = min(v_cap, self.ee_speed)
             if self.ee_accel > 0:
                 v_cap = min(v_cap, self._ee_v[arm] + self.ee_accel * dt)      # 加速度爬升
-                if dist is not None:
-                    v_cap = min(v_cap, float(np.sqrt(2.0 * self.ee_accel * max(dist, 0.0))))  # 提前减速
+                # 提前减速要用**本臂**的剩余距离：跨臂取 min 会让"已到位的那条臂"把另一条
+                # 臂的速度上限压到 0（实测 --arm both 时受控臂完全不动）
+                d_arm = dist.get(arm) if isinstance(dist, dict) else dist
+                # 只剩几微米的臂（已到位 / 被 hold）不参与制动上限：它的 v_cap→0 会把**全局**
+                # scale 拉到 ~0，从而冻住另一条正在运动的臂（--arm both 实测完全不动）。
+                # 真正在接近目标的臂 d ≫ 1µm，行为与原来一致。
+                if d_arm is not None and d_arm > 1e-6:
+                    v_cap = min(v_cap, float(np.sqrt(2.0 * self.ee_accel * max(d_arm, 0.0))))
                 # jerk 限制：把"期望加速度"限幅后再积分，得到平滑的 S 形速度曲线
                 if self.ee_jerk > 0:
                     v_cap_orig = v_cap                      # 速度/制动上限，绝不能被突破
@@ -475,8 +507,9 @@ class ArmController:
                 w_cap = min(w_cap, self.ee_rot_speed)
             if self.ee_rot_accel > 0:
                 w_cap = min(w_cap, self._ee_w[arm] + self.ee_rot_accel * dt)
-                if dtheta is not None:
-                    w_cap = min(w_cap, float(np.sqrt(2.0 * self.ee_rot_accel * max(dtheta, 0.0))))
+                th_arm = dtheta.get(arm) if isinstance(dtheta, dict) else dtheta
+                if th_arm is not None and th_arm > 1e-6:      # 同上：到位臂不参与制动
+                    w_cap = min(w_cap, float(np.sqrt(2.0 * self.ee_rot_accel * max(th_arm, 0.0))))
             if self.ee_rot_accel > 0 and self.ee_rot_jerk > 0:
                 w_cap_orig = w_cap
                 wa_des = float(np.clip((w_cap_orig - self._ee_w[arm]) / dt,
@@ -508,9 +541,18 @@ class ArmController:
         if q14 is None:
             info.notes.append("尚无状态帧")
             return info
+        # 最后一道门：坏数据不许进正解/反解。np.clip(nan) == nan，一旦 NaN 进了 q_send，
+        # 它会一路发到 6002；所以这里显式拦下并说明原因（不是靠"IK 恰好失败"兜住）。
+        if not np.isfinite(q14).all():
+            info.notes.append("状态含非有限值(NaN/Inf) -> 不下发")
+            return info
+        q_waist = self.state.q_waist()
+        if q_waist is not None and not np.isfinite(np.asarray(q_waist, dtype=float)).all():
+            info.notes.append("腰角含非有限值(NaN/Inf) -> 不下发")
+            return info
         self.q_meas = q14
-        self.q_waist = self.state.q_waist()
-        info.q_meas, info.q_waist = q14.copy(), None if self.q_waist is None else self.q_waist.copy()
+        self.q_waist = q_waist
+        info.q_meas, info.q_waist = q14.copy(), None if q_waist is None else q_waist.copy()
 
         if self.state.age() > self.state_timeout:
             info.notes.append(f"状态超时 {info.state_age_ms:.0f}ms -> 不下发")
@@ -554,8 +596,12 @@ class ArmController:
         except Exception as exc:
             logger.error("IK 异常(%s)，保持上一帧命令", exc)
         info.ik_ms = (time.perf_counter() - t0) * 1000.0
-        if q_raw is None:
-            info.notes.append("IK 失败 -> 保持")
+        if (q_raw is None or not np.isfinite(q_raw).all()
+                or not getattr(self.ik, "last_ok", True)):
+            # 注意 last_ok=False 时求解器返回的是 opti.debug 的发散迭代点（不是 None）：照着它走
+            # 会每周期 2° 地朝一个错误构型爬。宁可保持上一帧，并把原因说清楚。
+            why = getattr(self.ik, "last_status", "")
+            info.notes.append("IK 未收敛/非有限 -> 保持" + (f"（{why}）" if why else ""))
             return info
 
         # 5) 平滑
@@ -579,17 +625,16 @@ class ArmController:
             if np.any(over):
                 delta = np.clip(delta, -self.max_step, self.max_step)
                 info.notes.append(f"关节限速 {int(np.sum(over))} 个")
-        # 受控臂到目标的剩余距离（用于加速度限制的提前减速）
+        # 受控臂到目标的剩余距离（用于加速度限制的提前减速）：**按臂**给，不要跨臂取 min
         T_prev_lk = self.model.fk(prev)
-        dist = dtheta = None
+        dist: Dict[str, float] = {}
+        dtheta: Dict[str, float] = {}
         for arm, T_prev_arm, T_tgt_arm in ((LEFT, T_prev_lk[0], T_L_tgt),
                                            (RIGHT, T_prev_lk[1], T_R_tgt)):
             if self.controlled not in (arm, "both"):
                 continue
-            d = float(np.linalg.norm(T_tgt_arm[:3, 3] - T_prev_arm[:3, 3]))
-            th = float(np.linalg.norm(log3_error(T_prev_arm[:3, :3], T_tgt_arm[:3, :3])))
-            dist = d if dist is None else min(dist, d)
-            dtheta = th if dtheta is None else min(dtheta, th)
+            dist[arm] = float(np.linalg.norm(T_tgt_arm[:3, 3] - T_prev_arm[:3, 3]))
+            dtheta[arm] = float(np.linalg.norm(log3_error(T_prev_arm[:3, :3], T_tgt_arm[:3, :3])))
         delta, info.ee_clamp = self._clamp_ee_motion(prev, delta, dt, dist=dist, dtheta=dtheta)
         if info.ee_clamp < 0.999:
             info.notes.append(f"末端限速 x{info.ee_clamp:.2f}")

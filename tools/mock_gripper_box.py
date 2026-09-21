@@ -150,7 +150,8 @@ def main() -> int:
 
     print(f"[box] 盒子 {args.box_cm:g}cm | 全开 {args.open_cm:g}cm / q_max {args.q_max:g}rad | "
           f"刚度 {args.stiffness:g} τ/cm | 手指速度 {args.speed:g}cm/s", flush=True)
-    print(f"[box] 端口：6001 静止状态 → 主程序 / 6002 收指令 / 6004 广播夹爪状态", flush=True)
+    print("[box] 端口：{} 静止状态 → 主程序 / {} 收指令 / {} 广播夹爪状态".format(
+        args.state_port, args.cmd_port, args.gripper_port), flush=True)
 
     running = True
 

@@ -33,8 +33,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from controller import ArmController            # noqa: E402
-from g1_ik import G1ArmModel, log3_error, make_ik  # noqa: E402
-from joint_map import ARM_SLICE, WAIST_SLICE    # noqa: E402
+from g1_ik import G1ArmModel, make_ik           # noqa: E402
+from joint_map import ARM_SLICE                 # noqa: E402
 from sim_arm import SimulatedArmState           # noqa: E402
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -109,7 +109,7 @@ def run_case(model, kind: str, speed: float, accel: float, dist: float,
 
     qs, ee, meas, ts = [], [], [], []
     for k in range(cycles):
-        info = ctrl.step(dt)
+        ctrl.step(dt)
         qs.append(ctrl.q_cmd.copy())
         ee.append(model.fk(ctrl.q_cmd)[1][:3, 3].copy())
         meas.append(model.fk(state.q_arm())[1][:3, 3].copy())
@@ -184,7 +184,6 @@ def main() -> int:
 
     # --- 综合评分：平滑度(抖动/纹波/颤振) + 稳定性(过冲) + 到位时间 ---
     jmax = max(r["jerk_peak"] for *_, r in rows) or 1.0
-    amax = max(r["peak_a"] for *_, r in rows) or 1.0
     print("\n综合评分（越小越好）：平滑 55% + 过冲 15% + 到位时间 30%")
     scored = []
     for kind, speed, accel, jerk, r in rows:

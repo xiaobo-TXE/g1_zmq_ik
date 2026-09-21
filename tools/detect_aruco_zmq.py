@@ -243,6 +243,9 @@ class TargetSender:
         self.zmq = zmq
         self.socket = zmq.Context.instance().socket(zmq.PUSH)
         self.socket.setsockopt(zmq.SNDHWM, 4)
+        # 目标流是"最新优先"：对端不在时宁可丢帧，也不能阻塞在 send 上
+        # （否则主程序没起/重启期间，检测端会卡在 send 里不再收图、不再打印）
+        self.socket.setsockopt(zmq.SNDTIMEO, 200)
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.connect(endpoint)
         print('[INFO] 目标发送 -> {} (PUSH connect)，限频 {:.0f}Hz 死区 {:.0f}mm '
@@ -623,9 +626,15 @@ def main():
                         best['id'], state), flush=True)
 
             if not args.no_display:
-                cv2.imshow('ArUco ZMQ pose', annotated)
-                if cv2.waitKey(1) & 0xFF in (27, ord('q')):
-                    break
+                try:
+                    cv2.imshow('ArUco ZMQ pose', annotated)
+                    if cv2.waitKey(1) & 0xFF in (27, ord('q')):
+                        break
+                except cv2.error as exc:
+                    # 无显示器/无 GUI 后端（机载部署常见）：关掉预览继续跑，别让检测整体挂掉
+                    print('[WARN] 无法显示预览窗口（{}），已关闭显示继续运行；'
+                          '可用 --no-display 消除本条'.format(exc), file=sys.stderr, flush=True)
+                    args.no_display = True
     except KeyboardInterrupt:
         pass
     finally:

@@ -17,8 +17,6 @@ import os
 import sys
 import time
 
-import sys
-
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -130,7 +128,7 @@ def main() -> int:
     # 2) 反解精度
     print("\n[2] 反解精度（随机目标 -> IK -> FK 回代）")
     ik = make_ik(model, args.solver, max_iter=30)
-    r_neutral = self_test(model, ik, samples=args.samples, start="neutral")
+    self_test(model, ik, samples=args.samples, start="neutral")
     ik2 = make_ik(model, args.solver, max_iter=30)
     r_pert = self_test(model, ik2, samples=args.samples, start="perturbed")
 
@@ -138,7 +136,6 @@ def main() -> int:
     reg_bias = None
     if r_pert["solver"].startswith("casadi"):
         print("\n[2b] 正则项 0.02*||q||² 带来的系统性偏置（原版算法的固有性质）")
-        import g1_ik as _g
         model2 = model
         from g1_ik import W_REGULARIZATION_UNITREE
         ikA = make_ik(model2, "casadi", max_iter=60,

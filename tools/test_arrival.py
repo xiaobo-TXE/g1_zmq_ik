@@ -323,7 +323,8 @@ def main() -> int:
         missing = [f for f in REQUIRED_INFO_FIELDS if f not in have]
         check("StepInfo 提供全部所需字段", not missing, f"缺失={missing}" if missing else "")
     except Exception as exc:
-        check("StepInfo 字段契约（跳过：导入 controller 失败）", True, f"{type(exc).__name__}: {exc}")
+        # 导入失败也算这项失败：否则 controller/StepInfo 改名后这条会"假通过"
+        check("StepInfo 字段契约（导入 controller 失败）", False, f"{type(exc).__name__}: {exc}")
 
     # --- 场景 1：正常到位
     print("\n[2] 正常收敛到位")

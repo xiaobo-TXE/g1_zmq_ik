@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -85,8 +85,20 @@ class SoftClose:
     def start(self, ctrl, sides: Sequence[str] = SIDES,
               tau_limit: Optional[float] = None, source: str = "") -> List[str]:
         """从**当前锁存的目标**（没设过就用实测/闭合位）开始往闭合方向推。"""
-        self.sides = tuple(s for s in sides if s in SIDES)
+        # 去重：{"grip_sides":["right","right"]} 会让 len(done) 永远追不上 len(sides)，
+        # 状态机再也结束不了（实测 599 周期仍在跑）
+        self.sides = tuple(dict.fromkeys(s for s in sides if s in SIDES))
         self.tau_limit = float(self.cfg.tau_limit if tau_limit is None else tau_limit)
+        # 参数守门：坏阈值/坏速度不能让软闭合"看起来在跑、其实什么也没做"
+        #   τ<=0    → 第一帧就会以 |τ|>=0 立刻"冻结"（用户会以为坏了）
+        #   速度<=0 → 目标永不推进（active 一直为真，却永远不动）
+        if self.tau_limit <= 0.0:
+            self.active = False
+            return [f"软闭合未启动：τ 阈值必须 > 0（收到 {self.tau_limit:g}）"]
+        if self.cfg.rate_rad_s <= 0.0 or self.cfg.press_rate_rad_s <= 0.0:
+            self.active = False
+            return [f"软闭合未启动：推进速度必须 > 0（逼近 {self.cfg.rate_rad_s:g} / "
+                    f"压紧 {self.cfg.press_rate_rad_s:g} rad/s）"]
         self.done, self.stall, self.cycles = {}, {}, 0
         self._touched = set()
         self.free, self.settle, self.pullbacks = {}, {}, {}
@@ -145,10 +157,21 @@ class SoftClose:
         for side in self.sides:
             if side in self.done:
                 continue
-            st = grip_rx.state.get(side) or {}
-            q_meas = float(st.get("q", float("nan")))
-            tau = float(st.get("tau_est", 0.0) or 0.0)
-            dq = float(st.get("dq", 0.0) or 0.0)
+            st = grip_rx.state.get(side)
+            q_meas = float((st or {}).get("q", float("nan")))
+            tau_raw = (st or {}).get("tau_est")
+            # tau_est 缺失 → None：这一侧没有力反馈。绝不能当 0.0 用（那会一路推到底），
+            # 也不能只靠"被挡住"兜底（q 也可能是 NaN）。直接中止该侧、说明原因。
+            if st is None or not np.isfinite(q_meas):
+                self.done[side] = "无该侧实测状态（6004 没给这一侧）"
+                msgs.append(f"{side} 中止：{self.done[side]}，目标未继续推进")
+                continue
+            if tau_raw is None:
+                self.done[side] = "该侧没有力反馈（6004 缺 tau_est）"
+                msgs.append(f"{side} 中止：{self.done[side]}，不做力控（避免把夹爪推到底）")
+                continue
+            tau = float(tau_raw)
+            dq = float((st or {}).get("dq", 0.0) or 0.0)
             free_eps = self.tau_limit * self.cfg.free_frac
 
             # 退回接触点之后先等压力释放（必须排在冻结判定**之前**：τ 反馈里还留着上一个周期的
@@ -220,7 +243,13 @@ class SoftClose:
                 if self.stall[side] >= self.cfg.stall_cycles:
                     # 手指被挡住却一直没到 τ 阈值（软物体）：用这条兜底，目标停在"实测开口 − 1mm"，
                     # 留 1mm 过盈做轻夹持 —— 位置控制下不留过盈就等于没夹住。
-                    hold = max(q_meas - self.cfg.press_cm / max(ctrl.grip_open_cm, 1e-9)
+                    # 过盈量按"实测全开 cm"折算成弧度；grip_open_cm 非法时不许用 max(...,1e-9)
+                    # 兜除零（那会把过盈算成 5.6e8 → 目标变成 q_min = 全闭，正好压坏东西）
+                    if not np.isfinite(ctrl.grip_open_cm) or ctrl.grip_open_cm <= 0:
+                        self.done[side] = "夹爪全开量程非法，无法折算过盈"
+                        msgs.append(f"{side} 中止：{self.done[side]}（检查 --grip-open-cm）")
+                        continue
+                    hold = max(q_meas - self.cfg.press_cm / ctrl.grip_open_cm
                                * (ctrl.grip_q_max - ctrl.grip_q_min), ctrl.grip_q_min)
                     self.target[side] = float(hold)
                     ctrl.set_gripper(**{side: hold}, source="软闭合-贴住收尾", quiet=True)
@@ -243,7 +272,7 @@ class SoftClose:
             self.target[side] = nxt
             ctrl.set_gripper(**{side: nxt}, source="软闭合", quiet=True)
 
-        if len(self.done) >= len(self.sides):
+        if all(s in self.done for s in self.sides):
             self.active = False
             summary = "；".join(f"{s}: {r}" for s, r in self.done.items())
             msgs.append(f"软闭合结束 —— {summary}（共 {self.cycles} 周期）")
