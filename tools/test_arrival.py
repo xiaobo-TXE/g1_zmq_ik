@@ -363,6 +363,8 @@ def main() -> int:
     print("\n[5] 末端静止但离目标 30mm（被挡住/限位）")
     mon, events = s4_blocked()
     show(events)
+    # 先无条件断言"确实产生了超时事件"：否则原因判定被改坏时这一节会一条 FAIL 都没有
+    check("产生了 1 条超时事件", len(events) == 1, f"实际 {len(events)} 条")
     if events:
         txt = format_event(events[0])
         check("原因 = 疑似被挡", events[0].reason == R_BLOCKED, events[0].reason)

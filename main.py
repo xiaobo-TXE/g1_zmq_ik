@@ -806,6 +806,9 @@ def main(argv=None) -> int:
     delta_done = False
     step_errors = 0
     prev_loop_t0 = None
+    consistency_checked = False
+    # 文件名里带 mode_15 的 URDF 对应 mode_machine=15（README §3.3）；其它模型不做假设
+    expected_mode_machine = 15 if "mode_15" in os.path.basename(args.urdf) else None
     dt = 1.0 / max(args.rate, 1e-3)
     t_start = time.time()
     status = 0
@@ -851,6 +854,20 @@ def main(argv=None) -> int:
             dt_real = dt if prev_loop_t0 is None else float(
                 min(max(loop_t0 - prev_loop_t0, 1e-4), 0.5))
             prev_loop_t0 = loop_t0
+
+            # 一次性一致性自检：机器人报的 mode_machine 必须和本程序加载的 URDF 对得上
+            # （上行按下标读、下行按名字写，模型不一致就会读错/写错关节）
+            if not consistency_checked and getattr(state, "last_mode_machine", None) is not None:
+                consistency_checked = True
+                mm = int(state.last_mode_machine)
+                if expected_mode_machine is not None and mm != expected_mode_machine:
+                    log.warning("机器人 mode_machine=%d，而本程序加载的是 %s（期望 %d）——"
+                                "关节布局可能不一致：上行按槽位 15..28 读手臂、下行按名字写。"
+                                "请确认机型/URDF 是否匹配（--print-mapping 可看关节映射）",
+                                mm, os.path.basename(args.urdf), expected_mode_machine)
+                else:
+                    log.info("机型自检: mode_machine=%d，URDF=%s",
+                             mm, os.path.basename(args.urdf))
 
             try:
                 info = ctrl.step(dt)

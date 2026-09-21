@@ -69,7 +69,23 @@ import numpy as np
 import zmq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config_file import add_config_argument, parse_args_with_config  # noqa: E402
+try:
+    from config_file import add_config_argument, parse_args_with_config  # noqa: E402
+except ImportError:            # 只把本文件拷到别处运行时（没有仓库根目录）
+    def add_config_argument(parser, section, example="robot.example.json"):
+        parser.add_argument('--config', metavar='FILE',
+                            help='（本副本不可用：没找到仓库根目录的 config_file.py）')
+
+    def parse_args_with_config(build_parser, argv=None, sections=()):
+        args = build_parser().parse_args(argv)
+        args.config_applied, args.config_ignored, args.config_sections = [], [], []
+        if getattr(args, 'config', None):
+            build_parser().error('--config 需要仓库根目录的 config_file.py：'
+                                 '本文件被单独拷出来了，请从仓库目录运行，或把 config_file.py 一起拷过去')
+        return args
+
+    print('[WARN] 没找到 config_file.py（本工具被单独拷出来运行？）：--config 不可用，'
+          '其余功能正常', file=sys.stderr)
 
 
 IMAGE_WIDTH = 1280

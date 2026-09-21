@@ -140,6 +140,14 @@ def main() -> int:
     ap.add_argument("--duration", type=float, default=0.0)
     ap.add_argument("--print-every", type=float, default=1.0, help="每隔多少秒打一行状态（0=不打）")
     args = ap.parse_args()
+    # 这些参数是除数（q/cm 换算），传 0 会在第一次 100Hz 广播里 ZeroDivisionError：
+    # mock 直接死掉，现象是"主程序收不到夹爪数据"，很容易查错方向 —— 启动时就拒绝
+    if args.q_max <= 0:
+        ap.error(f"--q-max 必须 > 0（收到 {args.q_max}）")
+    if args.open_cm <= 0:
+        ap.error(f"--open-cm 必须 > 0（收到 {args.open_cm}）")
+    if args.box_cm < 0:
+        ap.error(f"--box-cm 不能为负（收到 {args.box_cm}）")
 
     sides = SIDES if args.side == "both" else (args.side,)
     g = BoxGripper(args.box_cm, args.open_cm, args.q_max, args.speed, args.stiffness, sides)

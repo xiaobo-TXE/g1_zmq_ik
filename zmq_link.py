@@ -79,6 +79,8 @@ class RobotStateSubscriber(_WarnThrottle):
 
         self.frames = 0
         self.bad_frames = 0
+        self.n_motors: Optional[int] = None      # 最近一帧 motor_state 的槽位数（协议固定 35）
+        self._warned_slots = False               # 槽位数异常只告警一次
         self.last_rx: Optional[float] = None
         self._rx_times: List[float] = []
         self.last_topic: Optional[str] = None
@@ -122,6 +124,13 @@ class RobotStateSubscriber(_WarnThrottle):
             n = len(motors)
             if n < 29:
                 raise ValueError(f"motor_state 只有 {n} 项（应 >=29，协议固定 35 槽）")
+            # 上行按**索引**取手臂（15..28）、下行按**名字**写关节：上游一旦改了槽位布局，
+            # 读回来的就不是发出的那些关节了（越走越偏且没有告警）。这里至少把布局异常暴露出来。
+            self.n_motors = n
+            if n != 35 and not self._warned_slots:
+                self._warned_slots = True
+                logger.warning("motor_state 有 %d 槽（协议固定 35）：手臂槽位 15..28 的假设可能不成立，"
+                               "请核对上游版本（行为：仍按下标 15..28 读手臂）", n)
             self.last_topic = pkt.get("topic")
             q29 = np.array([m["q"] for m in motors[:29]], dtype=float)
             # 关节角必须全是有限值：NaN/Inf 会一路穿过正解、反解和 np.clip（clip(nan)==nan）

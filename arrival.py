@@ -425,6 +425,9 @@ class ArrivalMonitor:
             if left:
                 st.arrived = False
                 st.timeout_reported = False
+                # 离开到位区 = 这一轮结束：t_target 也要跟着重置，否则"再次到位"报的耗时
+                # 是从**第一次**下发目标算起（与 elapsed_s 口径不一致，反复出入时越报越大）
+                st.t_target = now
                 st.t_change = now
                 st.settle_s = float("nan")
                 return self._make(st, arm, now, "departed", reason, False, vals,
