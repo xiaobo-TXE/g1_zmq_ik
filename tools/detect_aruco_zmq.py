@@ -7,6 +7,8 @@
 
 本文件由本仓库作者的桌面脚本 `detect_aruco_zmq.py` 整合而来，改动集中在：
   * 新增 `TargetSender`（下发目标 + 防抖三件套：限频 / 死区 / 跳变拒绝）
+    - 跳变拒绝**可恢复**：同一新位置持续 `--jump-recover-s`（默认 0.5s）就判为真实移动并接受，
+      避免"盒子被挪走 >100mm 后 6003 永远停在旧点"
   * 新增 `--marker-to-grasp DX DY DZ`：标记中心 -> 抓取点的偏移（在**标记自身坐标系**里给）
   * 新增 `--print-axes`：打印标记三个轴在 torso 系下的指向，用来确定"往哪个轴偏移"
   * 其余检测/滤波/可视化逻辑与原脚本逐字一致
@@ -224,17 +226,26 @@ class TargetSender:
     """
 
     def __init__(self, endpoint, hz, deadband_mm, jump_reject_mm,
-                 send_quat=False, enabled=True):
+                 send_quat=False, enabled=True, recover_s=0.5):
         self.enabled = bool(enabled)
         self.send_quat = bool(send_quat)
         self.period = 1.0 / max(float(hz), 1e-3)
         self.deadband = float(deadband_mm) / 1000.0
-        self.jump_reject = float(jump_reject_mm) / 1000.0
+        # --jump-reject-mm 0（或负）= 关闭跳变拒绝；否则是"单帧跳变上限"
+        self.jump_reject = (float(jump_reject_mm) / 1000.0
+                            if float(jump_reject_mm) > 0 else float("inf"))
+        # 连续看到同一个新位置超过这么久 = 目标真的动了（盒子被挪走/相机被碰），
+        # 接受它并重置基准；否则一旦跳变就一直拒绝，6003 会永远停在旧点
+        self.recover_s = max(float(recover_s), 0.0)
         self.last_sent = None
         self.last_time = 0.0
         self.sent = 0
         self.skipped = 0
         self.rejected = 0
+        self.recovered = 0
+        self.jump_candidate = None
+        self.jump_since = 0.0
+        self._last_jump_warn = 0.0
         self.socket = None
         if not self.enabled:
             print('[INFO] 目标发送已关闭（--no-send）：只检测不发送', flush=True)
@@ -266,10 +277,29 @@ class TargetSender:
         if self.last_sent is not None:
             jump = float(np.linalg.norm(p - self.last_sent))
             if jump > self.jump_reject:
-                self.rejected += 1
-                print('[WARN] 目标跳变 {:.0f}mm 超过阈值，判为误检、丢弃这帧'.format(jump * 1000),
-                      file=sys.stderr, flush=True)
-                return False
+                # 单帧跳变先当误检丢掉，但**同一个新位置连续出现够久**就认它是真实移动
+                # （盒子被挪走、相机被碰）：否则一直拒绝，6003 永远停在旧位置，
+                # 表现成"Tag 明明看得见但手臂不动"，而且没人知道卡住了。
+                same_candidate = (self.jump_candidate is not None
+                                  and float(np.linalg.norm(p - self.jump_candidate)) < self.deadband)
+                if same_candidate:
+                    waited = now - self.jump_since
+                else:
+                    self.jump_candidate, self.jump_since, waited = p.copy(), now, 0.0
+                if waited < self.recover_s:
+                    self.rejected += 1
+                    if now - self._last_jump_warn >= 1.0:      # 告警限频，别刷屏
+                        self._last_jump_warn = now
+                        print('[WARN] 目标跳变 {:.0f}mm 超过阈值，暂判误检丢弃'
+                              '（若持续 {:.1f}s 会按真实移动接受）'.format(jump * 1000, self.recover_s),
+                              file=sys.stderr, flush=True)
+                    return False
+                self.recovered += 1
+                self.jump_candidate = None
+                print('[INFO] 目标持续偏移 {:.0f}mm 已达 {:.1f}s，判为真实移动：接受新位置并重置基准'
+                      .format(jump * 1000, waited), flush=True)
+            else:
+                self.jump_candidate = None
             if jump < self.deadband:
                 self.skipped += 1
                 return False
@@ -495,7 +525,10 @@ def build_parser():
     parser.add_argument('--deadband-mm', type=float, default=2.0,
                         help='目标变化小于它就不发（防抖）')
     parser.add_argument('--jump-reject-mm', type=float, default=100.0,
-                        help='单帧跳变超过它就判为误检并丢弃')
+                        help='单帧跳变超过它就判为误检并丢弃；0=关闭跳变拒绝（不做误检过滤）')
+    parser.add_argument('--jump-recover-s', type=float, default=0.5, metavar='S',
+                        help='同一个新位置持续这么久就认它是真实移动（盒子被挪走/相机被碰），'
+                             '接受并重置跳变基准；0=只要跳变就接受（不推荐）')
     parser.add_argument('--no-send', action='store_true',
                         help='只检测不发送（回到原脚本行为）')
     parser.add_argument('--send-quat', dest='send_quat', action='store_true', default=True,
@@ -563,7 +596,7 @@ def main():
     # 目标发送器
     sender = TargetSender(args.target_endpoint, args.target_hz, args.deadband_mm,
                           args.jump_reject_mm, send_quat=args.send_quat,
-                          enabled=not args.no_send)
+                          enabled=not args.no_send, recover_s=args.jump_recover_s)
     last_log_time = 0.0
     send_log_time = 0.0
     warned_resolution = False
@@ -642,8 +675,8 @@ def main():
         socket.close(linger=0)
         context.term()
         sender.close()
-        print('[INFO] 目标发送统计: 发送 {} 帧 / 死区或限频跳过 {} / 跳变丢弃 {}'.format(
-            sender.sent, sender.skipped, sender.rejected), flush=True)
+        print('[INFO] 目标发送统计: 发送 {} 帧 / 死区或限频跳过 {} / 跳变丢弃 {} / 判为真实移动 {}'.format(
+            sender.sent, sender.skipped, sender.rejected, sender.recovered), flush=True)
         print('[INFO] stopped')
 
 
