@@ -50,6 +50,240 @@ LEFT, RIGHT = "left", "right"
 TARGET_EPS_POS = 1e-4
 TARGET_EPS_ROT = 1e-4
 
+#: 笛卡尔直线段时间律的内部积分步长（s）。比控制周期细得多，保证
+#: "先算好整条曲线再按时间采样"的确定性，也让限幅不受控制周期抖动破坏。
+LIN_PROFILE_DT = 1e-3
+
+#: 姿态折算成"等效弧长"用的参考半径（m）。纯旋转的直线段（位移≈0）若按位移换算
+#: 加速度/加加速度上限会变成无穷大，所以用腕到指尖这个尺度做折算。
+LIN_ROT_RADIUS = 0.15
+
+
+def _rot_log(R: np.ndarray) -> np.ndarray:
+    """SO(3) 对数映射 -> 旋转向量 (3,)。接近 0/180° 时做有限性兜底。"""
+    c = float(np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0))
+    theta = float(np.arccos(c))
+    v = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    s = float(np.linalg.norm(v))
+    if s < 1e-12:
+        return np.zeros(3) if theta < 1e-6 else np.array([np.pi, 0.0, 0.0])
+    return v / s * theta
+
+
+def _rot_exp(w: np.ndarray) -> np.ndarray:
+    """旋转向量 -> SO(3)（Rodrigues）。"""
+    theta = float(np.linalg.norm(w))
+    if theta < 1e-12:
+        return np.eye(3)
+    a = w / theta
+    K = np.array([[0.0, -a[2], a[1]], [a[2], 0.0, -a[0]], [-a[1], a[0], 0.0]])
+    return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
+
+
+@dataclass
+class LinearMove:
+    """一段**笛卡尔直线**：位置线性，姿态沿测地线（轴角 / SLERP）插值。
+
+        p(s) = p0 + s · (p1 − p0)
+        R(s) = R0 · exp( s · log(R0ᵀ R1) )        # 等价 SLERP，无万向锁
+
+    进度 s(t) ∈ [0,1] 由一条 **jerk 限幅**的标量曲线给出：先在 LIN_PROFILE_DT 的细网格上
+    把曲线积分出来（速度上限 + 按剩余距离提前减速 + 加速度限幅 + 加加速度限幅），
+    之后按时间采样。好处：确定性（同样的 dt 出同样的轨迹，可离线单测）、
+    对控制周期抖动免疫，且天然是一条梯形 / S 形速度曲线。
+
+    与"每周期直接解最终目标"的区别：IK 追的是**随时间前进的路点**，所以末端被约束在
+    直线上，而不是沿关节空间最短路径划弧。
+    """
+
+    T0: np.ndarray
+    T1: np.ndarray
+    v_max: float = 0.10          # 线速度上限 m/s
+    a_max: float = 0.20          # 线加速度上限 m/s²
+    j_max: float = 0.0           # 线加加速度上限 m/s³（0=不限，退化成梯形曲线）
+    w_max: float = 0.0           # 角速度上限 rad/s（0=不限）
+
+    p0: np.ndarray = field(init=False)
+    p1: np.ndarray = field(init=False)
+    R0: np.ndarray = field(init=False)
+    R1: np.ndarray = field(init=False)
+    length: float = field(init=False, default=0.0)
+    rot_angle: float = field(init=False, default=0.0)
+    duration: float = field(init=False, default=0.0)
+    t: float = field(init=False, default=0.0)
+    t_prev: float = field(init=False, default=0.0)
+    _times: np.ndarray = field(init=False, default_factory=lambda: np.zeros(1))
+    _prog: np.ndarray = field(init=False, default_factory=lambda: np.zeros(1))
+    #: 标量进度上的加速度曲线（与 _times 同网格），仅供自检/单测核对限幅
+    _prof_a: np.ndarray = field(init=False, default_factory=lambda: np.zeros(1))
+
+    def __post_init__(self) -> None:
+        self.T0 = np.asarray(self.T0, dtype=float).reshape(4, 4)
+        self.T1 = np.asarray(self.T1, dtype=float).reshape(4, 4)
+        self.p0, self.p1 = self.T0[:3, 3].copy(), self.T1[:3, 3].copy()
+        self.R0, self.R1 = self.T0[:3, :3].copy(), self.T1[:3, :3].copy()
+        self.length = float(np.linalg.norm(self.p1 - self.p0))
+        self.rot_angle = float(np.linalg.norm(_rot_log(self.R0.T @ self.R1)))
+        self._build_profile()
+
+    # ---------------- 时间律 ----------------
+    def _build_profile(self) -> None:
+        """预先规划出整条标量进度曲线 s(t)（**S 形 / 梯形**，速度+加速度+jerk 三重限幅）。
+
+        为什么不做"每步反馈跟踪一条制动包络"：包络自己会随剩余距离收缩，一旦实际速度
+        超过包络，包络下降得比 `-a` 还快，就再也追不回来（到终点停不住）。所以这里改成
+        **先规划、后采样**：
+
+          1. 用锥形律 a_cmd = sign(dv)·min(a_max, sqrt(2·j·|dv|)) 模拟"从 0 加速到 v_peak"
+             （锥形律自带 |da/dt| ≤ j，所以它本身就是 jerk 受限的）；
+          2. 二分找 v_peak：使 `2·d_accel(v_peak) == 1`（算上匀速段），即恰好能在总距离内停下；
+          3. 曲线 = 加速段 + 匀速段 + **加速段的镜像**（减速段）。
+
+        这样终点速度精确为 0、进度精确到 1，且三个限幅都成立。
+        """
+        dt = LIN_PROFILE_DT
+        L_lin = max(self.length, 1e-9)
+        # 直线与旋转取更"长"的那个作为加速度/加加速度的折合尺度
+        scale = max(L_lin, self.rot_angle * LIN_ROT_RADIUS, 1e-6)
+
+        # 与末端限速同一套约定：<=0 表示"不限"
+        u_v = self.v_max / L_lin if self.v_max > 0 else np.inf
+        if self.w_max > 0 and self.rot_angle > 1e-9:
+            u_v = min(u_v, self.w_max / self.rot_angle)
+        u_a = self.a_max / scale if self.a_max > 0 else np.inf
+        u_j = self.j_max / scale if self.j_max > 0 else np.inf
+
+        def ramp(v_to: float) -> Tuple[List[float], List[float], List[float]]:
+            """从 0 加速到 v_to（加速度最后收到 0），返回 (时间, 已走距离, 加速度)。
+
+            用标准的"三段式"判据，而不是逐点跟踪锥形律：jerk 下降段能覆盖的速度增量恰好是
+            ``Δv = a²/(2·u_j)``，所以**当剩余速度增量等于它时就开始收加速度**，加速度以
+            jerk u_j 线性降到 0 的同时速度正好落在 v_to。推导：设收加速度前为 a0，降段
+            a(t)=a0−u_j t，则 Δv = a0²/(2u_j)，与判据一致 —— 收完之后 dv 恒为 0。
+
+            逐点跟踪锥形律在这里是行不通的：加速度有"记忆"（受 jerk 限制），等发现超了
+            再反打已经来不及（实测会冲过目标速度再振荡 2s、多走 1.5 倍距离）。
+            一旦进入收加速度段就**粘住**不再回头，避免判据两边的浮点抖动。
+            """
+            ts, ds, as_ = [0.0], [0.0], [0.0]
+            v, a, d, t = 0.0, 0.0, 0.0, 0.0
+            if u_a == np.inf:                                  # 没有加速度上限：直接跳
+                return [0.0, dt], [0.0, 0.0], [0.0, 0.0]
+            if v_to <= 0.0 or u_j == np.inf:
+                # 无 jerk 限幅（梯形）：a 直接给到上限，到了就吸附
+                while v < v_to and len(ts) < int(200.0 / dt):
+                    v = min(v_to, v + u_a * dt)
+                    d += v * dt
+                    t += dt
+                    ts.append(t)
+                    ds.append(d)
+                    as_.append(u_a)
+                return ts, ds, as_
+            coasts = False
+            for _ in range(int(200.0 / dt)):
+                dv = v_to - v
+                # 该收加速度了吗？（jerk 下降段覆盖的速度增量恰好是 a²/(2u_j)）
+                # 一旦开始收就粘住；dv 已经 <=0 也必须收，绝不能带着残余加速度退出
+                if (not coasts) and dv <= (a * a) / (2.0 * u_j) + 1e-15:
+                    coasts = True
+                a += float(np.clip((0.0 if coasts else u_a) - a, -u_j * dt, u_j * dt))
+                if coasts and a <= 1e-12:
+                    break
+                v += a * dt
+                d += v * dt
+                t += dt
+                ts.append(t)
+                ds.append(d)
+                as_.append(a)
+            return ts, ds, as_
+
+        if u_v == np.inf and u_a == np.inf:                    # 完全不限：一步到位
+            self._times = np.array([0.0, dt])
+            self._prog = np.array([1.0, 1.0])
+            self._prof_a = np.array([0.0, 0.0])
+            self.duration = dt
+            return
+        if self.length <= 1e-12 and self.rot_angle <= 1e-12:   # 原地不动
+            self._times = np.array([0.0])
+            self._prog = np.array([1.0])
+            self._prof_a = np.array([0.0])
+            self.duration = 0.0
+            return
+
+        v_peak = u_v if np.isfinite(u_v) else 1e12
+        ts_a, ds_a, as_a = ramp(v_peak)
+        if 2.0 * ds_a[-1] > 1.0:                               # 全速冲不到头：二分降峰值
+            lo, hi = 0.0, v_peak
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                if 2.0 * ramp(mid)[1][-1] <= 1.0:
+                    lo = mid
+                else:
+                    hi = mid
+            v_peak = lo
+            ts_a, ds_a, as_a = ramp(v_peak)
+
+        d_acc = ds_a[-1]
+        d_cruise = max(0.0, 1.0 - 2.0 * d_acc)
+        t_cruise = d_cruise / v_peak if v_peak > 0 else 0.0
+
+        times, prog, accs = list(ts_a), list(ds_a), list(as_a)   # ① 加速段
+        if t_cruise > 1e-9:                                      # ② 匀速段
+            n = max(1, int(round(t_cruise / dt)))
+            for i in range(1, n + 1):
+                times.append(times[-1] + t_cruise / n)
+                prog.append(d_acc + d_cruise * i / n)
+                accs.append(0.0)
+        for k in range(len(ts_a) - 1, 0, -1):                    # ③ 减速段 = 加速段镜像
+            times.append(times[-1] + (ts_a[k] - ts_a[k - 1]))
+            prog.append(1.0 - ds_a[k])
+            accs.append(-as_a[k])
+        times.append(times[-1] + (ts_a[1] - ts_a[0]))            # 终点（v=0, a=0）
+        prog.append(1.0)
+        accs.append(0.0)
+
+        self._times = np.asarray(times, dtype=float)
+        self._prog = np.asarray(prog, dtype=float)
+        self._prof_a = np.asarray(accs, dtype=float)
+        self._prog[-1] = 1.0                                   # 精确落在终点
+        self.duration = float(self._times[-1])
+
+    def sample(self, t: float) -> float:
+        """时间 -> 进度 s ∈ [0,1]。"""
+        if self.duration <= 0.0:
+            return 1.0
+        return float(np.interp(float(t), self._times, self._prog))
+
+    def pose_at(self, s: float) -> np.ndarray:
+        """进度 -> 位姿（位置直线 + 姿态测地线）。"""
+        s = float(np.clip(s, 0.0, 1.0))
+        T = np.eye(4)
+        T[:3, 3] = self.p0 + s * (self.p1 - self.p0)
+        T[:3, :3] = self.R0 @ _rot_exp(s * _rot_log(self.R0.T @ self.R1))
+        return T
+
+    # ---------------- 推进 ----------------
+    @property
+    def done(self) -> bool:
+        return self.t >= self.duration - 1e-12
+
+    def progress(self) -> float:
+        return self.sample(self.t)
+
+    def remaining_m(self) -> float:
+        return float((1.0 - self.progress()) * self.length)
+
+    def advance(self, dt: float) -> np.ndarray:
+        """推进 dt，返回本周期应当追的位姿（到末端后停在 T1）。"""
+        self.t_prev = self.t
+        self.t = min(self.t + max(0.0, float(dt)), self.duration)
+        return self.pose_at(self.progress())
+
+    def rollback(self) -> None:
+        """退回上一次 advance 之前：IK 失败时路点不许跑在手臂前面。"""
+        self.t = self.t_prev
+
+
 
 @dataclass
 class StepInfo:
@@ -78,6 +312,7 @@ class StepInfo:
     ik_status: str = ""
     target_rev: Dict[str, int] = field(default_factory=dict)   # 目标变更计数（到位判定用）
     controlled: str = ""           # 本帧实际驱动哪条臂：left/right/both（到位判定用）
+    lin: Dict[str, str] = field(default_factory=dict)   # 笛卡尔直线段进度（空串=没在走）
 
 
 def format_step(info: StepInfo, arm: str, with_joints: bool = False,
@@ -100,6 +335,9 @@ def format_step(info: StepInfo, arm: str, with_joints: bool = False,
             + (f" a={info.ee_accel_m_s2:5.2f}m/s²" if info.ee_accel_m_s2 > 0 else ""))
     if not info.sent:
         line += " [未下发]"
+    lin = (info.lin or {}).get(arm, "")
+    if lin:
+        line += f" [{lin}]"
     if info.waist_bias_mm > 0.5:
         line += f" [腰未参与换算, 偏差{info.waist_bias_mm:.1f}mm]"
     if info.notes:
@@ -184,6 +422,22 @@ class ArmController:
         # --arm both 时先到的左臂会被右臂覆盖，导致左臂目标被丢掉）
         self._pending_positions: List[Tuple[str, np.ndarray]] = []
 
+        # ---- 笛卡尔直线段（LIN）----
+        #: 每侧正在走的直线段；None = 该臂按"直接追目标"的旧行为
+        self.lin: Dict[str, Optional[LinearMove]] = {LEFT: None, RIGHT: None}
+        #: 每侧"两段式接近"的第一段（先 PTP 到 pre-grasp，到了再起 LIN 进给）
+        self._approach: Dict[str, Optional[dict]] = {LEFT: None, RIGHT: None}
+        #: 连续反解失败计数：超过 lin_abort_cycles 就取消该段（IK 失效即停）
+        self._lin_fail: Dict[str, int] = {LEFT: 0, RIGHT: 0}
+        #: 直线段的默认限幅（None = 沿用末端限速那套 ee_speed/ee_accel/ee_jerk）
+        self.lin_speed: Optional[float] = None
+        self.lin_accel: Optional[float] = None
+        self.lin_jerk: Optional[float] = None
+        self.lin_rot_speed: Optional[float] = None
+        self.lin_abort_cycles: int = 5
+        #: 第一段（PTP 到 pre-grasp）判定"到了"的容差（m）
+        self.lin_reach_tol: float = 0.005
+
         self.q_cmd: Optional[np.ndarray] = None
         self.q_meas: Optional[np.ndarray] = None
         self.q_waist: Optional[np.ndarray] = None
@@ -237,6 +491,28 @@ class ArmController:
     def set_target_pose(self, arm: str, T_pelvis: np.ndarray) -> None:
         self._assign_target(arm, T_pelvis)
 
+    def make_target_pose(self, arm: str, position: Sequence[float],
+                         rpy: Optional[Sequence[float]] = None,
+                         quat: Optional[Sequence[float]] = None) -> Optional[np.ndarray]:
+        """**只构造**目标位姿，不写进 self.target（笛卡尔段要用它在发车前算路点）。
+
+        姿态优先级：**quat（四元数 x,y,z,w）> rpy > 启动时锁定的参考姿态**。
+        参考姿态还没锁定时返回 None（调用方走 set_target_position 的排队逻辑）。
+        """
+        pos = np.asarray(position, dtype=float).reshape(3)
+        if quat is not None:
+            rot = quat_to_rotation(quat)
+        elif rpy is not None:
+            rot = rpy_to_rotation(np.asarray(rpy, dtype=float).reshape(3))
+        elif self._ref_rot is not None:
+            rot = self._ref_rot[arm]
+        else:
+            return None
+        T = np.eye(4)
+        T[:3, 3] = pos
+        T[:3, :3] = rot
+        return T
+
     def set_target_position(self, arm: str, position: Sequence[float],
                             rpy: Optional[Sequence[float]] = None,
                             quat: Optional[Sequence[float]] = None) -> None:
@@ -246,23 +522,154 @@ class ArmController:
         quat 用来"让夹爪跟着标记/物体转向"（例如 ArUco 给出的标记朝向）。
         """
         pos = np.asarray(position, dtype=float).reshape(3)
+        T = self.make_target_pose(arm, pos, rpy=rpy, quat=quat)
+        if T is None:
+            self._pending_positions.append((arm, pos))   # 参考姿态还没锁定，等第一帧补上
+            return
+        # 记下"原始输入"，供日志/显示用（位姿本身存在 self.target）
         if quat is not None:
-            rot = quat_to_rotation(quat)
             self.quat_target[arm] = np.asarray(quat, dtype=float).reshape(4).copy()
         elif rpy is not None:
             self.target_rpy[arm] = np.asarray(rpy, dtype=float).reshape(3)
-            rot = rpy_to_rotation(self.target_rpy[arm])
-            self.quat_target[arm] = None
-        elif self._ref_rot is not None:
-            rot = self._ref_rot[arm]
             self.quat_target[arm] = None
         else:
-            self._pending_positions.append((arm, pos))   # 参考姿态还没锁定，等第一帧补上
-            return
-        T = np.eye(4)
-        T[:3, 3] = pos
-        T[:3, :3] = rot
+            self.quat_target[arm] = None
         self._assign_target(arm, T)
+
+    # ------------------------------------------------------------------ 笛卡尔直线段
+    def _cmd_pose_in_target_frame(self, arm: str) -> Optional[np.ndarray]:
+        """当前**指令**位姿，表达在目标系里（直线段起点用它，保证不跳变）。"""
+        if self.q_cmd is None:
+            return None
+        T_L, T_R = self.ee_in_target_frame(self.q_cmd)
+        return (T_L if arm == LEFT else T_R).copy()
+
+    def _lin_limits(self) -> dict:
+        """直线段限幅：未显式给就沿用末端限速那套（ee_speed/ee_accel/ee_jerk）。"""
+        return {
+            "v_max": float(self.ee_speed if self.lin_speed is None else self.lin_speed),
+            "a_max": float(self.ee_accel if self.lin_accel is None else self.lin_accel),
+            "j_max": float(self.ee_jerk if self.lin_jerk is None else self.lin_jerk),
+            "w_max": float(self.ee_rot_speed if self.lin_rot_speed is None
+                           else self.lin_rot_speed),
+        }
+
+    def start_linear(self, arm: str, T_goal: np.ndarray,
+                     T_from: Optional[np.ndarray] = None) -> Optional[LinearMove]:
+        """从当前指令位姿（或指定的 T_from）起一段**笛卡尔直线**到 T_goal。
+
+        同时把 self.target[arm] 设成 T_goal —— 到位判定看的是**终点**，所以直线段
+        走到一半不会被误判到位（track_err 是实测 vs 终点）。
+        """
+        if T_from is None:
+            T_from = self._cmd_pose_in_target_frame(arm)
+            if T_from is None:
+                T_from = self._base_pose(arm)
+        lim = self._lin_limits()
+        mv = LinearMove(np.asarray(T_from, dtype=float).copy(),
+                        np.asarray(T_goal, dtype=float).copy(), **lim)
+        self.lin[arm] = mv
+        self._approach[arm] = None          # 显式起段 = 取消同臂的待接近阶段
+        self._lin_fail[arm] = 0
+        self._assign_target(arm, np.asarray(T_goal, dtype=float))
+        logger.info("直线段[%s]: 长 %.1fmm 转角 %.1f° 时长 %.2fs（v≤%.0fmm/s a≤%.2fm/s² j≤%.1f）",
+                    arm, mv.length * 1000, np.rad2deg(mv.rot_angle), mv.duration,
+                    lim["v_max"] * 1000, lim["a_max"], lim["j_max"])
+        return mv
+
+    def start_approach(self, arm: str, T_grasp: np.ndarray, approach_dist: float,
+                       T_from: Optional[np.ndarray] = None) -> None:
+        """两段式接近：先按普通方式追到 **pre-grasp**（PTP 语义），到位后再直线进给。
+
+        pre-grasp = 抓取点沿**工具轴 x** 后退 approach_dist（工具轴就是夹爪的进给方向）。
+        这样"长距离转移"仍走关节空间（快、不易撞），只有最后一段是直线。
+        """
+        T_grasp = np.asarray(T_grasp, dtype=float).reshape(4, 4).copy()
+        x_tool = T_grasp[:3, :3][:, 0]                      # 工具轴 = 夹爪进给方向
+        n = float(np.linalg.norm(x_tool))
+        if n < 1e-9:
+            raise ValueError("目标姿态的工具轴退化，无法算 pre-grasp")
+        x_tool = x_tool / n
+        if approach_dist <= 0.0:
+            self.set_target_pose(arm, T_grasp)
+            return
+        T_pre = T_grasp.copy()
+        T_pre[:3, 3] = T_grasp[:3, 3] - float(approach_dist) * x_tool
+        self.lin[arm] = None
+        self._lin_fail[arm] = 0
+        self._approach[arm] = {"T_pre": T_pre, "T_grasp": T_grasp, "from": T_from}
+        self._assign_target(arm, T_pre)
+        logger.info("两段式接近[%s]: 先到 pre-grasp %s（沿工具轴后退 %.0fmm），到位后直线进给",
+                    arm, np.round(T_pre[:3, 3], 4), approach_dist * 1000)
+
+    def retract(self, arm: str, distance: float,
+                T_from: Optional[np.ndarray] = None) -> Optional[LinearMove]:
+        """沿工具轴 x 反方向退出一段（抓完把物体拉出来 / 松开夹爪）。"""
+        base = self._cmd_pose_in_target_frame(arm)
+        if base is None:
+            base = self._base_pose(arm)
+        x_tool = np.asarray(base, dtype=float)[:3, :3][:, 0]
+        n = float(np.linalg.norm(x_tool))
+        if n < 1e-9:
+            raise ValueError("当前工具轴退化，无法算退出方向")
+        T_goal = np.asarray(base, dtype=float).copy()
+        T_goal[:3, 3] = np.asarray(base)[:3, 3] - float(distance) * (x_tool / n)
+        return self.start_linear(arm, T_goal, T_from=T_from)
+
+    def cancel_linear(self, arm: str, why: str = "") -> None:
+        """取消该臂的直线段 / 待接近阶段（目标保持不变）。"""
+        if self.lin[arm] is not None or self._approach[arm] is not None:
+            logger.warning("取消直线段[%s]%s", arm, f"（{why}）" if why else "")
+        self.lin[arm] = None
+        self._approach[arm] = None
+        self._lin_fail[arm] = 0
+
+    def lin_status(self, arm: str) -> str:
+        """给日志用的一行状态（没有直线段时返回空串）。"""
+        ap = self._approach.get(arm)
+        if ap is not None:
+            return "接近: 前往 pre-grasp"
+        mv = self.lin.get(arm)
+        if mv is None:
+            return ""
+        return (f"直线: {mv.progress() * 100:5.1f}% 剩 {mv.remaining_m() * 1000:5.1f}mm "
+                f"({mv.t:.2f}/{mv.duration:.2f}s)")
+
+    def _advance_lin(self, dt: float, T_L_tgt: np.ndarray, T_R_tgt: np.ndarray,
+                     ) -> Tuple[np.ndarray, np.ndarray]:
+        """本周期真正喂给 IK 的位姿：有直线段就用路点，否则直接用最终目标。"""
+        out = {}
+        for arm, T_tgt in ((LEFT, T_L_tgt), (RIGHT, T_R_tgt)):
+            ap = self._approach.get(arm)
+            if ap is not None and self.lin[arm] is None:
+                # 第一段：普通追 pre-grasp；**指令**位姿到了就切直线进给
+                T_cmd = self._cmd_pose_in_target_frame(arm)
+                if (T_cmd is not None
+                        and float(np.linalg.norm(T_cmd[:3, 3] - ap["T_pre"][:3, 3]))
+                        <= self.lin_reach_tol):
+                    self.start_linear(arm, ap["T_grasp"],
+                                      T_from=(ap["from"] if ap["from"] is not None
+                                              else ap["T_pre"]))
+                    out[arm] = self.pose_at_lin_start(arm, T_tgt)
+                    continue
+                out[arm] = T_tgt
+                continue
+            mv = self.lin[arm]
+            if mv is None:
+                out[arm] = T_tgt
+                continue
+            out[arm] = mv.advance(dt)
+            if mv.done:
+                # 走到终点即结束该段；目标（self.target）本来就是终点，语义不变
+                logger.info("直线段[%s]完成（长 %.1fmm，用时 %.2fs）",
+                            arm, mv.length * 1000, mv.duration)
+                self.lin[arm] = None
+        return out[LEFT], out[RIGHT]
+
+    def pose_at_lin_start(self, arm: str, fallback: np.ndarray) -> np.ndarray:
+        """刚起段时本周期该追的位姿 = 段的起点（避免 IK 目标从旧目标跳变）。"""
+        mv = self.lin[arm]
+        return mv.pose_at(0.0) if mv is not None else fallback
 
     def _base_pose(self, arm: str) -> np.ndarray:
         """"叠加位移 / 只改姿态"用的基准位姿。
@@ -598,12 +1005,15 @@ class ArmController:
                     # "还没有显式目标"，到位判定不会对启动时的保持位姿报"到位"
                     self.target[arm] = T.copy()
 
-        # 4) 目标 -> IK 求解系（= torso_link 系）-> IK；速度限制在下面用雅可比钳制
+        # 4) 目标 -> IK 求解系（= torso_link 系）
+        #    T_*_tgt : **用户目标**（终点）—— 到位判定、制动距离都用它
+        #    T_*_wp  : 本周期真正追的位姿 —— 有直线段时是插值出来的路点，否则就是终点
         T_L_tgt, T_R_tgt = self._ik_targets(T_L_meas, T_R_meas)
+        T_L_wp, T_R_wp = self._advance_lin(dt, T_L_tgt, T_R_tgt)
         t0 = time.perf_counter()
         q_raw = None
         try:
-            q_raw = self.ik.solve(T_L_tgt, T_R_tgt, self.q_meas)
+            q_raw = self.ik.solve(T_L_wp, T_R_wp, self.q_meas)
             info.ik_status = getattr(self.ik, "last_status", "")
         except Exception as exc:
             logger.error("IK 异常(%s)，保持上一帧命令", exc)
@@ -614,7 +1024,24 @@ class ArmController:
             # 会每周期 2° 地朝一个错误构型爬。宁可保持上一帧，并把原因说清楚。
             why = getattr(self.ik, "last_status", "")
             info.notes.append("IK 未收敛/非有限 -> 保持" + (f"（{why}）" if why else ""))
+            # 直线段：本周期路点没被"兑现"，回退进度（路点绝不允许跑在手臂前面）；
+            # 连续失败超过阈值就取消整段，让手臂停下来而不是硬着头皮往盒子里推。
+            for arm in (LEFT, RIGHT):
+                mv = self.lin[arm]
+                if mv is None:
+                    continue
+                mv.rollback()
+                self._lin_fail[arm] += 1
+                if self._lin_fail[arm] >= self.lin_abort_cycles:
+                    self.cancel_linear(arm, f"反解连续失败 {self._lin_fail[arm]} 周期")
+                    info.notes.append(f"{arm} 直线段已取消（反解失败）")
+                else:
+                    info.notes.append(f"{arm} 直线段暂停（反解失败 {self._lin_fail[arm]}）")
             return info
+        for arm in (LEFT, RIGHT):
+            if self.lin[arm] is not None:
+                self._lin_fail[arm] = 0
+        info.lin = {arm: self.lin_status(arm) for arm in (LEFT, RIGHT)}
 
         # 5) 平滑
         if self.filter is not None:
@@ -632,11 +1059,24 @@ class ArmController:
 
         # 7) 限速（先关节侧兜底，再按末端笛卡尔速度钳制）+ 限位
         delta = q_new - prev
+        joint_clipped = False
         if self.max_step > 0:
             over = np.abs(delta) > self.max_step
             if np.any(over):
                 delta = np.clip(delta, -self.max_step, self.max_step)
+                joint_clipped = True
                 info.notes.append(f"关节限速 {int(np.sum(over))} 个")
+        # 关节被限速 = 这条臂这一拍追不上路点。让直线段**退一拍**（不推进），
+        # 这样路点永远停在手臂够得着的位置，末端就不会被拽离直线。
+        if joint_clipped:
+            held = []
+            for arm in (LEFT, RIGHT):
+                mv = self.lin[arm]
+                if mv is not None and not mv.done:
+                    mv.rollback()
+                    held.append(arm)
+            if held:
+                info.notes.append("直线段同步减速")
         # 受控臂到目标的剩余距离（用于加速度限制的提前减速）：**按臂**给，不要跨臂取 min
         T_prev_base = self.model.fk(prev)
         dist: Dict[str, float] = {}

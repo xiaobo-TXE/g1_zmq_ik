@@ -179,6 +179,24 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--grip-soft-rate", type=float, default=1.5,
                    help="软闭合的目标推进速度 rad/s（默认 1.5 ≈ 2.3cm/s 开口变化）")
 
+    # ---- 笛卡尔直线段（抓取进给/退出）：6003 协议不变，主程序自己算 pre-grasp/退出点 ----
+    L = p.add_argument_group("笛卡尔直线段（LIN）")
+    L.add_argument("--lin-approach", type=float, default=0.0, metavar="MM",
+                   help="抓取进给：收到 6003 的绝对目标后，先按普通方式走到『沿工具轴后退 MM 的 "
+                        "pre-grasp 点』，再沿工具轴直线进给到目标。0=关闭（默认，行为同旧版）")
+    L.add_argument("--lin-retreat", type=float, default=0.0, metavar="MM",
+                   help="抓取退出：到位+闭爪完成后，沿工具轴反方向直线退出 MM（0=不动）")
+    L.add_argument("--lin-speed", type=float, default=None, metavar="M_S",
+                   help="直线段的线速度上限（默认沿用 --ee-speed）")
+    L.add_argument("--lin-accel", type=float, default=None, metavar="M_S2",
+                   help="直线段的线加速度上限（默认沿用 --ee-accel）")
+    L.add_argument("--lin-jerk", type=float, default=None, metavar="M_S3",
+                   help="直线段的加加速度上限（默认沿用 --ee-jerk）")
+    L.add_argument("--lin-rot-speed", type=float, default=None, metavar="RAD_S",
+                   help="直线段的角速度上限（默认沿用 --ee-rot-speed）")
+    L.add_argument("--lin-abort-cycles", type=int, default=5, metavar="N",
+                   help="直线段里反解连续失败 N 个周期就取消该段并停住（默认 5 = 100ms）")
+
     g = p.add_argument_group("到位判定（实测末端是否已稳定到达目标）")
     g.add_argument("--no-arrive", action="store_true", help="关闭到位判定（默认开启）")
     g.add_argument("--arrive-pos", type=float, default=2.0, metavar="MM",
@@ -247,6 +265,9 @@ HELP_TEXT = """
   g [R [L]]      夹爪开合百分比（0=闭 100=全开）     例: g 0      g 0 100     g=看当前
   gc [TAU]       力限软闭合（慢闭到 |τ|≥TAU 就冻结） 例: gc        gc 0.2
   go             夹爪张开到 100%（释放）
+  ap [MM]        从当前位置沿工具轴后退 MM 再直线进给到当前目标（默认 120mm）
+  rt [MM]        沿工具轴反方向直线退出 MM（默认 100mm）
+  lin            打印直线段状态
   h              打印当前实测/目标/误差/到位状态
   j              打印当前下发的 14 个关节角
   ?              显示本帮助
@@ -372,6 +393,23 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
                     log.info("%s", m)
                 if soft.active and flags.get("grip_rx") is None:
                     log.warning("注意：没有 6004 力反馈（--gripper-port 0？）—— 软闭合会立刻中止")
+        elif head == "ap":
+            d = (float(args[0]) / 1000.0) if args else 0.12
+            for arm in flags["arms"]:
+                T = ctrl.target.get(arm)
+                if T is None:
+                    log.warning("还没有目标位姿，ap 命令无效")
+                    continue
+                ctrl.start_approach(arm, np.asarray(T, dtype=float).copy(), d)
+            log.info("两段式接近: 后退 %.0fmm 后直线进给", d * 1000)
+        elif head == "rt":
+            d = (float(args[0]) / 1000.0) if args else 0.10
+            for arm in flags["arms"]:
+                ctrl.retract(arm, d)
+            log.info("沿工具轴退出 %.0fmm", d * 1000)
+        elif head == "lin":
+            for arm in (LEFT, RIGHT):
+                log.info("直线段[%s]: %s", arm, ctrl.lin_status(arm) or "（未在走）")
         elif head == "go":
             apply_grip_percent(ctrl, 100, 100, source="交互命令 go（张开/释放）")
             if flags.get("soft") is not None:
@@ -438,8 +476,23 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
     rpy = pkt.get("rpy")
 
     quat = pkt.get("quat")            # 可选目标朝向（四元数 x,y,z,w）
+    lin_mm = float(flags.get("lin_approach_mm", 0.0))
+
+    def apply_abs_target(arm: str, pos) -> None:
+        """绝对位置目标：开了 --lin-approach 就先到 pre-grasp，再直线进给。
+
+        pre-grasp 用**锁定姿态的工具轴 x** 算：位置指令不携带姿态也能得到正确的进给方向；
+        6003 协议一个字都不用改。姿态没锁定时退回旧的"直接设目标"。
+        """
+        T = ctrl.make_target_pose(arm, pos, rpy=rpy, quat=quat)
+        if lin_mm > 0 and T is not None:
+            ctrl.start_approach(arm, T, lin_mm / 1000.0)
+            flags["retreated"] = False
+        else:
+            ctrl.set_target_position(arm, pos, rpy=rpy, quat=quat)
+
     for side, pos in (pkt.get("per_arm") or {}).items():
-        ctrl.set_target_position(side, pos, rpy=rpy, quat=quat)
+        apply_abs_target(side, pos)
         if side not in arms:
             arms.append(side)
         flags["last_stream_pos"][side] = np.asarray(pos, dtype=float).copy()
@@ -450,7 +503,7 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
             if a not in arms:
                 arms.append(a)
             if pkt.get("pos") is not None:
-                ctrl.set_target_position(a, pkt["pos"], rpy=rpy, quat=quat)
+                apply_abs_target(a, pkt["pos"])
                 flags["last_stream_pos"][a] = np.asarray(pkt["pos"], dtype=float).copy()
             else:
                 # delta：相对"上一条目标位置"叠加（没有上一条时相对当前目标）
@@ -707,8 +760,25 @@ def main(argv=None) -> int:
                          grip_open_cm=args.grip_open_cm,
                          dry_run=args.dry_run and not args.sim,
                          velocity=(args.vx, args.vy, args.wz))
+    # 笛卡尔直线段的三条限幅：默认沿用末端限速那套
+    ctrl.lin_speed = args.lin_speed
+    ctrl.lin_accel = args.lin_accel
+    ctrl.lin_jerk = args.lin_jerk
+    ctrl.lin_rot_speed = args.lin_rot_speed
+    ctrl.lin_abort_cycles = max(1, int(args.lin_abort_cycles))
+    if args.lin_approach > 0:
+        log.info("抓取进给: 先到 pre-grasp（沿工具轴后退 %.0fmm）再直线进给 %.0fmm/s、"
+                 "jerk %s；反解失败 %d 周期即取消该段",
+                 args.lin_approach,
+                 (args.lin_speed if args.lin_speed is not None else args.ee_speed) * 1000,
+                 args.lin_jerk if args.lin_jerk is not None else args.ee_jerk,
+                 ctrl.lin_abort_cycles)
+    if args.lin_retreat > 0:
+        log.info("抓取退出: 到位并闭爪完成后沿工具轴直线退出 %.0fmm", args.lin_retreat)
 
-    # 初始目标
+    # 初始目标（--pos/--pos-left/--pos-right）
+    #   注意：这一步发生在收到第一帧状态**之前**，参考姿态还没锁定 -> 工具轴未知，
+    #   所以两段式接近要等第一帧之后再做（见循环里的 startup_approach_pending）。
     targets = parse_initial_targets(args)
     for arm, pos in targets.items():
         if pos is not None:
@@ -796,6 +866,9 @@ def main(argv=None) -> int:
 
     flags = {"arms": arms, "force_print": False, "print_joints": args.print_joints,
              "last_stream_pos": {}, "pending_delta": [], "hint_time": 0.0,
+             "retreated": False, "soft_was_active": False,
+             "lin_approach_mm": args.lin_approach,
+             "startup_approach_pending": bool(args.lin_approach > 0),
              "arrival": arrival, "frozen": False, "grip_rx": grip_rx, "soft": soft}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
     last_target_warn = 0.0
@@ -878,6 +951,18 @@ def main(argv=None) -> int:
 
             try:
                 info = ctrl.step(dt)
+
+                # 初始 --pos 的两段式接近：等锁定了参考姿态（工具轴已知）再起第一段
+                if flags.get("startup_approach_pending") and ctrl._ref_rot is not None:
+                    flags["startup_approach_pending"] = False
+                    for a, p in parse_initial_targets(args).items():
+                        if p is None or ctrl.target.get(a) is None:
+                            continue
+                        try:
+                            ctrl.start_approach(a, np.asarray(ctrl.target[a], dtype=float).copy(),
+                                                args.lin_approach / 1000.0)
+                        except Exception as exc:
+                            log.warning("初始目标的两段式接近失败[%s]: %s", a, exc)
             except Exception as exc:
                 # 任何一帧的异常（IK/数值/API）都只该丢掉这一周期：直接退出会停止下发，
                 # 而这是会动机器人的程序 —— 连续失败太多才停手并报错退出。
@@ -971,6 +1056,22 @@ def main(argv=None) -> int:
                 for m in soft.start(ctrl, tau_limit=args.grip_on_arrive_soft,
                                     source=f"到位后 --grip-on-arrive-soft {args.grip_on_arrive_soft:g}"):
                     log.info("%s", m)
+            # 抓取退出：到位 + 闭爪完成后沿工具轴反方向直线退出（--lin-retreat）
+            if soft.active:
+                flags["soft_was_active"] = True
+            grip_done = (not soft.active) if args.grip_on_arrive_soft is not None else True
+            if (args.lin_retreat > 0 and all_arrived_now and grip_done
+                    and not flags["retreated"]
+                    and (args.grip_on_arrive is not None
+                         or args.grip_on_arrive_soft is not None)):
+                flags["retreated"] = True
+                for arm in flags["arms"]:
+                    try:
+                        ctrl.retract(arm, args.lin_retreat / 1000.0)
+                    except Exception as exc:
+                        log.warning("退出直线段失败[%s]: %s", arm, exc)
+                log.info("到位并闭爪完成 -> 沿工具轴直线退出 %.0fmm（--lin-retreat）", args.lin_retreat)
+
             if all_arrived_now and args.on_arrive != "none":
                 if args.on_arrive == "exit":
                     log.info("已到位（--on-arrive exit）-> 退出")
