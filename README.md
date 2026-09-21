@@ -399,7 +399,7 @@ y（开合方向）横跨盒子的 3cm 那一维；不对就调 `--grasp-align-r
 # 不知道该填哪个 --grasp-align-rpy？让工具从当前标签轴自己算（四选一，并打印预期结果）：
 python tools/detect_aruco_zmq.py --config robot.json --no-send --suggest-align
 
-python tools/detect_aruco_zmq.py --no-send --marker-to-grasp 0 0 -0.09 --grasp-align-rpy 0 0 0
+python tools/detect_aruco_zmq.py --no-send --marker-to-grasp 0 0 -0.09 --grasp-align-rpy 0 0 -1.5708
 # 判定标准（打印出来的 axes(ee/torso)）：
 #   x ≈ (+1, 0, 0)  水平向前（从机器人朝盒子探入）   ← 探入方向
 #   y ≈ (0, ±1, 0)  左右                            ← 手指开合，跨盒子的 3cm 窄边
@@ -409,6 +409,10 @@ python tools/detect_aruco_zmq.py --no-send --marker-to-grasp 0 0 -0.09 --grasp-a
 # 四选一：看打印的 marker 轴哪个在 torso +x（前方）上分量最大（取正的）：
 #   +marker.x → 0 0 0        −marker.x → 0 0 3.1416
 #   +marker.y → 0 0 1.5708   −marker.y → 0 0 -1.5708
+#
+# 判据（配置是否真的生效）：启动第一行会打印吃的配置文件与生效值；此外打印的
+#   axes(ee/torso) 应与 --suggest-align 给出的『预期 axes(ee/torso)』完全一致。
+#   抓取点相对标记中心的偏移应是 -90mm（腰部），若看到 -15mm 说明用的是旧配置。
 ```
 这组值已写进 `robot.example.json` 的 `aruco` 段（`marker_to_grasp` / `grasp_align_rpy`）。
 
