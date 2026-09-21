@@ -16,6 +16,8 @@
     "arm": "right",
     "target_frame": "torso",
     "interactive": true,
+    "_接近时夹爪必须张开": "grip=100 → 启动即把两侧夹爪开到 100%。不然机器人侧保持它自己的状态（可能是闭合的），手臂会带着闭合的夹爪往前推，把盒子推走",
+    "grip": 100,
     "target_timeout": 3,
     "_夹爪标定": "open_cm/qmax/qmin 是真机量出来的量程；改之前先核对机器人侧 config.yaml 的 FSM.Groot.gripper",
     "grip_open_cm": 8.5,
@@ -50,8 +52,9 @@
     "deadband_mm": 2.0,
     "jump_reject_mm": 100.0,
     "print_axes": true,
-    "send_quat": true,
-    "_标定提示": "先用 --no-send 看 axes(marker/torso) 与 axes(ee/torso)，确认偏移方向和手指开合方向"
+    "send_quat": false,
+    "_标定提示": "先用 --no-send 看 axes(marker/torso) 与 axes(ee/torso)，确认偏移方向和手指开合方向",
+    "_只发位置": "send_quat=false → 帧里只有 {\"pos\":...}，末端姿态保持**启动瞬间锁定的朝向**。所以启动 main.py 时手臂应处于你想要的进给姿态（手朝前、手指水平）。想跟标记转再加回来（true）"
   },
   "_视觉流程": "看 README §2.2.1：机器人先进 Groot+VLA → 先起 main.py（不给 --pos）→ 再起 tools/detect_aruco_zmq.py；到位后按 main.grip_on_arrive_soft 自动力限闭爪"
 }
