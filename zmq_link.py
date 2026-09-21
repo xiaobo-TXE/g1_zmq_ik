@@ -281,12 +281,210 @@ class ArmCommandPublisher:
 # ---------------------------------------------------------------------------
 # 上行：夹爪状态（6004）/ 控制模式（6000）
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# 夹爪量程（Dex1_1）：上游 groot-control 默认标定值（rad，输出侧量纲）
-# ---------------------------------------------------------------------------
+#: 夹爪侧别顺序：上游 DDS 电机 ID 顺序是 0=right、1=left（与手臂"左臂在前"相反）
+GRIPPER_SIDES = ("right", "left")
+
 #: 上游默认量程（rad，输出侧）：q_min=完全闭合, q_max=完全张开（322° 标定值）
 GRIPPER_Q_MIN_DEFAULT = 0.0
 GRIPPER_Q_MAX_DEFAULT = 5.6217
+
+
+class GripperStateSubscriber:
+    """订阅 6004（PUB，100 Hz）的 Dex1_1 夹爪实测状态。
+
+    帧格式（上游 deploy/include/groot/GripperStateBroadcaster.h）::
+
+        {"topic":"rt/dex1/state",
+         "data":{"right":{"q":0.501,"dq":0.0,"tau_est":0.02},
+                 "left": {"q":0.500,"dq":0.0,"tau_est":0.02}}}
+
+    * 量纲 = 电机输出侧**弧度**；`q=0` 完全闭合，上限是机器人侧标定的 `q_max`
+      （默认 5.6217 rad = 322°）。桥接层不做"张开/闭合"语义换算，语义映射在上位机。
+    * 协议**没有 ZMQ topic 前缀**（`topic` 是 JSON 字段），所以必须 `subscribe(b"")`。
+    * 上游是 100 Hz 定频心跳广播（PUB 不留积压）；收不到帧不影响任何控制行为，
+      只影响显示 —— 老版本 groot-control 没有这个端口属于正常情况。
+    """
+
+    def __init__(self, robot_ip: str, port: int = 6004,
+                 topic_prefix: str = "rt/dex1"):
+        self.robot_ip = robot_ip
+        self.port = int(port)
+        self.topic_prefix = topic_prefix
+        self.frames = 0
+        self.bad_frames = 0
+        self.last_rx: Optional[float] = None
+        self.last_topic: Optional[str] = None
+        # side -> {"q","dq","tau_est"}
+        self.state: Dict[str, Dict[str, float]] = {}
+
+        import zmq
+        self.zmq = zmq
+        self.ctx = zmq.Context.instance()
+        self.sock = self.ctx.socket(zmq.SUB)
+        self.sock.setsockopt(zmq.SUBSCRIBE, b"")       # ★ 无 topic 前缀，必须订阅全部
+        self.sock.setsockopt(zmq.RCVHWM, 2)
+        self.sock.setsockopt(zmq.LINGER, 0)
+        self.sock.connect(f"tcp://{robot_ip}:{self.port}")
+        logger.info("订阅夹爪状态 tcp://%s:%d (SUB, 100Hz)", robot_ip, self.port)
+
+    # ---------------- 读 ----------------
+    def poll(self) -> bool:
+        """收最新一帧（顺带清积压）。返回本周期是否收到过帧。"""
+        got = False
+        try:
+            if self.sock.poll(0) == 0:
+                return False
+            for _ in range(8):
+                self._parse(self.sock.recv_string())
+                got = True
+                if self.sock.poll(0) == 0:
+                    break
+        except Exception as exc:
+            logger.warning("夹爪状态读取异常: %s", exc)
+        return got
+
+    def _parse(self, payload: str) -> None:
+        self.last_rx = time.time()
+        try:
+            pkt = json.loads(payload)
+            data = pkt.get("data") or {}
+            if not isinstance(data, dict):
+                raise ValueError("data 不是对象")
+            out: Dict[str, Dict[str, float]] = {}
+            for side in GRIPPER_SIDES:
+                node = data.get(side)
+                if not isinstance(node, dict):
+                    continue
+                q = float(node["q"])
+                if not np.isfinite(q):
+                    raise ValueError(f"{side}.q 非有限值")
+                out[side] = {"q": q,
+                             "dq": float(node.get("dq", 0.0) or 0.0),
+                             "tau_est": float(node.get("tau_est", 0.0) or 0.0)}
+            if not out:
+                raise ValueError("data 里没有 right/left")
+            self.state = out
+            self.last_topic = pkt.get("topic")
+            self.frames += 1
+        except Exception as exc:
+            self.bad_frames += 1
+            logger.warning("夹爪状态帧解析失败(%s)，原始前 120 字节: %r", exc, payload[:120])
+
+    # ---------------- 便利接口 ----------------
+    def q(self, side: str) -> Optional[float]:
+        return self.state.get(side, {}).get("q")
+
+    def fraction(self, side: str,
+                 q_min: float = GRIPPER_Q_MIN_DEFAULT,
+                 q_max: float = GRIPPER_Q_MAX_DEFAULT) -> Optional[float]:
+        """开合比例 0=全闭 1=全开（仅用于显示；量程来自上游标定默认值）。"""
+        q = self.q(side)
+        if q is None or q_max <= q_min:
+            return None
+        return float(np.clip((q - q_min) / (q_max - q_min), 0.0, 1.0))
+
+    def age(self) -> float:
+        return float("inf") if self.last_rx is None else time.time() - self.last_rx
+
+    def line(self) -> str:
+        """状态行片段：`夹爪=R0.50/L0.50`（无数据时返回空串）。"""
+        if not self.state:
+            return ""
+        parts = []
+        for side, tag in (("right", "R"), ("left", "L")):
+            q = self.state.get(side, {}).get("q")
+            if q is not None:
+                parts.append(f"{tag}{q:.2f}")
+        return "夹爪=" + "/".join(parts) if parts else ""
+
+    def stats(self) -> str:
+        return (f"夹爪状态={self.frames} 帧 坏帧={self.bad_frames} "
+                f"上帧 {self.age() * 1000:.0f}ms 前")
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class ControlModeSubscriber:
+    """订阅 6000（PUB，50 Hz）的控制模式。
+
+    帧格式（上游 deploy/include/groot/ControlStateBroadcaster.h）::
+
+        {"state":"gamepad"}   /  {"state":"nav"}  /  {"state":"vla"}
+
+    只有 `vla` 模式下机器人侧才把 6002 里的手臂指令写进电机 —— 这是"日志正常刷新
+    但手臂不动"最常见的原因，本类就是把它变成一条自动告警。
+    同样**没有 ZMQ topic 前缀**，必须 `subscribe(b"")`。
+    """
+
+    MODES = ("gamepad", "nav", "vla")
+
+    def __init__(self, robot_ip: str, port: int = 6000):
+        self.robot_ip = robot_ip
+        self.port = int(port)
+        self.frames = 0
+        self.bad_frames = 0
+        self.last_rx: Optional[float] = None
+        self.mode: Optional[str] = None
+
+        import zmq
+        self.zmq = zmq
+        self.ctx = zmq.Context.instance()
+        self.sock = self.ctx.socket(zmq.SUB)
+        self.sock.setsockopt(zmq.SUBSCRIBE, b"")
+        self.sock.setsockopt(zmq.RCVHWM, 2)
+        self.sock.setsockopt(zmq.LINGER, 0)
+        self.sock.connect(f"tcp://{robot_ip}:{self.port}")
+        logger.info("订阅控制模式 tcp://%s:%d (SUB, 50Hz)", robot_ip, self.port)
+
+    def poll(self) -> bool:
+        got = False
+        try:
+            if self.sock.poll(0) == 0:
+                return False
+            for _ in range(8):
+                self._parse(self.sock.recv_string())
+                got = True
+                if self.sock.poll(0) == 0:
+                    break
+        except Exception as exc:
+            logger.warning("控制模式读取异常: %s", exc)
+        return got
+
+    def _parse(self, payload: str) -> None:
+        self.last_rx = time.time()
+        try:
+            pkt = json.loads(payload)
+            mode = str(pkt["state"]).lower()
+            if mode not in self.MODES:
+                raise ValueError(f"未知模式 {mode!r}")
+            self.mode = mode
+            self.frames += 1
+        except Exception as exc:
+            self.bad_frames += 1
+            logger.warning("控制模式帧解析失败(%s)，原始前 80 字节: %r", exc, payload[:80])
+
+    def age(self) -> float:
+        return float("inf") if self.last_rx is None else time.time() - self.last_rx
+
+    def is_vla(self) -> Optional[bool]:
+        return None if self.mode is None else (self.mode == "vla")
+
+    def line(self) -> str:
+        return "" if self.mode is None else f"模式={self.mode}"
+
+    def stats(self) -> str:
+        return (f"控制模式={self.frames} 帧 坏帧={self.bad_frames} "
+                f"上帧 {self.age() * 1000:.0f}ms 前 当前={self.mode or '未知'}")
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

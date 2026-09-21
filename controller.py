@@ -169,6 +169,8 @@ class ArmController:
         self._filter_weights = [0.4, 0.3, 0.2, 0.1]
         self.filter = (WeightedMovingFilter(self._filter_weights, N_ARM)
                        if use_filter else None)
+        #: 是否真的往 6002 下发（--require-vla 在非 VLA 模式下会关掉它；见 set_send_enabled）
+        self.send_enabled = True
 
         self.target: Dict[str, Optional[np.ndarray]] = {LEFT: None, RIGHT: None}
         self.target_rpy: Dict[str, Optional[np.ndarray]] = {}
@@ -321,6 +323,41 @@ class ArmController:
                         "  ".join(f"{k}={v:.4f}rad({self.grip_rad_to_pct(v):.0f}%/"
                                   f"{self.grip_rad_to_cm(v):.2f}cm)" for k, v in applied.items()))
         return applied
+
+    def reanchor(self, reason: str = "") -> None:
+        """丢掉"上一条指令"的连续性，从下一帧起以**实测位姿**为起点重新起步。
+
+        什么时候需要：暂停下发一段时间后恢复（例如机器人一度不在 VLA 模式，或状态中断很久）。
+        这时机器人当前姿态可能已经不在我们的 `q_cmd` 附近了；如果继续从旧的 `q_cmd` 递推，
+        恢复后的第一帧就会把手臂"拽"回旧指令（单周期限速只能限制一帧走 2°，但起点本身是错的）。
+        做法：清掉 q_cmd / IK 热启动 / 平滑滤波器 / 末端速度记忆，让下一帧走"首帧初始化"路径。
+        """
+        self.q_cmd = None
+        if hasattr(self.ik, "reset"):
+            self.ik.reset()
+        if self.filter is not None:
+            self.filter = WeightedMovingFilter(self._filter_weights, N_ARM)
+        self._ee_v = {LEFT: 0.0, RIGHT: 0.0}
+        self._ee_w = {LEFT: 0.0, RIGHT: 0.0}
+        self._prev_ee_cmd = {LEFT: None, RIGHT: None}
+        self._prev_ee_speed = {LEFT: None, RIGHT: None}
+        if reason:
+            logger.info("重新锚定到实测位姿（%s）：下一帧从当前位置平滑起步", reason)
+
+    def set_send_enabled(self, enabled: bool, reason: str = "") -> None:
+        """开/关 6002 下发。关的时候仍然照常读状态、解 IK、算诊断（日志里会显示 [未下发]）。
+
+        恢复时会自动 reanchor()，避免从"暂停前的位置"续着发。
+        """
+        enabled = bool(enabled)
+        if enabled == self.send_enabled:
+            return
+        self.send_enabled = enabled
+        if enabled:
+            logger.info("恢复下发（%s）", reason or "条件恢复")
+            self.reanchor(reason or "恢复下发")
+        else:
+            logger.warning("暂停下发（%s）：仍然读状态/解 IK，但不发 6002", reason or "条件不满足")
 
     def grip_target(self) -> Optional[dict]:
         """给 ArmCommandPublisher.send(gripper=...) 的载荷；两侧都没目标则 None（帧里不带块）。"""
@@ -546,14 +583,18 @@ class ArmController:
                                    (q_send >= self.model.q_upper - 1e-9)))
 
         # 8) 下发
-        self.pub.send(q_send,
-                      ArmCommandPublisher.velocity_to_axes(*self.velocity),
-                      dry_run=self.dry_run,
-                      gripper=self.grip_target())   # 可选夹爪块（未设过目标则整块省略）
+        if not self.send_enabled:
+            info.notes.append("下发已暂停")
+        else:
+            self.pub.send(q_send,
+                          ArmCommandPublisher.velocity_to_axes(*self.velocity),
+                          dry_run=self.dry_run,
+                          gripper=self.grip_target())   # 可选夹爪块（未设过目标则整块省略）
         self.q_cmd = q_send
-        self.sent_cycles += 1
-        info.sent = True
         info.q_cmd = q_send.copy()
+        if self.send_enabled:
+            self.sent_cycles += 1
+            info.sent = True
 
         # 9) 诊断（全部在【目标系】里比较，与 target_frame 一致）
         #    ik_err   : 目标系下比较"指令 FK"与"IK 目标"    -> 纯求解精度

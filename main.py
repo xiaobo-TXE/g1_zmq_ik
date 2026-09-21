@@ -49,7 +49,8 @@ from g1_ik import G1ArmModel, make_ik, rotation_to_rpy
 from sim_arm import SimulatedArmState, SimulatedStateSource
 from target_io import TargetReceiver
 from zmq_link import (GRIPPER_Q_MAX_DEFAULT, GRIPPER_Q_MIN_DEFAULT,
-                      ArmCommandPublisher, RobotStateSubscriber)
+                      ArmCommandPublisher, ControlModeSubscriber,
+                      GripperStateSubscriber, RobotStateSubscriber)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 默认模型 = 官方 G1-29DoF + Dex1 夹爪（mode_machine=15）。
@@ -73,6 +74,15 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--robot-ip", default=DEFAULT_IP, help="机器人 IP")
     g.add_argument("--state-port", type=int, default=6001, help="状态 PUB 端口")
     g.add_argument("--cmd-port", type=int, default=6002, help="指令 PULL 端口")
+    g.add_argument("--gripper-port", type=int, default=6004,
+                   help="夹爪实测状态订阅端口（SUB/connect；groot-control 的 6004，PUB 100Hz，"
+                        "帧 {\"topic\":\"rt/dex1/state\",\"data\":{right/left:{q,dq,tau_est}}}）；0=关闭")
+    g.add_argument("--mode-port", type=int, default=6000,
+                   help="控制模式订阅端口（SUB/connect；groot-control 的 6000，PUB 50Hz，"
+                        "帧 {\"state\":\"vla\"|\"nav\"|\"gamepad\"}）；0=关闭")
+    g.add_argument("--require-vla", action="store_true",
+                   help="只在该模式下真正下发：机器人不在 VLA 模式时**暂停 6002 下发**"
+                        "（仍读状态/解 IK/打印），回到 VLA 时自动重新锚定到实测位姿再继续")
     g.add_argument("--sim", action="store_true", help="不连机器人，用内部仿真状态源")
     g.add_argument("--sim-waist", nargs=3, type=float, default=(0.0, 0.0, 0.0),
                    metavar=("YAW", "ROLL", "PITCH"),
@@ -269,8 +279,27 @@ def grip_target_line(ctrl: ArmController) -> str:
                     if (v := ctrl.grip.get(side)) is not None)
 
 
-def grip_line(ctrl: ArmController) -> str:
-    """状态行里的夹爪片段：`夹爪目标=R0%/L0%`（还没设过目标则空串）。"""
+def grip_line(grip_rx, ctrl: ArmController) -> str:
+    """状态行里的夹爪片段。
+
+    有 6004 实测帧  ：`夹爪=R34%(2.9cm)/L100%(8.5cm) τ0.02/0.01`
+    只有锁存的目标  ：`夹爪目标=R0%/L0%`
+    都没有          ：空串（老版本 groot-control 没有 6004 时不显示）
+    """
+    if grip_rx is not None and grip_rx.state:
+        parts, taus = [], []
+        for side, tag in (("right", "R"), ("left", "L")):
+            st = grip_rx.state.get(side)
+            if not st:
+                continue
+            q = st["q"]
+            parts.append(f"{tag}{ctrl.grip_rad_to_pct(q):.0f}%({ctrl.grip_rad_to_cm(q):.1f}cm)")
+            taus.append(f"{st.get('tau_est', 0.0):.2f}")
+        if parts:
+            out = "夹爪=" + "/".join(parts)
+            if taus:
+                out += " τ" + "/".join(taus)
+            return out
     latched = grip_target_line(ctrl)
     return ("夹爪目标=" + latched) if latched else ""
 
@@ -310,7 +339,9 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
             log.info("目标姿态 rpy -> %s rad", np.round(rpy, 4))
         elif head == "g":
             if not args:
-                log.info("夹爪目标=%s", grip_target_line(ctrl) or "（未设）")
+                log.info("夹爪: 目标=%s  实测=%s",
+                         grip_target_line(ctrl) or "（未设）",
+                         grip_line(flags.get("grip_rx"), ctrl) or "（无 6004 数据）")
             elif len(args) in (1, 2):
                 r = float(args[0])
                 l = float(args[1]) if len(args) == 2 else r      # 只给一个数 = 两侧同值
@@ -669,9 +700,18 @@ def main(argv=None) -> int:
     else:
         log.info("到位判定: 关闭（--no-arrive）")
 
+    # 上行（只看不影响控制）：夹爪实测状态 6004 + 控制模式 6000
+    grip_rx = GripperStateSubscriber(args.robot_ip, args.gripper_port) \
+        if args.gripper_port > 0 else None
+    mode_rx = ControlModeSubscriber(args.robot_ip, args.mode_port) \
+        if args.mode_port > 0 else None
+    if grip_rx is None and mode_rx is None:
+        log.info("上行订阅已关闭（--gripper-port 0 --mode-port 0）")
+    last_mode_warn = 0.0
+
     flags = {"arms": arms, "force_print": False, "print_joints": args.print_joints,
              "last_stream_pos": {}, "pending_delta": [], "hint_time": 0.0,
-             "arrival": arrival, "frozen": False}
+             "arrival": arrival, "frozen": False, "grip_rx": grip_rx}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
     last_target_warn = 0.0
     console = None
@@ -733,11 +773,28 @@ def main(argv=None) -> int:
             arrive_events = ([] if arrival is None
                              else arrival.update(info, flags["arms"], elapse, dt))
 
+            # 上行：夹爪状态 / 控制模式（只读，喂状态行、告警与模式门控；不参与控制解算）
+            if grip_rx is not None:
+                grip_rx.poll()
+            if mode_rx is not None:
+                mode_rx.poll()
+                not_vla = mode_rx.is_vla() is False
+                if not_vla and elapse - last_mode_warn > 5.0:
+                    last_mode_warn = elapse
+                    log.warning("机器人当前不在 VLA 模式（模式=%s）→ 6002 里的手臂关节角不会被"
+                                "写进电机，手臂不会动。请在机器人上切到 VLA（键盘 3 / 手柄 LB+A）",
+                                mode_rx.mode)
+                if args.require_vla:
+                    # --require-vla：非 VLA 时干脆不发（回到 VLA 时 controller 会自动重新锚定）
+                    ctrl.set_send_enabled(not not_vla,
+                                          reason=f"模式={mode_rx.mode}")
+
             # 打印
             if flags["force_print"] or (print_every > 0 and ctrl.cycle % print_every == 0):
                 flags["force_print"] = False
                 extra = " ".join(t for t in (
-                    grip_line(ctrl),
+                    grip_line(grip_rx, ctrl),
+                    "" if mode_rx is None else mode_rx.line(),
                     " [已冻结]" if flags["frozen"] else "") if t)
                 for arm in flags["arms"]:
                     print(format_step(info, arm, flags["print_joints"],
@@ -796,11 +853,19 @@ def main(argv=None) -> int:
         log.info("状态统计: %s", state.stats())
         log.info("目标流统计: %s", target_rx.stats())
         log.info("下发统计: %s", pub.stats())
+        if grip_rx is not None:
+            log.info("%s", grip_rx.stats())
+        if mode_rx is not None:
+            log.info("%s", mode_rx.stats())
         if arrival is not None:
             log.info("%s", arrival.stats())
         log.info("停止下发：机器人侧 VLA 指令超时后会保持最后一个有效 arm_q（不会松手）。"
                  "要交还控制权，在机器人上切回 Gamepad(LB+X / 键 1)，手臂会按 Bezier 回到 safe_home_q。")
         target_rx.close()
+        if grip_rx is not None:
+            grip_rx.close()
+        if mode_rx is not None:
+            mode_rx.close()
         state.close()
         pub.close()
     return status
