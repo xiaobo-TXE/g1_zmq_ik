@@ -11,6 +11,9 @@
       避免"盒子被挪走 >100mm 后 6003 永远停在旧点"
   * 新增 `--marker-to-grasp DX DY DZ`：标记中心 -> 抓取点的偏移（在**标记自身坐标系**里给）
   * 新增 `--print-axes`：打印标记三个轴在 torso 系下的指向，用来确定"往哪个轴偏移"
+  * 图像流名自适应：publisher 用 `observation.images.left_wrist` 这类键、而 `--camera-name`
+    写的是 `ego_view` 时，按"精确名 → 带前缀同名键 → 唯一一路图像"退让，且**只提示一次**
+    （原来每帧刷 `[WARN] camera ... not found`，把目标位置打印淹掉了）
   * 其余检测/滤波/可视化逻辑与原脚本逐字一致
 
 发送的帧（g1_zmq_ik 的 6003 契约，一行 JSON）::
@@ -88,16 +91,36 @@ except ImportError:            # 只把本文件拷到别处运行时（没有�
           '其余功能正常', file=sys.stderr)
 
 
-IMAGE_WIDTH = 1280
-IMAGE_HEIGHT = 720
+# IMAGE_WIDTH = 1280
+# IMAGE_HEIGHT = 720
+# CAMERA_MATRIX = np.array(
+#     [
+#         [911.4384765625, 0.0, 646.4236450195312],
+#         [0.0, 912.9034423828125, 382.7312316894531],
+#         [0.0, 0.0, 1.0],
+#     ],
+#     dtype=np.float64,
+# )
+IMAGE_WIDTH = 640
+IMAGE_HEIGHT = 480
 CAMERA_MATRIX = np.array(
     [
-        [911.4384765625, 0.0, 646.4236450195312],
-        [0.0, 912.9034423828125, 382.7312316894531],
+        [607.6256713867188, 0.0, 324.28240966796875],
+        [0.0, 608.602294921875, 255.15414428710938],
         [0.0, 0.0, 1.0],
     ],
     dtype=np.float64,
 )
+# === 彩色相机内参 ===
+# 宽度: 640
+# 高度: 480
+# 焦距 fx: 607.6256713867188
+# 焦距 fy: 608.602294921875
+# 主点 cx: 324.28240966796875
+# 主点 cy: 255.15414428710938
+# 畸变模型: distortion.inverse_brown_conrady
+# 畸变系数: [0.0, 0.0, 0.0, 0.0, 0.0]
+
 DISTORTION = np.zeros(5, dtype=np.float64)
 
 # OpenCV optical frame: x right, y down, z forward.
@@ -199,22 +222,39 @@ def make_detector(dictionary_name, error_correction_rate):
     return detect
 
 
+def pick_image_key(images, camera_name):
+    """在 publisher 的 images 里挑一路图像，返回 ``(key, note)``。
+
+    publisher 不一定用我们写死的名字（实测常见 ``observation.images.left_wrist``
+    这种带前缀的键），所以这里按"精确名 → 末尾同名的带前缀键 → 唯一一路图像"依次退让。
+    ``note`` 只在真的换了名字时给一句说明；调用方要**去重后只打印一次**，别逐帧刷屏。
+    """
+    if camera_name in images:
+        return camera_name, None
+    wanted = str(camera_name).strip().lower()
+    for key in sorted(images):
+        if str(key).split('.')[-1].lower() == wanted:
+            return key, "camera '{}' 不存在，改用图像流 '{}'".format(camera_name, key)
+    if len(images) == 1:
+        key = next(iter(images))
+        return key, "camera '{}' 不存在，只有一路图像，改用 '{}'".format(camera_name, key)
+    raise KeyError("camera '{}' not found; available: {}".format(
+        camera_name, sorted(images)))
+
+
 def receive_frame(socket, camera_name, publisher_rgb_jpeg):
-    """Receive and decode one JSON/base64/JPEG frame."""
+    """Receive and decode one JSON/base64/JPEG frame.
+
+    返回 ``(frame, note)``：note 是本次选的图像流与 ``--camera-name`` 不一致时的说明
+    （一致时为 None）。note 每帧都会重算，是否打印由调用方负责去重。
+    """
     payload = json.loads(socket.recv_string())
     images = payload.get('images')
     if not isinstance(images, dict) or not images:
         raise ValueError('ZMQ JSON does not contain a non-empty images object')
 
-    if camera_name in images:
-        encoded = images[camera_name]
-    elif len(images) == 1:
-        actual_name, encoded = next(iter(images.items()))
-        print("[WARN] camera '{}' not found; using '{}'".format(
-            camera_name, actual_name), file=sys.stderr)
-    else:
-        raise KeyError("camera '{}' not found; available: {}".format(
-            camera_name, sorted(images)))
+    key, note = pick_image_key(images, camera_name)
+    encoded = images[key]
 
     jpeg = base64.b64decode(encoded, validate=True)
     frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -226,7 +266,7 @@ def receive_frame(socket, camera_name, publisher_rgb_jpeg):
     # this correction is also needed for a normally colored preview.
     if publisher_rgb_jpeg:
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    return frame
+    return frame, note
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +279,10 @@ class TargetSender:
       * 限频        ：最快 --target-hz 帧/秒（默认 20）
       * 死区        ：与上一帧发送值的差 < --deadband-mm 就不发
       * 跳变拒绝    ：单帧跳变 > --jump-reject-mm 判为误检，丢弃并告警
+
+    对端（g1_zmq_ik 的 6003）没起/重启时，send 会因 SNDTIMEO 抛 ``zmq.Again``：
+    这里**接住它按丢帧处理**（计数 + 限频告警），绝不让它把整个检测循环干掉；
+    对端一起来，下一帧自动恢复发送。
     """
 
     def __init__(self, endpoint, hz, deadband_mm, jump_reject_mm,
@@ -259,15 +303,18 @@ class TargetSender:
         self.skipped = 0
         self.rejected = 0
         self.recovered = 0
+        self.dropped = 0                  # 对端不在（6003 没人收）导致的丢帧
         self.jump_candidate = None
         self.jump_since = 0.0
         self._last_jump_warn = 0.0
+        self._last_drop_warn = 0.0
         self.socket = None
         if not self.enabled:
             print('[INFO] 目标发送已关闭（--no-send）：只检测不发送', flush=True)
             return
         import zmq
         self.zmq = zmq
+        self.endpoint = endpoint
         self.socket = zmq.Context.instance().socket(zmq.PUSH)
         self.socket.setsockopt(zmq.SNDHWM, 4)
         # 目标流是"最新优先"：对端不在时宁可丢帧，也不能阻塞在 send 上
@@ -323,7 +370,18 @@ class TargetSender:
         if self.send_quat and quaternion_torso is not None:
             q = np.asarray(quaternion_torso, dtype=np.float64).reshape(4)
             frame['quat'] = [round(float(v), 6) for v in q]
-        self.socket.send_string(json.dumps(frame))
+        try:
+            self.socket.send_string(json.dumps(frame))
+        except self.zmq.Again:
+            # SNDTIMEO 到点：对端没起或收不过来。丢这一帧就好（目标流本来就"最新优先"），
+            # 关键是别让响应中断后挂在这里、更别让异常飞出把检测循环干掉。
+            self.dropped += 1
+            self.last_time = now                           # 别在 send 上反复干等，按目标频率重试
+            if now - self._last_drop_warn >= 1.0:          # 告警限频，别刷屏
+                self._last_drop_warn = now
+                print('[WARN] 目标发不出去（{} 没人收？），已丢帧；对端起来会自动恢复'
+                      .format(self.endpoint), file=sys.stderr, flush=True)
+            return False
         self.last_sent = p.copy()
         self.last_time = now
         self.sent += 1
@@ -455,10 +513,10 @@ def vector_text(vector):
 
 
 def print_results(results):
-    """Print confirmed marker poses in camera and torso link frames."""
+    """打印识别到的目标（标记）位置：相机系 d435 + torso 系，另附距离/重投影误差。"""
     for result in results:
         print(
-            'id={id} d435 p={dp} q={dq} torso p={tp} q={tq} '
+            '[TARGET] id={id}  torso p={tp} q={tq}  d435 p={dp} q={dq}  '
             'distance={distance:.3f}m reproj={error:.2f}px'.format(
                 id=result['id'],
                 dp=vector_text(result['d435_position']),
@@ -514,7 +572,9 @@ def build_parser():
     parser.add_argument(
         '--endpoint', default='tcp://10.3.42.221:5556',
         help='ZMQ publisher endpoint, e.g. tcp://127.0.0.1:5556')
-    parser.add_argument('--camera-name', default='ego_view')
+    parser.add_argument('--camera-name', default='ego_view',
+                        help='要订阅的那路图像名；给错了也不是错误：会退让到同名带前缀的键'
+                             '（observation.images.<name>）或唯一一路图像，并只提示一次')
     parser.add_argument('--marker-size', type=float, default=0.025,
                         help='physical marker side length in meters')
     parser.add_argument('--dictionary', default='DICT_APRILTAG_36H11')
@@ -616,6 +676,7 @@ def main():
     last_log_time = 0.0
     send_log_time = 0.0
     warned_resolution = False
+    last_camera_note = None
 
     try:
         while True:
@@ -623,12 +684,16 @@ def main():
                 print('[WARN] waiting for ZMQ images...', file=sys.stderr)
                 continue
             try:
-                frame = receive_frame(
+                frame, camera_note = receive_frame(
                     socket, args.camera_name, args.publisher_rgb_jpeg)
             except (ValueError, KeyError, json.JSONDecodeError) as error:
                 print('[WARN] invalid ZMQ frame: {}'.format(error),
                       file=sys.stderr)
                 continue
+            if camera_note is not None and camera_note != last_camera_note:
+                # 这条路换名字只说一次（否则逐帧刷 WARN，把真正的检测打印淹掉）
+                last_camera_note = camera_note
+                print('[INFO] ' + camera_note, flush=True)
 
             height, width = frame.shape[:2]
             if (width, height) != (IMAGE_WIDTH, IMAGE_HEIGHT):
@@ -661,6 +726,7 @@ def main():
                 target_torso = np.asarray(best['torso_position'], dtype=np.float64) \
                     + R_marker @ offset
                 target_quat = matrix_to_quaternion(R_marker @ R_align)
+                dropped_before = sender.dropped
                 sent = sender.maybe_send(target_torso, target_quat, now=now)
                 if now - send_log_time >= args.log_interval:
                     send_log_time = now
@@ -668,6 +734,8 @@ def main():
                         state = '未发送(--no-send)：这是算出来的抓取点，可用来校 --marker-to-grasp'
                     elif sent:
                         state = '已下发(累计 {} 帧)'.format(sender.sent)
+                    elif sender.dropped > dropped_before:
+                        state = '对端未就绪，已丢帧(累计丢 {})'.format(sender.dropped)
                     else:
                         state = '跳过(死区/限频)'
                     print('[INFO] 抓取位姿 torso p={} q={}  (id={}, {})'.format(
@@ -691,8 +759,10 @@ def main():
         socket.close(linger=0)
         context.term()
         sender.close()
-        print('[INFO] 目标发送统计: 发送 {} 帧 / 死区或限频跳过 {} / 跳变丢弃 {} / 判为真实移动 {}'.format(
-            sender.sent, sender.skipped, sender.rejected, sender.recovered), flush=True)
+        print('[INFO] 目标发送统计: 发送 {} 帧 / 死区或限频跳过 {} / 跳变丢弃 {} / '
+              '对端未就绪丢帧 {} / 判为真实移动 {}'.format(
+                  sender.sent, sender.skipped, sender.rejected, sender.dropped,
+                  sender.recovered), flush=True)
         print('[INFO] stopped')
 
 

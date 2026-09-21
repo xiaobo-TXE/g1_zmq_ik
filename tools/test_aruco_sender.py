@@ -119,6 +119,25 @@ def main() -> int:
     check("关闭后大跳变直接接受", s3.maybe_send([0.9, 0.0, 0.0], now=t3) is True
           and s3.rejected == 0, f"rejected={s3.rejected}")
 
+    print("\n[6] 对端不在（6003 没人收）时按丢帧处理，不把异常抛出去")
+    dead = mod.TargetSender("tcp://127.0.0.1:1", hz=50.0, deadband_mm=2.0,
+                            jump_reject_mm=100.0, enabled=True, recover_s=0.5)
+    dead.socket.setsockopt(zmq.SNDHWM, 1)               # 压小缓冲，几帧就撞上 SNDTIMEO
+    dead.socket.setsockopt(zmq.SNDTIMEO, 1)
+    t6 = 4000.0
+    crashed = None
+    for k in range(20):
+        t6 += 0.05
+        try:
+            dead.maybe_send([0.01 * k, 0.0, 0.0], now=t6)
+        except Exception as exc:                        # 关键回归：这里曾抛 zmq.Again 打死主循环
+            crashed = exc
+            break
+    check("没人收时只丢帧、不抛异常", crashed is None, repr(crashed) if crashed else "")
+    check("丢帧有计数", dead.dropped > 0, f"dropped={dead.dropped} sent={dead.sent}")
+    check("丢帧不假装发成功（sent 不再增长）", dead.sent <= 1, f"sent={dead.sent}")
+    dead.close()
+
     sender.close()
     s2.close()
     s3.close()
