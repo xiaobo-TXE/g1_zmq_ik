@@ -418,9 +418,14 @@ y（开合方向）横跨盒子的 3cm 那一维；不对就调 `--grasp-align-r
 # 不知道该填哪个 --grasp-align-rpy？让工具从当前标签轴自己算（四选一，并打印预期结果）：
 python tools/detect_aruco_zmq.py --config robot.json --no-send --suggest-align
 
-python tools/detect_aruco_zmq.py --no-send --marker-to-grasp 0 0 -0.09 --grasp-align-rpy 0 0 -1.5708
+# 默认策略：**从上往下抓**（避免"往前顶"把盒子推走，见下方说明）
+python tools/detect_aruco_zmq.py --no-send --marker-to-grasp 0 0 -0.03 --grasp-align-rpy 0 1.5708 1.5708
+#   → 探入方向竖直向下（实测 ee.x=(0.134,0.001,-0.991)）、手指沿左右（ee.y=(0.067,-0.998,0.008)）
+# 水平进给（要抓"腰部"时）：
+python tools/detect_aruco_zmq.py --no-send --marker-to-grasp 0 0.045 -0.09 --grasp-align-rpy 0 0 -1.5708
 # 判定标准（打印出来的 axes(ee/torso)）：
-#   x ≈ (+1, 0, 0)  水平向前（从机器人朝盒子探入）   ← 探入方向
+#   x ≈ (0, 0, −1)  竖直向下                      ← 探入方向（从上往下抓）
+#   （水平进给时才是 x ≈ (+1, 0, 0)）
 #   y ≈ (0, ±1, 0)  左右                            ← 手指开合，跨盒子的 3cm 窄边
 #   z ≈ (0, 0, +1)  朝上
 #
@@ -430,8 +435,13 @@ python tools/detect_aruco_zmq.py --no-send --marker-to-grasp 0 0 -0.09 --grasp-a
 #   +marker.y → 0 0 1.5708   −marker.y → 0 0 -1.5708
 #
 # 判据（配置是否真的生效）：启动第一行会打印吃的配置文件与生效值；此外打印的
-#   axes(ee/torso) 应与 --suggest-align 给出的『预期 axes(ee/torso)』完全一致。
-#   抓取点相对标记中心的偏移应是 -90mm（腰部），若看到 -15mm 说明用的是旧配置。
+#   axes(ee/torso) 应与 --suggest-align 给出的『预期 axes(ee/torso)』完全一致；
+#   抓取点相对标记中心的偏移应等于 marker_to_grasp（-30mm → 看到 -15mm 说明是旧配置）。
+
+> **为什么默认改成从上往下**：水平进给要求"两指夹持中心"到达目标点，而"抓腰部"的目标点在**盒体内部**
+> （标记中心往下半个盒高），手指长度＜需要的进深，手会先把盒子顶走。从上往下时手指只需降到盒子两侧，
+> 不存在这个问题。要坚持水平进给就把目标点用 `marker_to_grasp` 的**面内分量**往机器人方向拉回
+> （本例标签下 +tag.y 朝机器人，`0 0.045 -0.09` = 拉回 4.5cm，让指垫落在近侧面往里约 2cm）。
 ```
 这组值已写进 `robot.example.json` 的 `aruco` 段（`marker_to_grasp` / `grasp_align_rpy`）。
 
