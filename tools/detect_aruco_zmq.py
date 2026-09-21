@@ -11,6 +11,10 @@
       避免"盒子被挪走 >100mm 后 6003 永远停在旧点"
   * 新增 `--marker-to-grasp DX DY DZ`：标记中心 -> 抓取点的偏移（在**标记自身坐标系**里给）
   * 新增 `--print-axes`：打印标记三个轴在 torso 系下的指向，用来确定"往哪个轴偏移"
+  * 平面方标签的 **IPPE 双解消歧**：`SOLVEPNP_IPPE_SQUARE` 的两个解**位置几乎相同、姿态差约 10°**，
+    只取第一个解时姿态会在两解之间翻；而 6003 的跳变过滤器**只看位置**，抓不到这种翻转 ✗。
+    现在用**时间连续性**选解（`choose_pose_solution()`：与上一帧位姿最接近的那个；
+    没有上一帧时取重投影最小的）
   * 图像流名自适应：publisher 用 `observation.images.left_wrist` 这类键、而 `--camera-name`
     写的是 `ego_view` 时，按"精确名 → 带前缀同名键 → 唯一一路图像"退让，且**只提示一次**
     （原来每帧刷 `[WARN] camera ... not found`，把目标位置打印淹掉了）
@@ -393,6 +397,61 @@ class TargetSender:
             self.socket.close(linger=0)
 
 
+def choose_pose_solution(object_points, image_points, previous=None):
+    """平面方标签的 IPPE **双解消歧**，返回 ``(rvec, tvec, reproj)``。
+
+    平面正方形标记用 IPPE 求解时会有**两个解**：两者重投影误差都极小（实测 0.1~0.4px），
+    但三维位姿能差几十毫米、姿态差 10° 以上。只取第一个解时，检测会在两簇之间来回翻 ——
+    表现为 6003 的目标位置"跳变"，被跳变过滤器大量丢弃（实测 195/415 帧）。
+
+    做法（**时间连续性**）：两个解里选与**上一帧该标记的位姿**最接近的那个；
+    没有上一帧时选重投影误差更小的那个。这样同一标记不会在两簇间翻，且不会引入额外滤波。
+
+    `previous` 是 estimator 里保存的轨迹字典（含 ``translation``(optical 系) 与 ``rotation_vector``）。
+    """
+    solutions = []
+    try:
+        ok, rvecs, tvecs, _errs = cv2.solvePnPGeneric(
+            object_points, image_points, CAMERA_MATRIX, DISTORTION,
+            flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        if ok:
+            solutions = [(np.asarray(rv, dtype=np.float64).reshape(3),
+                          np.asarray(tv, dtype=np.float64).reshape(3))
+                         for rv, tv in zip(rvecs, tvecs)]
+    except Exception:                       # 老版本 OpenCV 没有 solvePnPGeneric
+        solutions = []
+    if not solutions:
+        ok, rv, tv = cv2.solvePnP(object_points, image_points, CAMERA_MATRIX, DISTORTION,
+                                  flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        if not ok:
+            return None, None, float("inf")
+        solutions = [(np.asarray(rv, dtype=np.float64).reshape(3),
+                      np.asarray(tv, dtype=np.float64).reshape(3))]
+
+    prev_R = None
+    if previous is not None and previous.get("rotation_vector") is not None:
+        prev_R = cv2.Rodrigues(np.asarray(previous["rotation_vector"], dtype=np.float64))[0]
+
+    best = None
+    best_cost = float("inf")
+    for rvec, tvec in solutions:
+        projected, _ = cv2.projectPoints(object_points, rvec, tvec, CAMERA_MATRIX, DISTORTION)
+        reproj = float(np.sqrt(np.mean(np.sum(
+            (projected.reshape(-1, 2) - image_points) ** 2, axis=1))))
+        cost = reproj                       # 没有上一帧：取重投影最小的解
+        if previous is not None:
+            dpos = float(np.linalg.norm(tvec - previous["translation"]))
+            cost = dpos / 0.05              # 5cm 的位置差记 1
+            if prev_R is not None:
+                dR = float(np.linalg.norm(cv2.Rodrigues(rvec)[0] - prev_R))
+                cost += 0.5 * dR            # 姿态差加权（0.5 rad ≈ 记 1）
+        if cost < best_cost:
+            best, best_cost = (rvec, tvec, reproj), cost
+    if best is None:
+        return None, None, float("inf")
+    return best
+
+
 class ArucoPoseEstimator:
     """Detect, validate and temporally confirm marker poses."""
 
@@ -440,30 +499,19 @@ class ArucoPoseEstimator:
             if perimeter < self.min_perimeter:
                 continue
 
-            success, rotation_vector, translation_vector = cv2.solvePnP(
-                self.object_points,
-                image_points,
-                CAMERA_MATRIX,
-                DISTORTION,
-                flags=cv2.SOLVEPNP_IPPE_SQUARE,
-            )
-            if not success:
+            # IPPE 双解消歧（用上一帧位姿做时间连续性），避免同一标记在两簇之间翻
+            previous = self.tracks.get(marker_id)
+            rotation_vector, translation_vector, reprojection_error = choose_pose_solution(
+                self.object_points, image_points, previous)
+            if rotation_vector is None:
                 continue
 
             translation_optical = translation_vector.reshape(3)
             distance = float(np.linalg.norm(translation_optical))
             if translation_optical[2] <= 0.0 or distance > self.max_distance:
                 continue
-
-            projected, _ = cv2.projectPoints(
-                self.object_points, rotation_vector, translation_vector,
-                CAMERA_MATRIX, DISTORTION)
-            reprojection_error = float(np.sqrt(np.mean(np.sum(
-                (projected.reshape(4, 2) - image_points) ** 2, axis=1))))
             if reprojection_error > self.max_reprojection_error:
                 continue
-
-            previous = self.tracks.get(marker_id)
             if (previous is not None
                     and np.linalg.norm(
                         translation_optical - previous['translation'])
@@ -474,6 +522,8 @@ class ArucoPoseEstimator:
             current_tracks[marker_id] = {
                 'count': count,
                 'translation': translation_optical,
+                # 下一帧消歧要用：上一帧的旋转（optical 系）
+                'rotation_vector': np.asarray(rotation_vector, dtype=np.float64).reshape(3).copy(),
             }
             if count < self.confirmation_frames:
                 continue

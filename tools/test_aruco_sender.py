@@ -176,6 +176,52 @@ def main() -> int:
     check("推荐值只取 0 / ±π/2 / π 四种（不会给出奇怪的角）",
           all(t in (0.0, 1.5708, -1.5708, 3.1416, -3.1416) for t in thetas), f"{thetas}")
 
+    print("\n[7] IPPE 双解消歧（时间连续性）")
+
+    half = 0.025 / 2.0
+    objp = np.array([[-half, half, 0.0], [half, half, 0.0],
+                     [half, -half, 0.0], [-half, -half, 0.0]], dtype=np.float64)
+    # 造一帧"真实"位姿 -> 投影出图像点（模拟一次检测）
+    # 接近正视时 IPPE 的两个解差别最大（真机上相机就是正对标签看的）
+    rvec_true = np.array([0.02, -0.01, 0.0], dtype=np.float64).reshape(3, 1)
+    tvec_true = np.array([0.02, -0.03, 0.55], dtype=np.float64).reshape(3, 1)
+    imgp, _ = mod2.cv2.projectPoints(objp, rvec_true, tvec_true,
+                                     mod2.CAMERA_MATRIX, mod2.DISTORTION)
+    imgp = imgp.reshape(4, 2)
+
+    _ok, rvecs, tvecs, _e = mod2.cv2.solvePnPGeneric(
+        objp, imgp, mod2.CAMERA_MATRIX, mod2.DISTORTION, flags=mod2.cv2.SOLVEPNP_IPPE_SQUARE)
+    check("IPPE 对平面方标签确实给出 2 个解（前提成立）", len(rvecs) >= 2,
+          f"解数={len(rvecs)}")
+    sols = [(np.asarray(r, float).reshape(3), np.asarray(t, float).reshape(3))
+            for r, t in zip(rvecs, tvecs)]
+
+    # 两个解的实际差别：**位置几乎相同、姿态差约 10°**（所以位置型跳变过滤器抓不到它）
+    d_pos = float(np.linalg.norm(sols[0][1] - sols[1][1]))
+    d_rot = float(np.linalg.norm(mod2.cv2.Rodrigues(sols[0][0])[0]
+                                 - mod2.cv2.Rodrigues(sols[1][0])[0]))
+    check("两解位置几乎相同（所以必须有姿态维度的消歧）", d_pos < 0.005,
+          f"位置差 {d_pos * 1000:.1f}mm")
+    check("两解姿态差明显（~10°，跳变过滤器只看位置 → 抓不到）", d_rot > 0.1,
+          f"姿态差 {np.rad2deg(d_rot):.1f}°")
+
+    # 以上一帧=解 0 为基准：应该选回解 0（姿态也一致），而不是翻到解 1
+    prev0 = {"translation": sols[0][1], "rotation_vector": sols[0][0]}
+    r0, t0, _ = mod2.choose_pose_solution(objp, imgp, previous=prev0)
+    check("上一帧=解0 时选回解0（姿态不翻转）",
+          float(np.linalg.norm(mod2.cv2.Rodrigues(r0)[0]
+                               - mod2.cv2.Rodrigues(sols[0][0])[0])) < 1e-6,
+          f"rvec={np.round(r0, 4)}")
+    prev1 = {"translation": sols[1][1], "rotation_vector": sols[1][0]}
+    r1, t1, _ = mod2.choose_pose_solution(objp, imgp, previous=prev1)
+    check("上一帧=解1 时跟着上一帧选解1（不会自己跳回去）",
+          float(np.linalg.norm(mod2.cv2.Rodrigues(r1)[0]
+                               - mod2.cv2.Rodrigues(sols[1][0])[0])) < 1e-6,
+          f"rvec={np.round(r1, 4)}")
+    _r, _t, reproj = mod2.choose_pose_solution(objp, imgp, previous=None)
+    check("没有上一帧时返回重投影最小的解（有限值）", np.isfinite(reproj) and reproj < 1.0,
+          f"reproj={reproj:.3f}px")
+
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
     print("\n" + "=" * 74)
     print(f"结果: {len(_RESULTS)-n_fail}/{len(_RESULTS)} 通过"
