@@ -56,6 +56,9 @@ def main() -> int:
             got = sub.read(timeout_ms=200)
             if got is None:
                 print("!! 200ms 没收到帧，age=%.1fms  %s" % (sub.age() * 1000, sub.stats()))
+                # --duration 必须在丢帧路径上也生效：否则状态流一断，本脚本永远不退出
+                if args.duration > 0 and time.time() - t0 >= args.duration:
+                    break
                 continue
             n += 1
             if csv_f:

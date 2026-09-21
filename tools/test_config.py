@@ -20,17 +20,31 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import main  # noqa: E402
+try:
+    import main  # noqa: E402  （需要 pinocchio 等运行依赖）
+except Exception as _exc:      # noqa: BLE001
+    main = None
+    _MAIN_IMPORT_ERR = f"{type(_exc).__name__}: {_exc}"
+else:
+    _MAIN_IMPORT_ERR = None
 
 
 def load_detector():
-    """把 tools/detect_aruco_zmq.py 当模块加载（测它读不读 \"aruco\" 段）。"""
+    """把 tools/detect_aruco_zmq.py 当模块加载（测它读不读 \"aruco\" 段）。
+
+    需要 opencv-contrib；缺依赖时返回 None 并让调用处报 FAIL（而不是抛出去把汇总行吃掉）。
+    """
     import importlib.util
     path = Path(__file__).resolve().parent / "detect_aruco_zmq.py"
-    spec = importlib.util.spec_from_file_location("detect_aruco_zmq", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    try:
+        spec = importlib.util.spec_from_file_location("detect_aruco_zmq", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as exc:      # noqa: BLE001
+        print(f"  [WARN] 检测端模块不可用：{type(exc).__name__}: {exc}"
+              f"（需要 opencv-contrib-python）")
+        return None
 
 _RESULTS = []
 
@@ -61,6 +75,15 @@ def main_check() -> int:
     print("=" * 74)
     print("--config 配置文件自检")
     print("=" * 74)
+
+    if main is None:
+        # 缺依赖时也要给出明确失败与汇总行（原来会抛异常、把结论吃掉）
+        check("导入 main（需要 pinocchio/numpy 等运行依赖）", False, _MAIN_IMPORT_ERR or "")
+        n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
+        print("\n" + "=" * 74)
+        print(f"结果: {len(_RESULTS)-n_fail}/{len(_RESULTS)} 通过，{n_fail} 项失败 ✗")
+        print("=" * 74)
+        return 1
 
     print("\n[1] 基线：不给 --config 时用程序内置默认值")
     args, _ = parse(["--pos", "0.35", "-0.20", "0.15"])
@@ -163,6 +186,13 @@ def main_check() -> int:
 
     print("\n[9] 检测端（tools/detect_aruco_zmq.py）读同一份配置的 aruco 段")
     det = load_detector()
+    if det is None:
+        check("加载检测端模块（需要 opencv-contrib-python）", False, "模块不可用，见上面的 WARN")
+        n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
+        print("\n" + "=" * 74)
+        print(f"结果: {len(_RESULTS)-n_fail}/{len(_RESULTS)} 通过，{n_fail} 项失败 ✗")
+        print("=" * 74)
+        return 1
     d0 = det.parse_args([])
     check("不给配置时检测端仍是自己的默认值",
           tuple(d0.marker_to_grasp) == (0.0, 0.0, 0.0) and d0.endpoint == "tcp://10.3.42.221:5556"

@@ -462,6 +462,7 @@ class ArmController:
         J_L, J_R = self.model.ee_jacobians(q_prev)
         scale = 1.0
         achieved = {}
+        a_used: Dict[str, float] = {}
         for arm, J in ((LEFT, J_L), (RIGHT, J_R)):
             if self.controlled not in (arm, "both"):
                 continue
@@ -523,10 +524,15 @@ class ArmController:
                 scale = min(scale, w_cap * dt / sw)
 
             achieved[arm] = (sp, sw)
+            a_used[arm] = self._ee_a[arm]              # 先记"期望加速度"，定稿后再乘全局 scale
         scale = max(0.0, min(1.0, scale))
         for arm, (sp, sw) in achieved.items():      # 记录本周期"真正实现"的速度(m/s)，供下周期加速度限制
             self._ee_v[arm] = scale * sp / dt
             self._ee_w[arm] = scale * sw / dt
+            # 加速度状态也要按"真正达成"回写：全局 scale 把增量压小之后，实际加速度是
+            # scale·a，若继续存期望值，下周期的 jerk 限制会以为已经爬得更高（起停首周期失真）
+            if arm in a_used:
+                self._ee_a[arm] = scale * a_used[arm]
         return dq * scale, scale
 
     # ------------------------------------------------------------------ 主步
@@ -643,6 +649,7 @@ class ArmController:
                                    (q_send >= self.model.q_upper - 1e-9)))
 
         # 8) 下发
+        rejected_before = int(getattr(self.pub, "rejected", 0))
         if not self.send_enabled:
             info.notes.append("下发已暂停")
         else:
@@ -650,9 +657,14 @@ class ArmController:
                           ArmCommandPublisher.velocity_to_axes(*self.velocity),
                           dry_run=self.dry_run,
                           gripper=self.grip_target())   # 可选夹爪块（未设过目标则整块省略）
+        # "sent"要表示真的交出去了：队列满/对端不在时 publisher 会计 rejected，
+        # 以前照样算成已下发（诊断上会误以为链路健康）
+        dropped = int(getattr(self.pub, "rejected", 0)) > rejected_before
+        if dropped:
+            info.notes.append("6002 帧被丢弃（对端未连接或发送队列满）")
         self.q_cmd = q_send
         info.q_cmd = q_send.copy()
-        if self.send_enabled:
+        if self.send_enabled and not dropped:
             self.sent_cycles += 1
             info.sent = True
 

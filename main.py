@@ -805,6 +805,7 @@ def main(argv=None) -> int:
     demo = DemoTrajectory(args.demo, args.radius, args.period, args.amp)
     delta_done = False
     step_errors = 0
+    prev_loop_t0 = None
     dt = 1.0 / max(args.rate, 1e-3)
     t_start = time.time()
     status = 0
@@ -844,6 +845,13 @@ def main(argv=None) -> int:
             if not flags["frozen"]:
                 demo.update(ctrl, flags["arms"], elapse)
 
+            # 实测周期（本周期起点 - 上周期起点）。控制步仍用名义 dt（限速按名义周期标定），
+            # 但**到位判定的速度估计**必须用实测间隔：某周期超时（IK 慢/日志多）时用名义 dt
+            # 会把速度算大，判定被推迟。
+            dt_real = dt if prev_loop_t0 is None else float(
+                min(max(loop_t0 - prev_loop_t0, 1e-4), 0.5))
+            prev_loop_t0 = loop_t0
+
             try:
                 info = ctrl.step(dt)
             except Exception as exc:
@@ -868,8 +876,14 @@ def main(argv=None) -> int:
                 delta_done = True
 
             # 到位判定（只读诊断：只比较实测/目标误差，不改任何控制行为）
-            arrive_events = ([] if arrival is None
-                             else arrival.update(info, flags["arms"], elapse, dt))
+            if arrival is None:
+                arrive_events = []
+            elif dt_real > 2.0 * dt:
+                # 本周期明显超时：这一周期的"速度=位移/时间"不可信，不做到位结论
+                # （宁可不判，也不能因为一次卡顿就宣布"停稳到位"）
+                arrive_events = []
+            else:
+                arrive_events = arrival.update(info, flags["arms"], elapse, dt_real)
 
             # 上行：夹爪状态 / 控制模式（只读，喂状态行、告警与模式门控；不参与控制解算）
             if grip_rx is not None:

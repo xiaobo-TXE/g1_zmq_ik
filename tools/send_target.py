@@ -97,6 +97,16 @@ def main() -> int:
     dt = 1.0 / max(args.rate, 1e-3)
     t0 = time.time()
     n = 0
+    failed = 0
+    # --center 之前只声明不使用：现在按帮助文本的语义实现 —— 先发一帧"圆心/起点"的绝对目标，
+    # 之后的相对轨迹自然就绕它走（不给则仍然由主程序以当前位姿为圆心）
+    if args.center is not None and args.mode in ("circle", "line"):
+        if send(sock, {"pos": list(args.center), "arm": args.arm}):
+            n += 1
+            print(f"[send_target] 已先下发圆心/起点 {args.center}（之后按相对轨迹绕它运动）")
+        else:
+            failed += 1
+            print("[send_target] 圆心/起点帧未能投递（主程序没在收？）")
     # pos/delta 是"一次性指令"语义：默认只发一帧就退出（避免一次调用把同一个增量叠加多次）
     one_shot = args.mode in ("pos", "delta")
     limit = args.repeat if one_shot else 0
@@ -147,7 +157,8 @@ def main() -> int:
                 pkt["pos"] = list(row[1:4])
                 if row.size >= 7:
                     pkt["rpy"] = list(row[4:7])
-            send(sock, pkt)
+            if not send(sock, pkt):
+                failed += 1
             n += 1
             if one_shot:
                 print(f"  已下发第 {n} 帧: {json.dumps(pkt, separators=(',', ':'))}")
@@ -158,9 +169,14 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        print(f"\n[send_target] 共下发 {n} 帧")
+        if failed:
+            print(f"\n[send_target] 共 {n} 帧，其中 {failed} 帧未投递"
+                  f"（PUSH 队列满或主程序没在监听 6003）")
+        else:
+            print(f"\n[send_target] 共下发 {n} 帧")
         sock.close()
-    return 0
+    # 一帧都没投递出去 → 非零退出，脚本/CI 才看得出来
+    return 1 if failed and failed == n else 0
 
 
 if __name__ == "__main__":

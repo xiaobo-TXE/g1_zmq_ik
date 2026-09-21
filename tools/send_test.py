@@ -46,6 +46,9 @@ def main() -> int:
     p.add_argument("--rate", type=float, default=50.0)
     p.add_argument("--duration", type=float, default=6.0)
     args = p.parse_args()
+    if not 0 <= args.joint < N_ARM:
+        # 原来 --joint 14 会在打印关节名时 IndexError，--joint -1 会静默作用到最后一个关节
+        p.error(f"--joint 必须在 0..{N_ARM - 1}（收到 {args.joint}）")
 
     pub = ArmCommandPublisher(args.robot_ip, args.cmd_port)
     pub.sock.setsockopt(pub.zmq.SNDHWM, 10)

@@ -87,7 +87,7 @@ class MockRobot:
     def state_loop(self, ctx) -> None:
         sock = ctx.socket(self.zmq.PUB)
         sock.setsockopt(self.zmq.SNDHWM, 2)
-        sock.bind(f"tcp://*:{self.state_port}")
+        _bind_or_die(sock, self.state_port, "状态(6001)")
         print(f"[mock] 6001 PUB 已绑定 tcp://*:{self.state_port}（500Hz，去重条件=tick 变化）")
         period = 1.0 / self.rate
         next_t = time.time()
@@ -176,7 +176,7 @@ class MockRobot:
     def cmd_loop(self, ctx) -> None:
         sock = ctx.socket(self.zmq.PULL)
         sock.setsockopt(self.zmq.RCVTIMEO, 20)
-        sock.bind(f"tcp://*:{self.cmd_port}")
+        _bind_or_die(sock, self.cmd_port, "指令(6002)")
         print(f"[mock] 6002 PULL 已绑定 tcp://*:{self.cmd_port}（等待 LeRobot action 帧）")
         while self.running:
             try:
@@ -244,6 +244,21 @@ class MockRobot:
         except KeyboardInterrupt:
             self.running = False
             print(f"\n[mock] 共接收 {self.recv_count} 帧有效指令，丢弃 {self.reject_count} 帧")
+
+
+def _bind_or_die(sock, port: int, what: str) -> None:
+    """bind 失败要立刻带着非零退出码死掉。
+
+    子线程里 bind 失败原来只打一行 traceback，主线程继续跑并宣称"Ctrl-C 退出"，
+    用户以为 mock 起好了、却永远收不到帧 —— 排查方向全错。
+    """
+    try:
+        sock.bind(f"tcp://*:{port}")
+    except Exception as exc:
+        print(f"\n[mock] {what}端口 {port} 绑定失败：{exc}\n"
+              f"[mock] 端口被占用（上次的 mock 没退干净？还是真机桥接在跑？）—— 退出", file=sys.stderr)
+        import os
+        os._exit(1)
 
 
 def main() -> int:
