@@ -4,3 +4,4 @@ _model_cache_*.pkl
 *.csv
 .DS_Store
 .venv/
+robot.json

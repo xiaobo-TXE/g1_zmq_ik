@@ -127,6 +127,37 @@ python main.py --robot-ip 192.168.123.161 --arm right --pos 0.35 -0.20 0.10
 退出：`Ctrl-C`。停发后机器人侧 VLA 指令超时会保持最后一个有效 `arm_q`（不会松手）；
 要交还控制权就切回 `Gamepad`（手柄 `LB+X` / 键 `1`），手臂会按 Bezier 回到 `safe_home_q`。
 
+#### 2.2.1 把真机常量写进配置文件（`--config`，可选）
+
+机器人 IP、端口、夹爪标定、要不要 VLA 门控、到位后要不要自动闭爪 —— 这些每次都在命令行敲一遍很烦，可以写进
+一个 JSON 文件，用 `--config` 带上：**文件里的键当默认值，命令行显式给的参数优先**。
+
+```bash
+cp robot.example.json robot.json      # robot.json 已进 .gitignore，不会污染版本库
+python main.py --config robot.json --pos 0.35 -0.20 0.15
+```
+
+键名 = 命令行参数去掉 `--` 并把 `-` 换成 `_`（`--grip-on-arrive-soft` → `grip_on_arrive_soft`）；
+数字写数字、开关写 `true`/`false`；以 `_` 开头的键会被忽略，可当注释用。写错键名**不会静默生效**：
+
+```
+配置文件 robot.json：14 项作为默认值生效（命令行显式给的参数优先）：arm='right' grip_open_cm=8.5 ...
+配置里有不认识的键（已忽略）：robor_ip（键名应是参数名去掉 -- 并把 - 换成 _）
+```
+
+取值非法（比如 `"arm": "torso"`、`"pos": [0.3, 0.1]`）会**直接报错退出**，而不是带着错值跑。
+
+| 想在文件里设 | 写什么 |
+|---|---|
+| 机器人 IP / 端口 | `"robot_ip": "192.168.123.161"`, `"gripper_port": 6004` |
+| 非 VLA 时不下发 | `"require_vla": true` |
+| 交互命令常开 | `"interactive": true` |
+| 夹爪标定 | `"grip_open_cm": 8.5`, `"grip_qmax_rad": 5.6217`, `"grip_qmin_rad": 0.0` |
+| 到位后力限软闭合 | `"grip_on_arrive_soft": 0.3` |
+| 每次任务的目标 | `"pos": [0.35, -0.20, 0.15]`（也可以留在命令行上） |
+
+自检：`python tools/test_config.py`（23 项：类型转换、命令行优先、坏键只告警、非法值报错退出）。
+
 ### 2.3 目标的几种给法
 
 ```bash
@@ -707,6 +738,7 @@ python main.py --robot-ip 192.168.123.161 --arm right --interactive --on-arrive 
 | `--dry-run` | off | 只打印不下发 |
 | `--interactive` | off | 运行中从 stdin 读目标 |
 | `--target-port` | `6003` | 目标流输入端口（PULL/bind）；`0` 关闭 |
+| `--config` | — | JSON 配置文件：文件里的键作为默认值，**命令行显式给的参数优先**；键名去掉 `--`、`-`→`_`；示例见 `robot.example.json` |
 | `--gripper-port` | `6004` | 夹爪实测状态订阅（SUB/connect，上游 6004 PUB 100Hz）；`0` 关闭 |
 | `--grip` `--grip-right` `--grip-left` | — | 启动时给夹爪目标（单位见 `--grip-unit`）；`--grip` 两侧同值，`--grip-right/left` 覆盖对应侧 |
 | `--grip-unit` | `pct` | 目标单位：`pct` 开合百分比 / `cm` 内壁开口厘米 / `rad` 弧度 |
@@ -764,6 +796,7 @@ g1_zmq_ik/
 │                            g1_29dof_mode_15_with_dex1_1.urdf（默认，Dex1 夹爪）
 │                            g1_body29_hand14.urdf（Dex3 三指手）
 ├── pyproject.toml / requirements.txt    uv 依赖声明（uv sync / uv pip install -r）
+├── robot.example.json    --config 示例（复制成 robot.json 用；robot.json 不进版本库）
 ├── tools/
 │   ├── mock_robot.py       本地假机器人：复刻 6001/6002 协议，便于不接真机联调
 │   ├── read_state.py       只读 6001，打印 29 个关节角
@@ -773,6 +806,9 @@ g1_zmq_ik/
 │   ├── mock_gripper_box.py 假夹爪 + 假盒子（离线量化「位置闭合 vs 力限软闭合」）
 │   ├── detect_aruco_zmq.py ArUco/AprilTag 检测 → torso 系目标 → 6003（需 opencv-contrib）
 │   ├── test_arrival.py     到位判定离线单测（合成 StepInfo 序列，44 项检查）
+│   ├── test_target_frame.py 目标系/pelvis 兼容/quat 单测（19 项检查）
+│   ├── test_target_io.py   6003 字段解析单测（动作型帧、失败隔离，24 项检查）
+│   ├── test_config.py      --config 单测（类型转换/命令行优先/坏输入，23 项检查）
 │   ├── tune_motion.py      速度/加速度标定工具（扫描网格，量化平滑度）
 │   └── selftest_offline.py 离线检查脚本：正解一致性 / 反解精度 / 轨迹跟踪└── docs/                   源码逐行对照、ZMQ 协议详解、实测数据
 ```

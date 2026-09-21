@@ -1,0 +1,25 @@
+{
+  "_README": "复制成 robot.json 后按你的机器改：python main.py --config robot.json --pos 0.35 -0.20 0.15",
+  "_键名规则": "键名 = 命令行参数去掉 -- 并把 - 换成 _（--grip-on-arrive-soft -> grip_on_arrive_soft）；以 _ 开头的键会被忽略，可当注释用。",
+  "_优先级": "命令行显式给的参数优先于这里；这里没写的键仍用程序内置默认值。",
+
+  "robot_ip": "192.168.123.161",
+  "state_port": 6001,
+  "cmd_port": 6002,
+  "gripper_port": 6004,
+  "mode_port": 6000,
+  "require_vla": true,
+
+  "arm": "right",
+  "target_frame": "torso",
+  "interactive": true,
+
+  "_夹爪标定": "open_cm/qmax/qmin 是真机量出来的量程；改这里之前先核对机器人侧 config.yaml 的 FSM.Groot.gripper",
+  "grip_open_cm": 8.5,
+  "grip_qmax_rad": 5.6217,
+  "grip_qmin_rad": 0.0,
+
+  "_抓取策略": "到位后自动做力限软闭合（抓盒子用）。不想要就删掉下面这行，或命令行加 --grip-on-arrive 0 改位置闭合",
+  "grip_on_arrive_soft": 0.3,
+  "grip_soft_tau": 0.3
+}
