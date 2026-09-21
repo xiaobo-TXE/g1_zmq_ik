@@ -10,5 +10,8 @@ dependencies = [
     "casadi>=3.6",    # PyPI 轮子自带 IPOPT 插件
 ]
 
+# 可选：tools/detect_aruco_zmq.py（ArUco 检测前端）需要，主程序不需要
+#   uv pip install opencv-contrib-python
+
 [tool.uv]
 package = false       # 不是要发布的 Python 包，uv sync 只装依赖

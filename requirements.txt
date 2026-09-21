@@ -14,3 +14,6 @@ casadi>=3.6
 # * PyPI 的 casadi 轮子自带 IPOPT 插件（libcasadi_nlpsol_ipopt.so），所以 IPOPT 不需要额外安装。
 # * 若确实想用 pinocchio.casadi 这条上游原路径，只能用 conda-forge：
 #       conda install -c conda-forge pinocchio casadi
+#
+# 可选（只有 tools/detect_aruco_zmq.py 需要；主程序不需要）：
+#   opencv-contrib-python>=4.7     # cv2.aruco 在 contrib 包里
