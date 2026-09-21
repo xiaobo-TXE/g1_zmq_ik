@@ -156,7 +156,30 @@ python main.py --config robot.json --pos 0.35 -0.20 0.15
 | 到位后力限软闭合 | `"grip_on_arrive_soft": 0.3` |
 | 每次任务的目标 | `"pos": [0.35, -0.20, 0.15]`（也可以留在命令行上） |
 
-自检：`python tools/test_config.py`（23 项：类型转换、命令行优先、坏键只告警、非法值报错退出）。
+**一份配置管两个程序**：`main.py` 读 `main` 段，`tools/detect_aruco_zmq.py`（相机 Tag 检测）读 `aruco` 段，
+顶层只放 `_` 注释键；各程序只认自己那段，别人的段静默忽略（不会误报"不认识的键"）：
+
+```json
+{
+  "_README": "两个程序共用这一份",
+  "main":  { "robot_ip": "192.168.123.161", "require_vla": true, "interactive": true,
+             "grip_open_cm": 8.5, "grip_on_arrive_soft": 0.3 },
+  "aruco": { "marker_to_grasp": [0.0, 0.0, -0.015], "grasp_align_rpy": [0.0, 0.0, 0.0],
+             "endpoint": "tcp://10.3.42.221:5556", "ids": [3] }
+}
+```
+
+于是两个终端各一行：
+
+```bash
+python main.py --config robot.json --pos 0.35 -0.20 0.15            # 终端 A：控制
+python tools/detect_aruco_zmq.py --config robot.json                # 终端 B：Tag 检测 → 6003
+```
+
+只想配一个程序时也可以不分段：所有键直接写在顶层（程序读"顶层 + 自己那段"）。
+
+自检：`python tools/test_config.py`（31 项：类型转换、命令行优先、坏键只告警、非法值报错退出、
+两个程序分段互不干扰、示例配置可直接用）。
 
 ### 2.3 目标的几种给法
 
@@ -282,6 +305,8 @@ python tools/detect_aruco_zmq.py --no-send --endpoint tcp://10.3.42.221:5556
 # ② 检测 + 下发（另一个终端先跑本程序的仿真，不需要机器人）
 python main.py --sim --arm right --interactive --target-frame torso
 python tools/detect_aruco_zmq.py --marker-to-grasp 0 0 -0.015
+#   ↑ 参数也能写进 robot.json 的 aruco 段，之后就是：
+#   python tools/detect_aruco_zmq.py --config robot.json
 ```
 
 **标记位姿 ≠ 抓取点**：检测给的是 **25mm 标记中心**的位姿，所以要用 `--marker-to-grasp DX DY DZ`
@@ -738,7 +763,7 @@ python main.py --robot-ip 192.168.123.161 --arm right --interactive --on-arrive 
 | `--dry-run` | off | 只打印不下发 |
 | `--interactive` | off | 运行中从 stdin 读目标 |
 | `--target-port` | `6003` | 目标流输入端口（PULL/bind）；`0` 关闭 |
-| `--config` | — | JSON 配置文件：文件里的键作为默认值，**命令行显式给的参数优先**；键名去掉 `--`、`-`→`_`；示例见 `robot.example.json` |
+| `--config` | — | JSON 配置文件：文件里的键作为默认值，**命令行显式给的参数优先**；键名去掉 `--`、`-`→`_`；`main` 段给本程序、`aruco` 段给 `tools/detect_aruco_zmq.py`（它也有 `--config`）；示例见 `robot.example.json` |
 | `--gripper-port` | `6004` | 夹爪实测状态订阅（SUB/connect，上游 6004 PUB 100Hz）；`0` 关闭 |
 | `--grip` `--grip-right` `--grip-left` | — | 启动时给夹爪目标（单位见 `--grip-unit`）；`--grip` 两侧同值，`--grip-right/left` 覆盖对应侧 |
 | `--grip-unit` | `pct` | 目标单位：`pct` 开合百分比 / `cm` 内壁开口厘米 / `rad` 弧度 |
@@ -796,7 +821,8 @@ g1_zmq_ik/
 │                            g1_29dof_mode_15_with_dex1_1.urdf（默认，Dex1 夹爪）
 │                            g1_body29_hand14.urdf（Dex3 三指手）
 ├── pyproject.toml / requirements.txt    uv 依赖声明（uv sync / uv pip install -r）
-├── robot.example.json    --config 示例（复制成 robot.json 用；robot.json 不进版本库）
+├── config_file.py        --config 的共用实现（两遍解析、类型转换、分段；两个程序共用）
+├── robot.example.json    --config 示例（main / aruco 两段；复制成 robot.json 用，robot.json 不进版本库）
 ├── tools/
 │   ├── mock_robot.py       本地假机器人：复刻 6001/6002 协议，便于不接真机联调
 │   ├── read_state.py       只读 6001，打印 29 个关节角

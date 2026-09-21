@@ -44,6 +44,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 
 import joint_map
+from config_file import add_config_argument, describe_applied, parse_args_with_config
 from arrival import ArrivalMonitor, ArrivalThresholds, format_event
 from controller import ArmController, LEFT, RIGHT, format_step
 from grip_control import SoftClose, SoftCloseConfig
@@ -225,11 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--wz", type=float, default=0.0)
 
     g = p.add_argument_group("杂项")
-    g.add_argument("--config", metavar="FILE",
-                   help="JSON 配置文件：文件里的键作为**默认值**，命令行显式给的参数优先。"
-                        "键名 = 参数名去掉 -- 并把 - 换成 _（例 --grip-on-arrive-soft → "
-                        "grip_on_arrive_soft）；以 _ 开头的键忽略（可当注释用）。"
-                        "示例见仓库里的 robot.example.json")
+    add_config_argument(p, "main")          # --config（本程序读 "main" 段）
     g.add_argument("--check", action="store_true", help="只做环境/模型自检后退出")
     g.add_argument("--list-limits", action="store_true", help="打印手臂关节限位后退出")
     g.add_argument("--print-mapping", action="store_true", help="打印关节序号对照表后退出")
@@ -615,71 +612,11 @@ def parse_initial_targets(args):
 
 
 # ---------------------------------------------------------------------------
-# 参数解析：支持 --config 配置文件（文件里的键当默认值，命令行优先）
+# 参数解析：--config 由 config_file.py 提供（主程序读 "main" 段；"aruco" 段留给检测端）
 # ---------------------------------------------------------------------------
-def _config_value(action, value, key: str):
-    """把配置文件里的值变成该参数该有的类型，并做 choices 校验。"""
-    if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
-        if isinstance(value, str):                      # "true"/"false"/"1"/"0" 都认
-            v = value.strip().lower()
-            if v in ("1", "true", "yes", "on", "y"):
-                return True
-            if v in ("0", "false", "no", "off", "n", ""):
-                return False
-            raise ValueError(f"布尔值无法识别：{value!r}")
-        return bool(value)
-    if value is None:
-        return None
-    conv = action.type if callable(action.type) else (lambda v: v)
-    if action.nargs in (None, "?"):
-        out = conv(value)
-    else:                                               # nargs=3 之类（例：pos / rpy / quat）
-        seq = list(value) if isinstance(value, (list, tuple)) else [value]
-        if isinstance(action.nargs, int) and len(seq) != action.nargs:
-            raise ValueError(f"需要 {action.nargs} 个数，收到 {len(seq)} 个")
-        out = [conv(v) for v in seq]
-    if action.choices is not None and out not in action.choices:
-        raise ValueError(f"只能是 {'/'.join(map(str, action.choices))}，收到 {out!r}")
-    return out
-
-
-def load_config(path: str, parser: argparse.ArgumentParser):
-    """读 JSON 配置。返回 (默认值 dict, 已应用的键, 不认识的键)。键以 _ 开头的忽略。"""
-    with open(path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    if not isinstance(raw, dict):
-        raise ValueError("顶层必须是 JSON 对象")
-    by_dest = {a.dest: a for a in parser._actions}
-    defaults, applied, ignored = {}, [], []
-    for k, v in raw.items():
-        key = str(k).strip().replace("-", "_")
-        if key.startswith("_") or key == "config":       # _comment 之类：当注释用
-            continue
-        action = by_dest.get(key)
-        if action is None:
-            ignored.append(str(k))
-            continue
-        defaults[key] = _config_value(action, v, str(k))
-        applied.append(key)
-    return defaults, applied, ignored
-
-
 def parse_args(argv=None) -> argparse.Namespace:
     """两遍解析：第一遍只为拿到 --config，第二遍把配置当默认值（命令行优先）。"""
-    pre, _ = build_parser().parse_known_args(argv)
-    if not pre.config:
-        args = build_parser().parse_args(argv)
-        args.config_applied, args.config_ignored = [], []
-        return args
-    parser = build_parser()
-    try:
-        defaults, applied, ignored = load_config(pre.config, parser)
-    except Exception as exc:
-        parser.error(f"--config {pre.config} 读取失败：{exc}")   # 打印用法并退出(2)
-    parser.set_defaults(**defaults)
-    args = parser.parse_args(argv)
-    args.config_applied, args.config_ignored = applied, ignored
-    return args
+    return parse_args_with_config(build_parser, argv, sections=("main",))
 
 
 def main(argv=None) -> int:
@@ -689,8 +626,9 @@ def main(argv=None) -> int:
                         datefmt="%H:%M:%S")
     if args.config:
         log.info("配置文件 %s：%d 项作为默认值生效（命令行显式给的参数优先）：%s",
-                 args.config, len(args.config_applied),
-                 " ".join(f"{k}={getattr(args, k)!r}" for k in sorted(args.config_applied)))
+                 args.config, len(args.config_applied), describe_applied(args))
+        if getattr(args, "config_sections", None):
+            log.info("配置里的其它段留给别的程序：%s", ", ".join(args.config_sections))
         if args.config_ignored:
             log.warning("配置里有不认识的键（已忽略）：%s（键名应是参数名去掉 -- 并把 - 换成 _）",
                         ", ".join(args.config_ignored))

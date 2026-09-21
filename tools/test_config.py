@@ -22,6 +22,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import main  # noqa: E402
 
+
+def load_detector():
+    """把 tools/detect_aruco_zmq.py 当模块加载（测它读不读 \"aruco\" 段）。"""
+    import importlib.util
+    path = Path(__file__).resolve().parent / "detect_aruco_zmq.py"
+    spec = importlib.util.spec_from_file_location("detect_aruco_zmq", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 _RESULTS = []
 
 
@@ -135,6 +145,46 @@ def main_check() -> int:
           args is not None and args.config_ignored == [] and args.require_vla is True
           and args.gripper_port == 6004 and args.grip_on_arrive_soft == 0.3,
           f"applied={len(args.config_applied) if args else 0} ignored={args.config_ignored if args else err}")
+
+    print("\n[8] 分「段」：两个程序共用一份配置")
+    cfg_sec = write_config({
+        "robot_ip": "10.0.0.7",
+        "main": {"arm": "left", "interactive": True},
+        "aruco": {"endpoint": "tcp://1.2.3.4:5556", "marker_to_grasp": [0, 0, -0.015],
+                  "ids": [3, 7], "print_axes": False},
+    })
+    args, _ = parse(["--config", cfg_sec])
+    check("main 段里的键等价于平铺（arm/interactive 生效）",
+          args.arm == "left" and args.interactive is True and args.robot_ip == "10.0.0.7",
+          f"arm={args.arm} interactive={args.interactive} ip={args.robot_ip}")
+    check("别的程序的段（aruco）不报错、不告警、不算不认识的键",
+          args.config_ignored == [] and args.config_sections == ["aruco"],
+          f"ignored={args.config_ignored} sections={args.config_sections}")
+
+    print("\n[9] 检测端（tools/detect_aruco_zmq.py）读同一份配置的 aruco 段")
+    det = load_detector()
+    d0 = det.parse_args([])
+    check("不给配置时检测端仍是自己的默认值",
+          tuple(d0.marker_to_grasp) == (0.0, 0.0, 0.0) and d0.endpoint == "tcp://10.3.42.221:5556"
+          and d0.print_axes is True and d0.ids == [3],
+          f"grasp={d0.marker_to_grasp} endpoint={d0.endpoint}")
+    d1 = det.parse_args(["--config", cfg_sec])
+    check("aruco 段生效（endpoint / marker_to_grasp / ids）",
+          d1.endpoint == "tcp://1.2.3.4:5556" and tuple(d1.marker_to_grasp) == (0.0, 0.0, -0.015)
+          and d1.ids == [3, 7], f"grasp={d1.marker_to_grasp} ids={d1.ids}")
+    check("aruco 段里的开关（print_axes=False）生效", d1.print_axes is False)
+    check("检测端把 main 段留给主程序", d1.config_sections == ["main"],
+          f"sections={d1.config_sections}")
+    d2 = det.parse_args(["--config", cfg_sec, "--marker-to-grasp", "0", "0", "-0.03", "--no-send"])
+    check("检测端命令行也优先于文件",
+          tuple(d2.marker_to_grasp) == (0.0, 0.0, -0.03) and d2.no_send is True and d2.ids == [3, 7],
+          f"grasp={d2.marker_to_grasp}")
+    example = Path(__file__).resolve().parent.parent / "robot.example.json"
+    d3 = det.parse_args(["--config", str(example)])
+    check("仓库示例配置里的 aruco 段可直接用（含 -15mm 抓取偏移）",
+          tuple(d3.marker_to_grasp) == (0.0, 0.0, -0.015) and d3.config_ignored == []
+          and d3.target_endpoint == "tcp://127.0.0.1:6003",
+          f"grasp={d3.marker_to_grasp} ignored={d3.config_ignored}")
 
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
     print("\n" + "=" * 74)

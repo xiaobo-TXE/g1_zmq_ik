@@ -60,10 +60,14 @@ import json
 import math
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
 import zmq
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config_file import add_config_argument, parse_args_with_config  # noqa: E402
 
 
 IMAGE_WIDTH = 1280
@@ -454,9 +458,10 @@ def print_marker_axes(result, align_rpy=(0.0, 0.0, 0.0)):
             vector_text(ee[:, 2])), flush=True)
 
 
-def parse_args():
+def build_parser():
     parser = argparse.ArgumentParser(
         description='ROS-free ArUco pose estimation from a ZMQ JPEG stream')
+    add_config_argument(parser, 'aruco')      # --config（本程序读 "aruco" 段）
     parser.add_argument(
         '--endpoint', default='tcp://10.3.42.221:5556',
         help='ZMQ publisher endpoint, e.g. tcp://127.0.0.1:5556')
@@ -507,19 +512,34 @@ def parse_args():
                         metavar=('DX', 'DY', 'DZ'),
                         help='标记中心 -> 抓取点的偏移（米，标记自身坐标系）。'
                              '例：标记贴在 3cm 盒子顶面中央、要夹盒子腰部，则给 0 0 -0.015')
-    args = parser.parse_args()
+    return parser
 
+
+def parse_args(argv=None):
+    """解析命令行；--config 里的键当默认值（命令行显式给的优先）。"""
+    args = parse_args_with_config(build_parser, argv, sections=('aruco',))
     if args.marker_size <= 0.0:
-        parser.error('--marker-size must be greater than zero')
+        build_parser().error('--marker-size must be greater than zero')
     if args.confirmation_frames < 1:
-        parser.error('--confirmation-frames must be at least one')
+        build_parser().error('--confirmation-frames must be at least one')
     if args.log_interval < 0.0:
-        parser.error('--log-interval cannot be negative')
+        build_parser().error('--log-interval cannot be negative')
     return args
 
 
 def main():
     args = parse_args()
+    if args.config:
+        print('[INFO] 配置文件 {}：{} 项作为默认值生效（命令行优先）：{}'.format(
+            args.config, len(args.config_applied),
+            ' '.join('{}={!r}'.format(k, getattr(args, k)) for k in sorted(args.config_applied))),
+            flush=True)
+        if args.config_sections:
+            print('[INFO] 配置里的其它段留给别的程序：{}'.format(', '.join(args.config_sections)),
+                  flush=True)
+        if args.config_ignored:
+            print('[WARN] 配置里有不认识的键（已忽略）：{}（键名应是参数名去掉 -- 并把 - 换成 _）'
+                  .format(', '.join(args.config_ignored)), file=sys.stderr, flush=True)
     estimator = ArucoPoseEstimator(args)
     context = zmq.Context()
     socket = context.socket(zmq.SUB)
