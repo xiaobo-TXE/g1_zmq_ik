@@ -199,8 +199,29 @@ class ArmCommandPublisher:
         return {"remote.lx": -float(vy), "remote.ly": float(vx),
                 "remote.rx": -float(wz), "remote.ry": 0.0}
 
+    @staticmethod
+    def gripper_block(right: Optional[float] = None,
+                      left: Optional[float] = None) -> Optional[dict]:
+        """组装 6002 action 帧里的**可选** `gripper` 块（上游 groot-control 契约）。
+
+        只包含"这一帧真的要更新"的侧（另一侧由机器人侧 latch 保持）；两侧都没给则返回 None
+        （整块省略 = 本帧不产生任何夹爪更新，机器人侧在收到首个目标前保持静默）。
+        值必须是有限值（非有限直接抛错，由调用方拦下），量程不在这里管：上游契约是
+        "clamp 不丢帧"，clamp 由 ArmController 与机器人侧各自做一次。
+        """
+        out: Dict[str, dict] = {}
+        for side, q in (("right", right), ("left", left)):
+            if q is None:
+                continue
+            v = float(q)
+            if not np.isfinite(v):
+                raise ValueError(f"夹爪 {side} 的 q 不是有限值：{q!r}")
+            out[side] = {"q": v}
+        return out or None
+
     def build_frame(self, q14: Sequence[float],
-                    axes: Optional[Dict[str, float]] = None) -> str:
+                    axes: Optional[Dict[str, float]] = None,
+                    gripper: Optional[dict] = None) -> str:
         q = np.asarray(q14, dtype=float).reshape(-1)
         if q.size != N_ARM:
             raise ValueError(f"必须一次给全 {N_ARM} 个手臂关节，实际 {q.size} 个")
@@ -216,6 +237,12 @@ class ArmCommandPublisher:
                 if key in REMOTE_AXIS_KEYS:
                     action[key] = float(value)
         # timestamp 严格递增：即使本机时钟回拨也不会被判成 stale
+        # 可选夹爪块：只读 q（kp/kd/mode 属于机器人侧 config，帧里传会被忽略并 warn）
+        if gripper:
+            block = (gripper if set(gripper) <= {"right", "left"}
+                     else self.gripper_block(gripper.get("right"), gripper.get("left")))
+            if block:
+                action["gripper"] = block
         ts = max(time.time(), self._last_ts + 1e-4)
         frame = {"cmd": "action", "action": action, "timestamp": ts}
         payload = json.dumps(frame, separators=(",", ":"))
@@ -224,8 +251,8 @@ class ArmCommandPublisher:
         return payload
 
     def send(self, q14: Sequence[float], axes: Optional[Dict[str, float]] = None,
-             dry_run: bool = False) -> str:
-        payload = self.build_frame(q14, axes)
+             dry_run: bool = False, gripper: Optional[dict] = None) -> str:
+        payload = self.build_frame(q14, axes, gripper=gripper)
         self.last_payload = payload
         if dry_run:
             self.sent += 1
@@ -249,6 +276,17 @@ class ArmCommandPublisher:
             self.sock.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# 上行：夹爪状态（6004）/ 控制模式（6000）
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 夹爪量程（Dex1_1）：上游 groot-control 默认标定值（rad，输出侧量纲）
+# ---------------------------------------------------------------------------
+#: 上游默认量程（rad，输出侧）：q_min=完全闭合, q_max=完全张开（322° 标定值）
+GRIPPER_Q_MIN_DEFAULT = 0.0
+GRIPPER_Q_MAX_DEFAULT = 5.6217
 
 
 # ---------------------------------------------------------------------------

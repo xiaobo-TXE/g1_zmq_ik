@@ -35,7 +35,8 @@ import pinocchio as pin
 
 from g1_ik import G1ArmModel, WeightedMovingFilter, log3_error, pose_error, rpy_to_rotation
 from joint_map import N_ARM
-from zmq_link import ArmCommandPublisher
+from zmq_link import (GRIPPER_Q_MAX_DEFAULT, GRIPPER_Q_MIN_DEFAULT,
+                      ArmCommandPublisher)
 
 logger = logging.getLogger("controller")
 
@@ -127,7 +128,10 @@ class ArmController:
                  ee_rot_jerk: float = 0.0,
                  state_timeout: float = 0.25,
                  dry_run: bool = False,
-                 velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0)):
+                 velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+                 grip_q_min: float = GRIPPER_Q_MIN_DEFAULT,
+                 grip_q_max: float = GRIPPER_Q_MAX_DEFAULT,
+                 grip_open_cm: float = 8.5):
         if controlled not in (LEFT, RIGHT, "both"):
             raise ValueError("controlled 只能是 left / right / both")
         if target_frame not in ("torso", "pelvis"):
@@ -162,7 +166,9 @@ class ArmController:
         self.dry_run = bool(dry_run)
         self.velocity = tuple(float(v) for v in velocity)
 
-        self.filter = WeightedMovingFilter([0.4, 0.3, 0.2, 0.1], N_ARM) if use_filter else None
+        self._filter_weights = [0.4, 0.3, 0.2, 0.1]
+        self.filter = (WeightedMovingFilter(self._filter_weights, N_ARM)
+                       if use_filter else None)
 
         self.target: Dict[str, Optional[np.ndarray]] = {LEFT: None, RIGHT: None}
         self.target_rpy: Dict[str, Optional[np.ndarray]] = {}
@@ -180,6 +186,15 @@ class ArmController:
         self.sent_cycles = 0
         self._prev_ee_cmd: Dict[str, Optional[np.ndarray]] = {LEFT: None, RIGHT: None}
         self._prev_ee_speed: Dict[str, Optional[float]] = {LEFT: None, RIGHT: None}
+
+        # ---- Dex1_1 夹爪（下行：塞进 6002 帧里的可选 gripper 块）----
+        # 标定：q_min/q_max 是机器人侧 config 的输出侧弧度量程（0=全闭，默认 5.6217=322°）；
+        # grip_open_cm 是真机上量到的"内壁最大张开"（cm），只用于 % / cm 显示与输入换算。
+        self.grip_q_min = float(grip_q_min)
+        self.grip_q_max = float(grip_q_max)
+        self.grip_open_cm = float(grip_open_cm)
+        #: 每侧已锁存的目标（rad）；None = 这一侧还没下发过目标 → 帧里不带它
+        self.grip: Dict[str, Optional[float]] = {"right": None, "left": None}
 
     # ------------------------------------------------------------------ 目标
     def _assign_target(self, arm: str, T_new: np.ndarray) -> None:
@@ -250,6 +265,66 @@ class ArmController:
             pending, self._pending_positions = self._pending_positions, []
             for arm, pos in pending:
                 self.set_target_position(arm, pos)
+
+    # ------------------------------------------------------------------ 夹爪
+    #   上游 groot-control 契约：夹爪目标复用 6002 action 帧里的可选 `gripper` 块，
+    #   帧里只读 `q`（弧度、输出侧量纲）；超量程是 **clamp 不丢帧**；机器人侧
+    #   GripperBridge 会 latch 并以 100 Hz 无条件重发，所以"发一帧就够"。
+    def grip_pct_to_rad(self, pct: float) -> float:
+        """开合百分比(0=全闭, 100=全开) -> 弧度。线性映射：rad = pct/100 * q_max。"""
+        return self.grip_q_min + (self.grip_q_max - self.grip_q_min) * float(pct) / 100.0
+
+    def grip_cm_to_rad(self, cm: float) -> float:
+        """内壁开口(cm) -> 弧度（用实测量程 grip_open_cm 线性换算）。"""
+        if self.grip_open_cm <= 0:
+            raise ValueError("grip_open_cm 必须 > 0")
+        return self.grip_pct_to_rad(float(cm) / self.grip_open_cm * 100.0)
+
+    def grip_rad_to_pct(self, rad: float) -> float:
+        """弧度 -> 开合百分比（用于显示实测值）。"""
+        span = self.grip_q_max - self.grip_q_min
+        if span <= 0:
+            return float("nan")
+        return float(np.clip((float(rad) - self.grip_q_min) / span * 100.0, 0.0, 100.0))
+
+    def grip_rad_to_cm(self, rad: float) -> float:
+        """弧度 -> 内壁开口 cm（同一线性映射）。"""
+        span = self.grip_q_max - self.grip_q_min
+        if span <= 0 or self.grip_open_cm <= 0:
+            return float("nan")
+        return float(np.clip(float(rad) - self.grip_q_min, 0.0, span) / span * self.grip_open_cm)
+
+    def set_gripper(self, right: Optional[float] = None, left: Optional[float] = None,
+                    source: str = "", quiet: bool = False) -> Dict[str, float]:
+        """锁存夹爪目标（**弧度**，输出侧量纲）。None = 该侧不动。
+
+        超量程按上游契约 **clamp 到 [q_min, q_max] 并告警**（不丢、不报错）；非有限值直接抛错，
+        由调用方拦下（这种帧不该发出去）。返回本侧实际采用的值 {side: rad}。
+        """
+        applied: Dict[str, float] = {}
+        for side, q in (("right", right), ("left", left)):
+            if q is None:
+                continue
+            v = float(q)
+            if not np.isfinite(v):
+                raise ValueError(f"夹爪 {side} 的目标不是有限值：{q!r}")
+            if v < self.grip_q_min or v > self.grip_q_max:
+                clamped = float(np.clip(v, self.grip_q_min, self.grip_q_max))
+                logger.warning("夹爪 %s q=%.4f rad 超出标定量程 [%.4f, %.4f] -> clamp 到 %.4f"
+                               "（量程可在真机上实测后用 --grip-qmin-rad/--grip-qmax-rad 改）",
+                               side, v, self.grip_q_min, self.grip_q_max, clamped)
+                v = clamped
+            self.grip[side] = v
+            applied[side] = v
+        if applied and not quiet:
+            logger.info("夹爪目标%s -> %s", f"（{source}）" if source else "",
+                        "  ".join(f"{k}={v:.4f}rad({self.grip_rad_to_pct(v):.0f}%/"
+                                  f"{self.grip_rad_to_cm(v):.2f}cm)" for k, v in applied.items()))
+        return applied
+
+    def grip_target(self) -> Optional[dict]:
+        """给 ArmCommandPublisher.send(gripper=...) 的载荷；两侧都没目标则 None（帧里不带块）。"""
+        return ArmCommandPublisher.gripper_block(self.grip.get("right"), self.grip.get("left"))
 
     # ------------------------------------------------------------------ 坐标系
     def ee_in_target_frame(self, q14: Sequence[float],
@@ -473,7 +548,8 @@ class ArmController:
         # 8) 下发
         self.pub.send(q_send,
                       ArmCommandPublisher.velocity_to_axes(*self.velocity),
-                      dry_run=self.dry_run)
+                      dry_run=self.dry_run,
+                      gripper=self.grip_target())   # 可选夹爪块（未设过目标则整块省略）
         self.q_cmd = q_send
         self.sent_cycles += 1
         info.sent = True
@@ -527,4 +603,6 @@ class ArmController:
                 f"滤波={'on' if self.filter else 'off'} "
                 f"单周期限速={np.rad2deg(self.max_step):.2f}° "
                 f"{ee} "
-                f"状态超时={self.state_timeout * 1000:.0f}ms 下发={self.sent_cycles} 帧")
+                f"状态超时={self.state_timeout * 1000:.0f}ms 下发={self.sent_cycles} 帧 "
+                f"夹爪量程={self.grip_q_min:.3f}~{self.grip_q_max:.4f}rad"
+                f"(实测全开{self.grip_open_cm:.1f}cm)")

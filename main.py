@@ -48,7 +48,8 @@ from controller import ArmController, LEFT, RIGHT, format_step
 from g1_ik import G1ArmModel, make_ik, rotation_to_rpy
 from sim_arm import SimulatedArmState, SimulatedStateSource
 from target_io import TargetReceiver
-from zmq_link import ArmCommandPublisher, RobotStateSubscriber
+from zmq_link import (GRIPPER_Q_MAX_DEFAULT, GRIPPER_Q_MIN_DEFAULT,
+                      ArmCommandPublisher, RobotStateSubscriber)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 默认模型 = 官方 G1-29DoF + Dex1 夹爪（mode_machine=15）。
@@ -139,6 +140,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="超过该秒数没收到新目标就视为失联：0=保持上一条目标（默认），"
                         ">0 时会在日志里提示失联（仍然保持，不会松手）")
 
+    g = p.add_argument_group("夹爪（下行 = 6002 帧里的可选 gripper 块）")
+    g.add_argument("--grip", type=float, metavar="V",
+                   help="启动时给两侧夹爪同一个目标（单位见 --grip-unit，默认百分比：0=闭合 100=全开）")
+    g.add_argument("--grip-right", type=float, metavar="V",
+                   help="只给右爪目标（会覆盖 --grip 对右侧的设定）")
+    g.add_argument("--grip-left", type=float, metavar="V", help="只给左爪目标")
+    g.add_argument("--grip-unit", default="pct", choices=["pct", "cm", "rad"],
+                   help="--grip/--grip-right/--grip-left 的单位：pct=开合百分比 / cm=内壁开口厘米 / rad=弧度")
+    g.add_argument("--grip-open-cm", type=float, default=8.5,
+                   help="真机实测的夹爪内壁最大张开（cm），用于 %% 与 cm 的换算（默认 8.5）")
+    g.add_argument("--grip-qmax-rad", type=float, default=GRIPPER_Q_MAX_DEFAULT,
+                   help="机器人侧标定的张开角（rad，输出侧量纲；上游默认 5.6217 = 322°）")
+    g.add_argument("--grip-qmin-rad", type=float, default=GRIPPER_Q_MIN_DEFAULT,
+                   help="机器人侧标定的闭合角（rad；上游默认 0.0）")
+    g.add_argument("--grip-on-arrive", type=float, metavar="PCT",
+                   help="到位后自动把两侧夹爪压到这个开合百分比（例：0 = 到位即闭爪）；不给则不动夹爪")
+
     g = p.add_argument_group("到位判定（实测末端是否已稳定到达目标）")
     g.add_argument("--no-arrive", action="store_true", help="关闭到位判定（默认开启）")
     g.add_argument("--arrive-pos", type=float, default=2.0, metavar="MM",
@@ -203,6 +221,8 @@ HELP_TEXT = """
   r R P Y        设置目标姿态 rpy (rad)              例: r 0 0 0     r=复位朝向
   a left|right|both   切换受控手臂
   t POS_MM ROT_DEG    设置到位判据（实测残差）       例: t 2 1      t 5 2 = 放宽
+  g [R [L]]      夹爪开合百分比（0=闭 100=全开）     例: g 0      g 0 100     g=看当前
+  go             夹爪张开到 100%（释放）
   h              打印当前实测/目标/误差/到位状态
   j              打印当前下发的 14 个关节角
   ?              显示本帮助
@@ -229,6 +249,30 @@ class InteractiveConsole(threading.Thread):
             line = line.strip()
             if line:
                 self.queue.append(line)
+
+
+def apply_grip_percent(ctrl: ArmController, right_pct=None, left_pct=None,
+                       source: str = "") -> None:
+    """按开合百分比下发夹爪目标（0=全闭，100=全开）。None = 该侧不动。"""
+    try:
+        right = None if right_pct is None else ctrl.grip_pct_to_rad(right_pct)
+        left = None if left_pct is None else ctrl.grip_pct_to_rad(left_pct)
+        ctrl.set_gripper(right=right, left=left, source=source)
+    except Exception as exc:
+        log.warning("夹爪目标被拒（%s）: %s", source or "?", exc)
+
+
+def grip_target_line(ctrl: ArmController) -> str:
+    """已锁存的夹爪目标：`R50%/L0%`（没设过任何目标则空串）。"""
+    return "/".join(f"{tag}{ctrl.grip_rad_to_pct(v):.0f}%"
+                    for side, tag in (("right", "R"), ("left", "L"))
+                    if (v := ctrl.grip.get(side)) is not None)
+
+
+def grip_line(ctrl: ArmController) -> str:
+    """状态行里的夹爪片段：`夹爪目标=R0%/L0%`（还没设过目标则空串）。"""
+    latched = grip_target_line(ctrl)
+    return ("夹爪目标=" + latched) if latched else ""
 
 
 def unfreeze(flags: Dict, why: str) -> None:
@@ -264,6 +308,17 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
             for arm in flags["arms"]:
                 ctrl.set_target_rpy(arm, rpy)
             log.info("目标姿态 rpy -> %s rad", np.round(rpy, 4))
+        elif head == "g":
+            if not args:
+                log.info("夹爪目标=%s", grip_target_line(ctrl) or "（未设）")
+            elif len(args) in (1, 2):
+                r = float(args[0])
+                l = float(args[1]) if len(args) == 2 else r      # 只给一个数 = 两侧同值
+                apply_grip_percent(ctrl, r, l, source="交互命令 g")
+            else:
+                print(HELP_TEXT)
+        elif head == "go":
+            apply_grip_percent(ctrl, 100, 100, source="交互命令 go（张开/释放）")
         elif head == "t" and len(args) == 2:
             mon = flags.get("arrival")
             if mon is None:
@@ -297,6 +352,18 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
 # ---------------------------------------------------------------------------
 def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
     """把一帧目标流数据应用到控制器（最新优先，直接覆盖上一条目标）。"""
+    # 可选夹爪字段（与位置目标无关，可以单独发一帧"只动夹爪"）
+    #   grip     = 开合百分比（0=闭 100=全开）      grip_rad = 直接给弧度（输出侧量纲）
+    if pkt.get("grip_rad"):
+        gr = pkt["grip_rad"]
+        try:
+            ctrl.set_gripper(right=gr.get("right"), left=gr.get("left"), source="6003 grip_rad")
+        except Exception as exc:
+            log.warning("夹爪目标被拒（6003 grip_rad）: %s", exc)
+    elif pkt.get("grip"):
+        gp = pkt["grip"]
+        apply_grip_percent(ctrl, gp.get("right"), gp.get("left"), source="6003 grip")
+
     arms = flags["arms"]
     arm = pkt.get("arm") or ctrl.controlled
     rpy = pkt.get("rpy")
@@ -530,6 +597,9 @@ def main(argv=None) -> int:
                          ee_jerk=args.ee_jerk,
                          ee_rot_jerk=args.ee_rot_jerk,
                          state_timeout=args.state_timeout,
+                         grip_q_min=args.grip_qmin_rad,
+                         grip_q_max=args.grip_qmax_rad,
+                         grip_open_cm=args.grip_open_cm,
                          dry_run=args.dry_run and not args.sim,
                          velocity=(args.vx, args.vy, args.wz))
 
@@ -541,6 +611,27 @@ def main(argv=None) -> int:
     for arm in (LEFT, RIGHT):
         if arm not in arms and targets.get(arm) is None:
             ctrl.hold(arm)
+
+    # 启动时的夹爪目标（--grip 两侧同值；--grip-right/left 覆盖对应侧）
+    def _to_rad(v):
+        if v is None:
+            return None
+        if args.grip_unit == "pct":
+            return ctrl.grip_pct_to_rad(v)
+        if args.grip_unit == "cm":
+            return ctrl.grip_cm_to_rad(v)
+        return float(v)
+
+    if args.grip is not None or args.grip_right is not None or args.grip_left is not None:
+        base = args.grip
+        try:
+            ctrl.set_gripper(right=_to_rad(args.grip_right if args.grip_right is not None else base),
+                             left=_to_rad(args.grip_left if args.grip_left is not None else base),
+                             source=f"启动参数 --grip-unit {args.grip_unit}")
+        except Exception as exc:
+            log.warning("启动夹爪目标被拒: %s", exc)
+    log.info("夹爪标定: q %.3f~%.4f rad（输出侧）; 实测内壁全开 %.1fcm -> 显示用 %% / cm 换算",
+             ctrl.grip_q_min, ctrl.grip_q_max, ctrl.grip_open_cm)
 
     log.info("%s", ctrl.describe())
     if hasattr(ik, "backend"):
@@ -645,10 +736,13 @@ def main(argv=None) -> int:
             # 打印
             if flags["force_print"] or (print_every > 0 and ctrl.cycle % print_every == 0):
                 flags["force_print"] = False
+                extra = " ".join(t for t in (
+                    grip_line(ctrl),
+                    " [已冻结]" if flags["frozen"] else "") if t)
                 for arm in flags["arms"]:
                     print(format_step(info, arm, flags["print_joints"],
                                       arrive="" if arrival is None else arrival.line(arm))
-                          + (" [已冻结]" if flags["frozen"] else ""))
+                          + ((" " + extra) if extra else ""))
                 sys.stdout.flush()
 
             # 到位 / 离开 / 超时事件（每条目标最多各报一次，不会刷屏）
@@ -657,10 +751,14 @@ def main(argv=None) -> int:
                     print("  " + format_event(ev))
                 sys.stdout.flush()
 
-            # --on-arrive：所有受控臂都到位后才执行
-            if (arrival is not None and args.on_arrive != "none"
-                    and any(ev.kind == "arrived" for ev in arrive_events)
-                    and arrival.all_arrived(flags["arms"])):
+            # 到位后的动作（所有受控臂都到位）：--grip-on-arrive / --on-arrive
+            all_arrived_now = (arrival is not None
+                               and any(ev.kind == "arrived" for ev in arrive_events)
+                               and arrival.all_arrived(flags["arms"]))
+            if all_arrived_now and args.grip_on_arrive is not None:
+                apply_grip_percent(ctrl, args.grip_on_arrive, args.grip_on_arrive,
+                                   source=f"到位后 --grip-on-arrive {args.grip_on_arrive:g}%")
+            if all_arrived_now and args.on_arrive != "none":
                 if args.on_arrive == "exit":
                     log.info("已到位（--on-arrive exit）-> 退出")
                     break

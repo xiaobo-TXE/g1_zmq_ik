@@ -13,6 +13,8 @@
     {"rpy":   [0.0, 0.0, 0.0]}              # 可选；不给就保持当前锁定的末端朝向
     {"arm":   "right"}                      # 可选: right/left/both；默认用启动时的 --arm
     {"pos_left": [...], "pos_right": [...]}# 可选：一次给两条手臂（优先于 pos/arm）
+    {"grip": 0}                             # 可选：夹爪开合百分比 0=闭 100=全开（也可 {"right":0}）
+    {"grip_rad": {"right": 0.0}}            # 可选：直接给夹爪弧度（输出侧量纲，跳过百分比换算）
     {"timestamp": 1788514855.53}            # 可选，只用于诊断乱序
 
 示例（发送端）：
@@ -42,6 +44,45 @@ def _vec3(value, name: str) -> Optional[np.ndarray]:
     if not np.isfinite(arr).all():
         raise ValueError(f"{name} 含 NaN/Inf")
     return arr
+
+
+def _sides(value, name: str) -> Optional[Dict[str, float]]:
+    """解析"可给单侧或两侧"的数值字段。
+
+    接受三种写法（NaN/inf 会被拒）::
+
+        "grip": 0                # 标量 -> 两侧同值
+        "grip": {"right": 0}     # 只给一侧 -> 另一侧不动（机器人侧 latch）
+        "grip": {"right": 0, "left": 100}
+
+    返回 {"right": float, ...}；未给该字段返回 None。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip()):
+        try:
+            v = float(value)
+        except Exception:
+            raise ValueError(f"{name} 不是数字: {value!r}")
+        if not np.isfinite(v):
+            raise ValueError(f"{name} 含 NaN/Inf")
+        return {"right": v, "left": v}
+    if isinstance(value, dict):
+        out: Dict[str, float] = {}
+        for side in ("right", "left"):
+            if value.get(side) is None:
+                continue
+            try:
+                v = float(value[side])
+            except Exception:
+                raise ValueError(f"{name}.{side} 不是数字: {value[side]!r}")
+            if not np.isfinite(v):
+                raise ValueError(f"{name}.{side} 含 NaN/Inf")
+            out[side] = v
+        if not out:
+            raise ValueError(f"{name} 里没有 right/left")
+        return out
+    raise ValueError(f"{name} 需要数字或 {{right/left: 数字}}，收到 {type(value).__name__}")
 
 
 class TargetReceiver:
@@ -84,8 +125,9 @@ class TargetReceiver:
         pkt = json.loads(payload)
         if not isinstance(pkt, dict):
             raise ValueError("帧必须是 JSON 对象")
-        out = {"arm": None, "pos": None, "rpy": None, "delta": None,
-               "per_arm": {}, "timestamp": None, "raw_size": len(payload)}
+        out = {"arm": None, "pos": None, "rpy": None, "delta": None, "per_arm": {},
+               "grip": None, "grip_rad": None,
+               "timestamp": None, "raw_size": len(payload)}
         arm = pkt.get("arm")
         if arm is not None:
             arm = str(arm).lower()
@@ -99,8 +141,17 @@ class TargetReceiver:
             v = _vec3(pkt.get(f"pos_{side}"), f"pos_{side}")
             if v is not None:
                 out["per_arm"][side] = v
-        if out["pos"] is None and out["delta"] is None and not out["per_arm"]:
-            raise ValueError("帧里需要 pos / delta / pos_left / pos_right 之一")
+        # 可选夹爪字段：grip = 开合百分比(0=闭,100=全开)；grip_rad = 直接给弧度(输出侧量纲)
+        # 夹爪部分的错误只丢弃夹爪更新（warn），手臂目标照旧 —— 与上游 6002 的失败隔离一致
+        try:
+            out["grip"] = _sides(pkt.get("grip"), "grip")
+            out["grip_rad"] = _sides(pkt.get("grip_rad"), "grip_rad")
+        except Exception as exc:
+            logger.warning("夹爪字段被忽略: %s（原始前 120 字节: %r）", exc, payload[:120])
+            out["grip"] = out["grip_rad"] = None
+        if (out["pos"] is None and out["delta"] is None and not out["per_arm"]
+                and out["grip"] is None and out["grip_rad"] is None):
+            raise ValueError("帧里需要 pos / delta / pos_left / pos_right / grip / grip_rad 之一")
         ts = pkt.get("timestamp")
         if ts is not None:
             try:

@@ -110,10 +110,11 @@ class SimulatedCommandSink:
         self.dropped = 0
         self.last_payload: Optional[str] = None
 
-    def send(self, q14, axes=None, dry_run: bool = False):
+    def send(self, q14, axes=None, dry_run: bool = False, gripper=None):
         payload = None
         if self.formatter is not None:
-            payload = self.formatter.build_frame(q14, axes)   # 协议校验（不合法会抛异常）
+            # 协议校验（不合法会抛异常）；夹爪块只做格式检查，仿真手臂不建模夹爪
+            payload = self.formatter.build_frame(q14, axes, gripper=gripper)
             self.last_payload = payload
         self.state.command(q14)
         self.sent += 1

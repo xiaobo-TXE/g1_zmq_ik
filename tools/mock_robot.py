@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import threading
+from typing import Optional
 import time
 
 import numpy as np
@@ -60,6 +61,10 @@ class MockRobot:
         self.reject_count = 0
         self.last_ts = None
         self.last_q = np.zeros(N_ARM)
+        # 最近一次收到的夹爪目标（6002 action 帧里的可选 gripper 块）
+        self.last_grip: Optional[dict] = None
+        self.grip_frames = 0
+        self._pending_grip: Optional[dict] = None
         self.lock = threading.Lock()
 
     # ---------------- 6001 PUB ----------------
@@ -140,6 +145,32 @@ class MockRobot:
             q[slot] = v
         if count != N_ARM:
             return False, f"expected 14 arm joints (got {count})", None
+
+        # 可选夹爪块（上游契约）：只读 q；kp/kd/mode 会被真机忽略并 warn；
+        # 夹爪部分非法只降级为"本帧不更新夹爪"，**不影响手臂**。
+        block = action.get("gripper")
+        if isinstance(block, dict):
+            grip = {}
+            for side in ("right", "left"):
+                node = block.get(side)
+                if not isinstance(node, dict):
+                    continue
+                if any(k in node for k in ("kp", "kd", "mode")):
+                    print("[mock] 注意：帧里的 kp/kd/mode 会被真机忽略并打 warn")
+                if "q" not in node:
+                    print(f"[mock] gripper.{side} 缺 q -> 本帧不更新该侧")
+                    continue
+                try:
+                    v = float(node["q"])
+                except Exception:
+                    print(f"[mock] gripper.{side}.q 不是数字 -> 本帧不更新该侧")
+                    continue
+                if not np.isfinite(v):
+                    print(f"[mock] gripper.{side}.q 非有限值 -> 本帧不更新该侧")
+                    continue
+                grip[side] = v
+            if grip:
+                self._pending_grip = grip
         return True, "", q
 
     def cmd_loop(self, ctx) -> None:
@@ -165,6 +196,13 @@ class MockRobot:
             with self.lock:
                 self.last_q = q
                 self.arm.command(q)
+            new_grip = getattr(self, "_pending_grip", None)
+            if new_grip and new_grip != self.last_grip:
+                self.last_grip = dict(new_grip)
+                self.grip_frames += 1
+                desc = "  ".join(f"{k} q={v:.4f}rad" for k, v in new_grip.items())
+                print(f"[mock] 夹爪目标 -> {desc}"
+                      f"（真机会 clamp 到标定量程并 latch，以 100Hz 重发）")
             if self.recv_count == 1:
                 print("[mock] 收到第一帧有效指令 ✓ （真机上此时手臂会开始跟随）")
             elif self.recv_count % 100 == 0:

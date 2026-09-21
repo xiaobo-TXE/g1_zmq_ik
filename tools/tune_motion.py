@@ -38,11 +38,15 @@ from joint_map import ARM_SLICE, WAIST_SLICE    # noqa: E402
 from sim_arm import SimulatedArmState           # noqa: E402
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_URDF = os.path.join(HERE, "assets", "g1", "g1_body29_hand14.urdf")
+# 与 main.py 的默认保持一致：G1-29DoF + Dex1 夹爪（末端点 = 抓取中心 0.152m）
+DEFAULT_URDF = os.path.join(HERE, "assets", "g1", "g1_29dof_mode_15_with_dex1_1.urdf")
+DEFAULT_EE_OFFSET = 0.152
 
 
 class NullPublisher:
-    def send(self, q14, axes=None, dry_run=False):
+    # 注意：controller.step() 现在会带 gripper=…（6002 帧里的可选夹爪块），
+    # 这里必须接受该参数，否则本工具在换模型后会直接 TypeError。
+    def send(self, q14, axes=None, dry_run=False, gripper=None):
         return None
 
     def stats(self):
@@ -164,7 +168,7 @@ def main() -> int:
     jerks = [0.0, 2.0, 5.0, 10.0] if not args.quick else [0.0, 5.0]
     kinds = ["ideal", "servo"] if args.kind == "both" else [args.kind]
 
-    model = G1ArmModel(args.urdf, 0.05, cache_dir=HERE)
+    model = G1ArmModel(args.urdf, DEFAULT_EE_OFFSET, cache_dir=HERE)
     print(f"URDF={os.path.basename(args.urdf)}  移动距离={args.dist*1000:.0f}mm  "
           f"控制周期={20}ms  执行对象={kinds}")
     print(f"\n{'执行':<6}{'速度':>7}{'加速度':>8}{'jerk限':>8}{'峰值jerk':>10}{'RMSjerk':>9}"

@@ -64,9 +64,11 @@ class FakeState:
 class FakePub:
     def __init__(self):
         self.sent = []
+        self.gripper = None          # 最近一帧里的可选夹爪块（未下发过目标时应为 None）
 
-    def send(self, q14, axes=None, dry_run: bool = False):
+    def send(self, q14, axes=None, dry_run: bool = False, gripper=None):
         self.sent.append(np.asarray(q14, dtype=float).copy())
+        self.gripper = gripper
         return "{}"
 
     def stats(self) -> str:
