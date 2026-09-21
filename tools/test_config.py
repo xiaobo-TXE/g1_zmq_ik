@@ -211,9 +211,13 @@ def main_check() -> int:
           f"grasp={d2.marker_to_grasp}")
     example = Path(__file__).resolve().parent.parent / "robot.example.json"
     d3 = det.parse_args(["--config", str(example)])
-    check("仓库示例配置里的 aruco 段可直接用（抓腰部 -9cm + 水平进/左右开合）",
+    # 对准值会随标签在盒顶的贴法变化（四选一），所以这里断言**不变量**而不是某个具体值：
+    # roll/pitch 必须为 0（保持 z 朝上），yaw 必须是 90° 的整数倍（水平面内四选一）
+    _align = tuple(round(float(v), 4) for v in d3.grasp_align_rpy)
+    check("仓库示例配置里的 aruco 段可直接用（抓腰部 -9cm；对准值是四选一之一）",
           tuple(d3.marker_to_grasp) == (0.0, 0.0, -0.09) and d3.config_ignored == []
-          and tuple(round(v, 4) for v in d3.grasp_align_rpy) == (0.0, 0.0, -1.5708)
+          and _align[0] == 0.0 and _align[1] == 0.0
+          and _align[2] in (0.0, 1.5708, -1.5708, 3.1416)
           and d3.target_endpoint == "tcp://127.0.0.1:6003",
           f"grasp={d3.marker_to_grasp} ignored={d3.config_ignored}")
 

@@ -396,12 +396,16 @@ y（开合方向）横跨盒子的 3cm 那一维；不对就调 `--grasp-align-r
 **实测例子**（LIVOX 盒子立着、18cm 高、3cm 窄面朝机器人、标签平贴顶面；要"水平进入 + 手指左右开合 + 抓腰部"）：
 
 ```bash
-python tools/detect_aruco_zmq.py --no-send --marker-to-grasp 0 0 -0.09 --grasp-align-rpy 0 0 -1.5708
+python tools/detect_aruco_zmq.py --no-send --marker-to-grasp 0 0 -0.09 --grasp-align-rpy 0 0 0
 # 判定标准（打印出来的 axes(ee/torso)）：
 #   x ≈ (+1, 0, 0)  水平向前（从机器人朝盒子探入）   ← 探入方向
 #   y ≈ (0, ±1, 0)  左右                            ← 手指开合，跨盒子的 3cm 窄边
 #   z ≈ (0, 0, +1)  朝上
-# 若 x/y 恰好互换（说明标签在盒顶是转 90° 贴的）→ 改成 --grasp-align-rpy 0 0 0（或 0 0 3.1416）
+#
+# --grasp-align-rpy 只取决于标签在盒顶的**面内旋转**，盒子/标签转 90° 就要换一支。
+# 四选一：看打印的 marker 轴哪个在 torso +x（前方）上分量最大（取正的）：
+#   +marker.x → 0 0 0        −marker.x → 0 0 3.1416
+#   +marker.y → 0 0 1.5708   −marker.y → 0 0 -1.5708
 ```
 这组值已写进 `robot.example.json` 的 `aruco` 段（`marker_to_grasp` / `grasp_align_rpy`）。
 
