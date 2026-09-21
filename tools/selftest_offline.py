@@ -103,7 +103,7 @@ def main() -> int:
         T_got = model.fk_pelvis(q_arm, waist)[i]
         max_err = max(max_err, float(np.abs(T_true - T_got).max()))
     print(f"\n[1] 腰部坐标换算校验（实测腰角 -> pelvis 系 FK）: 最大逐元素误差 = {max_err:.2e} "
-          f"{'✓' if max_err < 1e-9 else '✗ 检查 fk_pelvis/pelvis_to_locked'}")
+          f"{'✓' if max_err < 1e-9 else '✗ 检查 fk_pelvis/torso_in_pelvis'}")
 
     # 1b) 正解一致性：CasADi 符号正解（宇树同款，与 IK 同源）vs Pinocchio 数值正解
     print("\n[1b] 正解一致性（CasADi 符号 FK vs Pinocchio 数值 FK）")

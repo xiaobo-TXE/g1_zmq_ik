@@ -23,9 +23,10 @@ G1 双臂：**给一个目标位置 → ZMQ 读当前关节角 → 正解出当�
  ③ 正解 FK(q_meas)  ─────────────▶  当前末端位姿（日志里的 meas=）
       │   与反解共用同一个 CasADi 符号模型（内置正解，或 pinocchio.casadi）
       ▼
- ④ 目标换算：目标系 ──▶ 求解坐标系（locked 系）
-      │   torso 系（默认）：常量平移 C = torso 原点相对 pelvis 44.18mm，**与腰角无关**
-      │   pelvis 系       ：用实测腰角做刚体换算（含腰角旋转）
+ ④ 目标换算：目标系 ──▶ 求解坐标系
+      │   **求解系就是 torso_link 系**（正解/反解的基座直接搬到了躯干）
+      │   torso 系（默认）：**无需换算**（目标位姿直接就是求解系的位姿）
+      │   pelvis 系       ：T_torso = P(腰角)⁻¹ @ T_pelvis（P = torso_link 在 pelvis 里的位姿）
       ▼
  ⑤ 反解 IK：CasADi Opti + IPOPT
       │   变量 = 14 个手臂关节角；硬约束 = URDF 关节限位
@@ -673,17 +674,21 @@ go            # 张开/释放（两侧 100%）
 | 坐标系 | 定义 | 什么时候用 |
 |---|---|---|
 | **`torso_link` 系（默认）** | 躯干 link 的坐标系 —— **手臂就挂在它上面**（`left/right_shoulder_pitch_joint` 的 parent 是 `torso_link`） | `--target-frame torso`（默认）。**腰怎么转都不影响手臂解算**：目标是"相对躯干的位置"，Tag 检测/抓取通常就是这种语义 |
-| **`pelvis` 系** | URDF 根 link `pelvis`（**骨盆**）；x 前、y 左、z 上；pinocchio 的世界系与它重合 | `--target-frame pelvis`（旧行为）。腰角参与换算：同一个骨盆系目标，腰一转就需要不同的手臂构型 |
+| **`pelvis` 系** | URDF 根 link `pelvis`（**骨盆**）；x 前、y 左、z 上 | `--target-frame pelvis`（旧行为）。腰角参与换算：同一个骨盆系目标，腰一转就需要不同的手臂构型 |
 
-两个系之间只差一个**常量**（实测自 URDF）：
+**正解/反解的基座直接就是 `torso_link`**：模型构造时把 pinocchio 的 reduced 模型（原本基座是
+URDF 根 link `pelvis`）整体搬到躯干 —— 把「挂在 universe 上的关节/frame」统一左乘 `inv(C)`，
+`C = FK(全身=0) 时 torso_link 的位姿 = 平移 (-3.964, 0, +44.000) mm，姿态 = 单位阵`。
+于是 `fk(q)` 返回的就是躯干系位姿，IK 的目标位姿也直接是躯干系，**中间不再有"腰=0 的 pelvis 系"**。
 
 ```
-C = FK(腰=0) 时 torso_link 的位姿 = 平移 (-3.964, 0, +44.000) mm，姿态 = 单位阵
-torso 系目标  ──▶ 求解系：T_locked = C @ T_torso            （与腰角无关）
-pelvis 系目标 ──▶ 求解系：T_locked = A0 @ inv(A) @ T_pelvis  （A = FK_full(腰=实测值) 的手臂链根帧）
+torso 系目标  ──▶ 求解系：**不做换算**（求解系 = torso_link 系，与腰角无关）
+pelvis 系目标 ──▶ 求解系：T_torso = P(腰角)⁻¹ @ T_pelvis
+                          P = torso_link 在 pelvis 里的位姿（腰=0 时就是上面的常量 C）
 ```
 
-`--check` 会把这两个数打印出来核对；`tools/test_target_frame.py` 专门验证这套语义（13 项）。
+自检：`model.verify_torso_base()` 检查「reduced 模型的基座与 torso_link 重合」；
+`--check` 会把 C 打印出来核对；`tools/test_target_frame.py` 专门验证这套语义（20 项）。
 
 **要点**：`pos` 目标、日志里的 `tgt=`/`meas=`、`track_err`、到位判定**全都用同一个目标系**，所以两组数字可以直接相减对比。`--waist state|zero` 只在 `--target-frame pelvis` 下有意义。
 
@@ -923,7 +928,8 @@ g1_zmq_ik/
 │   ├── test_target_io.py   6003 字段解析单测（动作型帧、失败隔离，24 项检查）
 │   ├── test_config.py      --config 单测（类型转换/命令行优先/坏输入，23 项检查）
 │   ├── tune_motion.py      速度/加速度标定工具（扫描网格，量化平滑度）
-│   └── selftest_offline.py 离线检查脚本：正解一致性 / 反解精度 / 轨迹跟踪└── docs/                   源码逐行对照、ZMQ 协议详解、实测数据
+│   ├── selftest_offline.py 离线检查脚本：正解一致性 / 反解精度 / 轨迹跟踪
+└── docs/                   源码逐行对照、ZMQ 协议详解、实测数据
 ```
 
 更多细节见 [`docs/对照宇树源码.md`](docs/对照宇树源码.md)（与 xr_teleoperate 的逐行对照）

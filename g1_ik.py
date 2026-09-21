@@ -88,8 +88,8 @@ def end_effector_joint_names(model) -> List[str]:
     return [n for n in locked_joint_names(model)
             if any(k in n.lower() for k in HAND_KEYWORDS)]
 
-# 手臂链在 pelvis 之后的“根参考帧”所挂的关节：用它定义 腰部->手臂 的变换 A
-ARM_CHAIN_ROOT_JOINT = "left_shoulder_pitch_joint"
+# 注：基座搬迁（_rebase_to_torso）之后，reduced 模型不再需要"手臂链根参考帧"来定义
+# 腰部换算 —— 换算直接是 pelvis <-> torso_link 的刚体变换（见 torso_in_pelvis）。
 
 
 # ---------------------------------------------------------------------------
@@ -148,14 +148,20 @@ class G1ArmModel:
       要锁哪些关节由 locked_joint_names() 从 URDF 推导，不写死名字（见 README §3.1）。
 
     坐标系约定（非常重要）：
-      "locked 坐标系" = reduced 模型的基座，等价于「腰关节全部为 0 时的 pelvis 系」。
-      "pelvis 坐标系" = URDF 根 link(pelvis)，即机器人本体坐标系；x 前, y 左, z 上。
+      **reduced 模型（也就是正解/反解）的基座就是 torso_link（躯干系）**：x 前, y 左, z 上。
+      `fk(q)` 直接返回末端在 torso 系下的位姿，IK 的目标位姿也直接是 torso 系 —— 中间
+      不再有"腰=0 的 pelvis 系"这种中间系。
 
-      实测腰角不为 0 时，两者的关系是纯刚体变换（已数值验证，误差 ~1e-16）：
-          A  = FK_full(腰=实测值) 中 ARM_CHAIN_ROOT_JOINT 的位姿
-          A0 = FK_full(腰=0)      中同一个关节的位姿（常量）
-          正解:  T_pelvis = A @ inv(A0) @ T_locked
-          反解:  T_locked = A0 @ inv(A) @ T_pelvis
+      实现：pinocchio 的 buildReducedModel 得到的模型基座是 URDF 根 link(pelvis)，
+      而手臂链挂在 torso_link 上。构造时把「挂在 universe 上的元素」统一左乘 inv(C_torso)
+      （C_torso = FK(全身=0) 里 torso_link 的位姿，见 _rebase_to_torso），
+      于是 universe 就等价于 torso_link —— 之后所有正解/雅可比天然都是躯干系的。
+
+      因为手臂链挂在 torso_link 上，**腰角完全不参与"末端相对躯干"的几何**
+      （已数值验证：腰从 0 变到任意值，torso 系下的末端位姿不变，误差 ~1e-16）。
+
+      pelvis 系（URDF 根 link，机器人本体坐标系）只是**可选**的另一种表达，
+      用 torso_in_pelvis(实测腰角) 换算；默认的目标系就是 torso 系。
     """
 
     def __init__(self, urdf_path: str, ee_offset: float = 0.05,
@@ -178,25 +184,23 @@ class G1ArmModel:
         if self.model.nq != N_ARM:
             raise RuntimeError(f"缩链后自由度 {self.model.nq} != {N_ARM}，URDF 与 G1-29 不匹配")
 
-        self.data = self.model.createData()
+        # full_data 要先建：下面算 C_torso 要用全模型正解
         self.full_data = self.full_model.createData()
+
+        # ---- 把 reduced 模型的基座从 pelvis 搬到 torso_link（正解/反解直接用躯干系）----
+        self._waist_names = ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint")
+        # C_torso = FK(全身关节=0) 里 torso_link 的位姿（相对 pelvis）
+        #         实测是纯平移 (-3.9635, 0, +44.0) mm，姿态 = I
+        self.torso_frame_id = self.full_model.getFrameId("torso_link")
+        self.C_torso = self._fk_full_frame(pin.neutral(self.full_model),
+                                           self.torso_frame_id, is_joint=False)
+        self._rebase_to_torso(self.model, self.C_torso)
+        self.C_torso_inv = np.linalg.inv(self.C_torso)
+
+        self.data = self.model.createData()
 
         self.L_ee_id = self.model.getFrameId("L_ee")
         self.R_ee_id = self.model.getFrameId("R_ee")
-
-        # 腰部投影用：手臂链根参考帧（腰之后）
-        self._waist_names = ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint")
-        self.root_joint_id = self.full_model.getJointId(ARM_CHAIN_ROOT_JOINT)
-        self.A0 = self._fk_full_frame(pin.neutral(self.full_model), self.root_joint_id)
-
-        # torso 系（躯干）与 locked 系（腰=0 的 pelvis 系）之间只差一个**常量**：
-        #   C = FK(腰=0) 里 torso_link 的位姿（实测量级：平移 (-3.96, 0, +44.0) mm，姿态 = I）
-        # 因为手臂链挂在 torso_link 上，"目标相对躯干"时腰角完全不参与手臂几何：
-        #   T_locked = C @ T_torso        （torso_to_locked）
-        #   T_torso  = inv(C) @ T_locked  （locked_to_torso）
-        torso_fid = self.full_model.getFrameId("torso_link")
-        self.C_torso = self._fk_full_frame(pin.neutral(self.full_model), torso_fid, is_joint=False)
-        self.C_torso_inv = np.linalg.inv(self.C_torso)
 
         # 关节限位（URDF）
         self.q_lower = np.array(self.model.lowerPositionLimit, dtype=float).copy()
@@ -246,9 +250,53 @@ class G1ArmModel:
             logger.warning("写模型缓存失败: %s", exc)
         return model
 
-    # ---------------- 正解 ----------------
+    # ---------------- 基座搬迁：pelvis -> torso_link ----------------
+    @staticmethod
+    def _rebase_to_torso(model: pin.Model, C_torso: np.ndarray) -> None:
+        """就地（in-place）把 model 的基座从 pelvis 换成 torso_link。
+
+        pinocchio 里 ``oMi[j] = oMi[parents[j]] * jointPlacements[j] * M(q)``，
+        基座(universe)满足 ``oMi[0] = I``。挂在外面的东西有两类：
+
+          * 根关节（``parents[j] == 0``，本模型是左右 shoulder_pitch）
+          * 直接挂在 universe 上的 frame（``frames[k].parentJoint == 0``：
+            pelvis / torso_link / 腿 / 头 / d435 这些被锁住的部分都退化成这类固定 frame）
+
+        把它们的 placement 统一左乘 ``inv(C_torso)``，等价于把 universe 从 pelvis
+        平移到 torso_link，于是之后 ``forwardKinematics`` / 雅可比给出的全部是躯干系的量。
+
+        自检：搬完之后 ``frames[torso_link].placement`` 应当等于单位阵（见 verify_torso_base()）。
+        """
+        Ci = np.linalg.inv(np.asarray(C_torso, dtype=float))
+        for j in range(1, model.njoints):
+            if model.parents[j] == 0:
+                model.jointPlacements[j] = pin.SE3(
+                    Ci @ model.jointPlacements[j].homogeneous)
+        for k in range(model.nframes):
+            frame = model.frames[k]
+            if frame.parentJoint == 0 and frame.name != "universe":
+                frame.placement = pin.SE3(Ci @ frame.placement.homogeneous)
+
+    def verify_torso_base(self, tol: float = 1e-12) -> dict:
+        """自检：reduced 模型的基座确实就是 torso_link。
+
+        * ``frames[torso_link].placement`` 应为单位阵（基座与躯干重合）
+        * ``FK_full(腰=0) 里 torso_link`` 与 reduced 模型的基座应重合
+        * 左右肩关节相对基座的位姿应等于 URDF 里 torso_link 到该关节的固定变换
+        """
+        pin.forwardKinematics(self.model, self.data, pin.neutral(self.model))
+        pin.updateFramePlacements(self.model, self.data)
+        T_base_torso = self.data.oMf[self.model.getFrameId("torso_link")].homogeneous
+        return {
+            "base_is_torso": float(np.abs(T_base_torso - np.eye(4)).max()),
+            "C_torso_translation_mm": (np.asarray(self.C_torso[:3, 3]) * 1000.0).tolist(),
+            "C_torso_rotation_err": float(np.abs(self.C_torso[:3, :3] - np.eye(3)).max()),
+            "ok": float(np.abs(T_base_torso - np.eye(4)).max()) < tol,
+        }
+
+    # ---------------- 正解（躯干系） ----------------
     def fk(self, q14: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
-        """正解（locked 坐标系）。返回 (T_L, T_R) 4x4。"""
+        """正解。返回 (T_L, T_R) 4x4 —— **都在 torso_link（躯干）系下**。"""
         q = np.asarray(q14, dtype=float).reshape(self.model.nq)
         pin.forwardKinematics(self.model, self.data, q)
         pin.updateFramePlacements(self.model, self.data)
@@ -264,41 +312,32 @@ class G1ArmModel:
                if is_joint else frame_or_joint_id)
         return self.full_data.oMf[fid].homogeneous.copy()
 
-    def waist_transform(self, q_waist3: Optional[Sequence[float]]) -> np.ndarray:
-        """实测腰角 -> A（4x4）。q_waist3 为 None/全 0 时返回 A0。"""
+    def torso_in_pelvis(self, q_waist3: Optional[Sequence[float]] = None) -> np.ndarray:
+        """torso_link 在 pelvis 系里的位姿 P(w)（4x4）。
+
+        q_waist3 为 None 时按腰=0，此时就是常量 C_torso（姿态=I，平移 (-3.9635,0,44)mm）。
+        """
         if q_waist3 is None:
-            return self.A0.copy()
+            return self.C_torso.copy()
         q_full = pin.neutral(self.full_model)
         # 按关节名写腰角（不按索引）：所有 G1 变体里腰都是 12..14，但这里不再依赖布局顺序
         for name, v in zip(self._waist_names, np.asarray(q_waist3, dtype=float).reshape(3)):
             j = self.full_model.joints[self.full_model.getJointId(name)]
             q_full[j.idx_q] = float(v)
-        return self._fk_full_frame(q_full, self.root_joint_id)
+        return self._fk_full_frame(q_full, self.torso_frame_id, is_joint=False)
 
     def fk_pelvis(self, q14: Sequence[float],
                   q_waist3: Optional[Sequence[float]] = None) -> Tuple[np.ndarray, np.ndarray]:
-        """正解到 pelvis 坐标系（用实测腰角修正）。"""
-        A = self.waist_transform(q_waist3)
-        T = A @ np.linalg.inv(self.A0)
+        """正解到 pelvis 系（用实测腰角换算）：T_pelvis = P(w) @ T_torso。"""
+        P = self.torso_in_pelvis(q_waist3)
         T_L, T_R = self.fk(q14)
-        return T @ T_L, T @ T_R
+        return P @ T_L, P @ T_R
 
-    def pelvis_to_locked(self, T_pelvis: np.ndarray,
-                         q_waist3: Optional[Sequence[float]] = None) -> np.ndarray:
-        """把 pelvis 系下的目标位姿换算到 locked 坐标系（IK 求解用）。"""
-        if q_waist3 is None:
-            return np.asarray(T_pelvis, dtype=float).copy()
-        A = self.waist_transform(q_waist3)
-        return self.A0 @ np.linalg.inv(A) @ np.asarray(T_pelvis, dtype=float)
-
-    # ---------------- torso 系（躯干） <-> locked 系 ----------------
-    def torso_to_locked(self, T_torso: np.ndarray) -> np.ndarray:
-        """torso_link 系下的目标位姿 -> locked 系（IK 求解用）。常量变换，与腰角无关。"""
-        return self.C_torso @ np.asarray(T_torso, dtype=float)
-
-    def locked_to_torso(self, T_locked: np.ndarray) -> np.ndarray:
-        """locked 系下的位姿 -> torso_link 系（诊断/日志用）。常量变换，与腰角无关。"""
-        return self.C_torso_inv @ np.asarray(T_locked, dtype=float)
+    def pelvis_to_torso(self, T_pelvis: np.ndarray,
+                        q_waist3: Optional[Sequence[float]] = None) -> np.ndarray:
+        """把 pelvis 系下的目标位姿换算到 torso 系（IK 求解系）。"""
+        P = self.torso_in_pelvis(q_waist3)
+        return np.linalg.inv(P) @ np.asarray(T_pelvis, dtype=float)
 
     def torso_offset_mm(self) -> float:
         """torso 原点相对 pelvis 原点的距离（mm），仅用于日志核对。"""

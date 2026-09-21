@@ -5,12 +5,16 @@
     RobotStateSubscriber(6001)                       ArmCommandPublisher(6002)
             │ q29/dq/tau/imu                                  ▲ 14 关节角 + 摇杆轴
             ▼                                                 │
-      q14_meas / q_waist3 ──▶ FK ──▶ 当前末端位姿(pelvis 系)   │
+      q14_meas / q_waist3 ──▶ FK ──▶ 当前末端位姿(torso 系)    │
             │                                                 │
             ▼                                                 │
-      目标(pelvis 系) ──▶ 换算到 locked 系 ──▶ IK ──▶ q14_cmd ─┘
+      目标(torso 系) ──▶ IK（求解系就是 torso 系）──▶ q14_cmd ─┘
                                           │
                               平滑滤波 ──▶ 冻结非受控臂 ──▶ 限速 ──▶ 限位裁剪
+
+坐标系：**正解/反解的基座就是 torso_link（躯干系）**，`--target-frame torso`（默认）下
+目标位姿直接就是求解系的位姿，不做任何换算；`--target-frame pelvis` 时才用实测腰角把
+pelvis 系目标换算到躯干系（`T_torso = P(腰角)⁻¹ @ T_pelvis`）。腰角不进入躯干系几何。
 
 安全设计（上真机前请先读 README §6）：
   * 状态超时（默认 0.25s 收不到 6001 帧）→ 不下发新指令。机器人侧 VLA 指令超时后
@@ -70,7 +74,7 @@ class StepInfo:
     ee_accel_m_s2: float = 0.0        # 本周期实测末端加速度
     ee_speed_mm_s: float = 0.0        # 上一帧指令位姿 -> 本帧，末端实际移动速度
     ee_rot_speed_dps: float = 0.0
-    waist_bias_mm: float = 0.0     # 仅 target_frame=pelvis 且 --waist zero：真实 pelvis 系与 locked 系的偏差
+    waist_bias_mm: float = 0.0     # 仅 target_frame=pelvis 且 --waist zero：真实腰角与"按腰=0"的换算偏差
     ik_status: str = ""
     target_rev: Dict[str, int] = field(default_factory=dict)   # 目标变更计数（到位判定用）
     controlled: str = ""           # 本帧实际驱动哪条臂：left/right/both（到位判定用）
@@ -410,21 +414,23 @@ class ArmController:
                            use_true_waist: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """给定手臂关节角，返回【目标系】下的两个末端位姿。
 
-        target_frame="torso" ：T = inv(C) @ FK_locked(q) —— **与腰角无关**
-                               （手臂挂在 torso_link 上，腰怎么动都不影响手臂相对躯干的位姿）
-        target_frame="pelvis"：T = FK_pelvis(q, 腰角)   —— 用实测腰角换算
+        target_frame="torso" ：T = FK(q) —— 正解/反解的基座**就是 torso_link**，直接可用，
+                              且**与腰角无关**（手臂挂在 torso_link 上，腰怎么动都不影响
+                              手臂相对躯干的位姿）
+        target_frame="pelvis"：T = P(腰角) @ FK(q) —— 用实测腰角把躯干系结果搬到 pelvis 系
         """
+        T_L, T_R = self.model.fk(q14)
         if self.target_frame == "torso":
-            T_L, T_R = self.model.fk(q14)
-            return self.model.locked_to_torso(T_L), self.model.locked_to_torso(T_R)
+            return T_L, T_R
         waist = q_waist3 if (use_true_waist or q_waist3 is not None) else self.waist_for_kinematics()
-        return self.model.fk_pelvis(q14, waist)
+        P = self.model.torso_in_pelvis(waist)
+        return P @ T_L, P @ T_R
 
-    def _target_to_locked(self, T_target: np.ndarray) -> np.ndarray:
-        """目标系的位姿 -> locked 系（IK 求解用）。"""
+    def _target_to_base(self, T_target: np.ndarray) -> np.ndarray:
+        """目标系的位姿 -> IK 求解系（= torso_link 系）。"""
         if self.target_frame == "torso":
-            return self.model.torso_to_locked(T_target)     # 常量变换，与腰角无关
-        return self.model.pelvis_to_locked(T_target, self.waist_for_kinematics())
+            return np.asarray(T_target, dtype=float)      # 已经是求解系，无需换算
+        return self.model.pelvis_to_torso(T_target, self.waist_for_kinematics())
 
     # ------------------------------------------------------------------ 辅助
     def waist_for_kinematics(self) -> Optional[np.ndarray]:
@@ -439,7 +445,7 @@ class ArmController:
         out = {}
         for arm, T_meas in ((LEFT, T_L_meas), (RIGHT, T_R_meas)):
             T = self.target[arm] if self.target[arm] is not None else T_meas
-            out[arm] = self._target_to_locked(T)
+            out[arm] = self._target_to_base(T)
         return out[LEFT], out[RIGHT]
 
     # ------------------------------------------------------------------ 末端速度限制
@@ -592,7 +598,7 @@ class ArmController:
                     # "还没有显式目标"，到位判定不会对启动时的保持位姿报"到位"
                     self.target[arm] = T.copy()
 
-        # 4) 目标 -> locked 系 -> IK（直接解真目标；速度限制在下面用雅可比钳制）
+        # 4) 目标 -> IK 求解系（= torso_link 系）-> IK；速度限制在下面用雅可比钳制
         T_L_tgt, T_R_tgt = self._ik_targets(T_L_meas, T_R_meas)
         t0 = time.perf_counter()
         q_raw = None
@@ -632,11 +638,11 @@ class ArmController:
                 delta = np.clip(delta, -self.max_step, self.max_step)
                 info.notes.append(f"关节限速 {int(np.sum(over))} 个")
         # 受控臂到目标的剩余距离（用于加速度限制的提前减速）：**按臂**给，不要跨臂取 min
-        T_prev_lk = self.model.fk(prev)
+        T_prev_base = self.model.fk(prev)
         dist: Dict[str, float] = {}
         dtheta: Dict[str, float] = {}
-        for arm, T_prev_arm, T_tgt_arm in ((LEFT, T_prev_lk[0], T_L_tgt),
-                                           (RIGHT, T_prev_lk[1], T_R_tgt)):
+        for arm, T_prev_arm, T_tgt_arm in ((LEFT, T_prev_base[0], T_L_tgt),
+                                           (RIGHT, T_prev_base[1], T_R_tgt)):
             if self.controlled not in (arm, "both"):
                 continue
             dist[arm] = float(np.linalg.norm(T_tgt_arm[:3, 3] - T_prev_arm[:3, 3]))
@@ -669,12 +675,11 @@ class ArmController:
             info.sent = True
 
         # 9) 诊断（全部在【目标系】里比较，与 target_frame 一致）
-        #    ik_err   : 目标系下比较"指令 FK"与"IK 目标"    -> 纯求解精度
-        #    track_err: 目标系下比较"实测 FK"与"目标"        -> 真实物理偏差（伺服滞后等）
-        #    注：target_frame="torso" 时目标相对躯干，腰角不进入这两个误差；
+        #    ik_err   : 求解系（torso）下比较"IK 原始解 FK"与"IK 目标" -> 纯求解精度
+        #    track_err: 目标系下比较"实测 FK"与"目标"                -> 真实物理偏差（伺服滞后等）
+        #    注：target_frame="torso" 时目标相对躯干，求解系与目标系同为 torso 系，腰角不进入误差；
         #        target_frame="pelvis" 时 track_err 还含腰部换算偏置（见 info.waist_bias_mm）
-        T_L_raw_lk, T_R_raw_lk = self.model.fk(q_raw)      # IK 原始解（未限幅）-> 纯求解质量
-        T_L_cmd_lk, T_R_cmd_lk = self.model.fk(q_send)
+        T_L_raw_base, T_R_raw_base = self.model.fk(q_raw)   # IK 原始解（未限幅）-> 纯求解质量
         T_L_cmd_tf, T_R_cmd_tf = self.ee_in_target_frame(q_send, waist_true, use_true_waist=True)
         info.ee_cmd = {LEFT: T_L_cmd_tf, RIGHT: T_R_cmd_tf}
         # 本周期指令末端实际移动速度（用于核对速度上限是否生效）
@@ -691,11 +696,11 @@ class ArmController:
                         info.ee_accel_m_s2 = max(info.ee_accel_m_s2, abs(v - prev_v) / dt)
                     self._prev_ee_speed[arm] = v
             self._prev_ee_cmd[arm] = np.array(T_now, copy=True)
-        for arm, T_raw_lk, T_tgt_lk, T_true in ((LEFT, T_L_raw_lk, T_L_tgt, T_L_true),
-                                               (RIGHT, T_R_raw_lk, T_R_tgt, T_R_true)):
+        for arm, T_raw_base, T_tgt_base, T_true in ((LEFT, T_L_raw_base, T_L_tgt, T_L_true),
+                                                    (RIGHT, T_R_raw_base, T_R_tgt, T_R_true)):
             T_tgt_frame = self.target[arm] if self.target[arm] is not None else T_true
             info.ee_target[arm] = T_tgt_frame
-            p, r, _ = pose_error(T_raw_lk, T_tgt_lk)
+            p, r, _ = pose_error(T_raw_base, T_tgt_base)
             info.err_ik_pos[arm], info.err_ik_rot[arm] = p, r
             p2, r2, _ = pose_error(T_true, T_tgt_frame)
             info.err_track_pos[arm], info.err_track_rot[arm] = p2, r2

@@ -546,11 +546,17 @@ def run_check(args) -> int:
         from g1_ik import end_effector_joint_names
         print(f"         末端变体: {', '.join(end_effector_joint_names(model.full_model)) or '无（裸腕）'}")
         print(f"         末端点(EE) = wrist_yaw + x{args.ee_offset:.3f}m  ← 所有目标位置指的都是这个点")
+        vb = model.verify_torso_base()
+        print(f"         求解系(正解/反解的基座) = torso_link（躯干系，x前 y左 z上）"
+              f"  {'✓' if vb['ok'] else '✗ 基座搬迁失败'}"
+              f"（frames[torso_link] 与单位阵最大差 {vb['base_is_torso']:.1e}）")
         print(f"         目标系 = {'torso_link（躯干系）' if args.target_frame == 'torso' else 'pelvis（骨盆系）'}"
+              f"{'（= 求解系，无需换算）' if args.target_frame == 'torso' else ''}"
               f"；torso 原点相对 pelvis = {model.torso_offset_mm():.2f}mm"
               f"（常量，与腰角无关）")
         T_L, T_R = model.fk(model.neutral())
-        print(f"         零位 FK: L_ee={np.round(T_L[:3, 3], 4)}  R_ee={np.round(T_R[:3, 3], 4)}")
+        print(f"         零位 FK（torso 系）: L_ee={np.round(T_L[:3, 3], 4)}  "
+              f"R_ee={np.round(T_R[:3, 3], 4)}")
         print("\n" + model.limits_table())
     except Exception as exc:
         print(f"  [FAIL] 模型加载失败: {exc}")
@@ -738,8 +744,9 @@ def main(argv=None) -> int:
     if hasattr(ik, "backend"):
         log.info("符号正解后端: %s", ik.backend)
     if args.target_frame == "torso":
-        log.info("目标系=torso_link（躯干系，x前 y左 z上，m）—— Tag 检测给的就是这个系；"
-                 "手臂挂在躯干上，**腰角不参与手臂解算**（--target-frame pelvis 可切回骨盆系）")
+        log.info("目标系=torso_link（躯干系，x前 y左 z上，m）= **正解/反解的求解系**，目标不做换算；"
+                 "Tag 检测给的就是这个系；手臂挂在躯干上，**腰角不参与手臂解算**"
+                 "（--target-frame pelvis 可切回骨盆系）")
     else:
         log.info("目标系=pelvis（骨盆系/URDF 根 link，x前 y左 z上，m）；腰参考=%s", args.waist)
     log.info("受控臂=%s；求解器=%s", args.arm, ik.name)

@@ -2,7 +2,7 @@
 """目标坐标系（torso_link / pelvis）语义自检 —— 不需要机器人。
 
 要证明的三件事：
-  ① torso 系与 locked 系之间只差一个**常量**变换（= FK(腰=0) 里 torso_link 的位姿），
+  ① **正解/反解的基座就是 torso_link**（构造时把 reduced 模型从 pelvis 搬到了躯干），
      并且这个实现与"用全模型 FK 算 torso_link 再取逆"的物理定义逐位一致；
   ② target_frame="torso" 时，**腰角不参与手臂解算** —— 腰怎么变，手臂关节角完全一样；
   ③ target_frame="pelvis" 时腰角必须参与（同一个骨盆系目标在腰转动后需要不同的手臂构型），
@@ -84,7 +84,7 @@ def make_ctrl(model, ik, q14, waist, frame: str) -> ArmController:
 def measure_in_frame(model, q14, waist, frame: str):
     """独立参考路径：**全模型 FK**（腰+手臂都按关节名写入）+ 显式末端偏移。
 
-    不使用 reduced 模型、不使用 A/A0、不使用 C_torso —— 用来交叉验证实现。
+    不使用 reduced 模型、不使用 C_torso、不碰任何"基座搬迁"的实现细节 —— 用来交叉验证。
     frame="pelvis"：末端在 pelvis 系（= pinocchio 世界系，根 link 固定在原点）
     frame="torso" ：末端在 torso_link 系（inv(P_torso_pelvis) @ T_ee_pelvis）
     """
@@ -133,9 +133,12 @@ def main() -> int:
     waist0 = np.zeros(3)
     waist1 = np.array([0.35, -0.20, 0.15])
 
-    print("\n[1] torso 系 <-> locked 系：常量变换自洽性")
+    print("\n[1] 基座 = torso_link：自洽性")
+    base = model.verify_torso_base()
+    check("reduced 模型的基座与 torso_link 重合（frames[torso_link] == I）",
+          base["ok"], f"最大元素差 {base['base_is_torso']:.2e}")
     C = model.C_torso
-    check("C_torso 是纯平移（姿态=I）",
+    check("C_torso（腰=0 时 torso 相对 pelvis）是纯平移（姿态=I）",
           np.allclose(C[:3, :3], np.eye(3), atol=1e-12),
           f"姿态最大偏差 {np.abs(C[:3,:3]-np.eye(3)).max():.2e}")
     check("torso 原点相对 pelvis 的距离 = 44.18mm（URDF 实测）",
@@ -143,12 +146,13 @@ def main() -> int:
           f"{model.torso_offset_mm():.4f}mm  C平移={np.round(C[:3,3],6)}")
     T_probe = np.eye(4)
     T_probe[:3, 3] = [0.3, -0.1, 0.05]
-    check("torso_to_locked 与 locked_to_torso 互逆",
-          np.allclose(model.locked_to_torso(model.torso_to_locked(T_probe)), T_probe, atol=1e-14))
+    check("torso_in_pelvis 与 pelvis_to_torso 互逆（腰=0 与腰≠0）",
+          all(np.allclose(model.pelvis_to_torso(model.torso_in_pelvis(w) @ T_probe, w),
+                           T_probe, atol=1e-13) for w in (waist0, waist1)))
 
     print("\n[2] 实现 vs 物理定义（用全模型 FK 算 torso_link 再取逆）")
     for tag, w in (("腰=0", waist0), ("腰≠0", waist1)):
-        got = model.locked_to_torso(model.fk(q14)[1])          # 我们的实现
+        got = model.fk(q14)[1]                                 # 我们的实现（已经是躯干系）
         ref = measure_in_frame(model, q14, w, "torso")[1]      # 物理定义
         d = np.abs(got - ref).max()
         check(f"torso 系实测末端（{tag}）与物理定义一致", d < 1e-12, f"最大元素差 {d:.2e}")
@@ -178,7 +182,8 @@ def main() -> int:
     print("\n[4] 两种约定在同一物理点上的等价性（腰=0 时）")
     T_target_torso = np.eye(4)
     T_target_torso[:3, 3] = [0.30, -0.10, 0.05]
-    T_target_pelvis = model.torso_to_locked(T_target_torso)      # 同一个物理点，换成 pelvis 表示
+    # 同一个物理点，换成 pelvis 表示
+    T_target_pelvis = model.torso_in_pelvis(waist0) @ T_target_torso
     ctrl_t = make_ctrl(model, ik, q14, waist0, "torso")
     ctrl_p = make_ctrl(model, ik, q14, waist0, "pelvis")
     for _ in range(4):
@@ -189,8 +194,8 @@ def main() -> int:
     d_eq = np.abs(ctrl_t.q_cmd - ctrl_p.q_cmd).max()
     check("腰=0 时 torso/pelvis 两种约定给出同一手臂构型", d_eq < 1e-9,
           f"最大关节差 {d_eq:.2e} rad")
-    check("IK 目标一致（torso_to_locked(T_torso) == 等效的 pelvis 目标）",
-          np.abs(model.torso_to_locked(T_target_torso) - T_target_pelvis).max() < 1e-14)
+    check("IK 目标一致（pelvis_to_torso(T_pelvis) == T_torso，求解系就是 torso 系）",
+          np.abs(model.pelvis_to_torso(T_target_pelvis, waist0) - T_target_torso).max() < 1e-13)
 
     print("\n[5] 跟踪误差定义在新约定下仍然自洽")
     ctrl = make_ctrl(model, ik, q14, waist1, "torso")
@@ -238,17 +243,18 @@ def main() -> int:
     quat_tilt = rotation_to_quat(Rx @ T_R_m[:3, :3])   # 实测朝向再绕 torso x 倾斜 15°
     pos_near = T_R_m[:3, 3] + np.array([0.02, 0.0, 0.0])
     ctrl_q.set_target_position(RIGHT, pos_near, quat=quat_tilt)
-    T_R_tgt_lk = model.torso_to_locked(ctrl_q.target[RIGHT])
-    q_sol = ik.solve(model.torso_to_locked(T_L_m), T_R_tgt_lk, q14)
+    # 求解系就是 torso 系：目标位姿直接喂给 IK，不需要任何换算
+    T_R_tgt = np.asarray(ctrl_q.target[RIGHT], dtype=float)
+    q_sol = ik.solve(T_L_m, T_R_tgt, q14)
     _, T_R_fk = model.fk(q_sol)
-    rot_err = np.rad2deg(np.linalg.norm(pin.log3(T_R_fk[:3, :3] @ T_R_tgt_lk[:3, :3].T)))
-    pos_err = np.linalg.norm(T_R_fk[:3, 3] - T_R_tgt_lk[:3, 3]) * 1000
+    rot_err = np.rad2deg(np.linalg.norm(pin.log3(T_R_fk[:3, :3] @ T_R_tgt[:3, :3].T)))
+    pos_err = np.linalg.norm(T_R_fk[:3, 3] - T_R_tgt[:3, 3]) * 1000
     check("带 quat 的（可达）位姿目标能解到（姿态 <4°、位置 <6mm）",
           rot_err < 4.0 and pos_err < 6.0, f"姿态残差 {rot_err:.2f}°，位置残差 {pos_err:.2f}mm")
     # 对照：同一个位置、只把那 15° 倾斜去掉 → 两者得到的关节角必须不同
     ctrl_q.set_target_position(RIGHT, pos_near)          # 不带 quat（锁定朝向）
-    T_R_flat = model.torso_to_locked(ctrl_q.target[RIGHT])
-    q_flat = ik.solve(model.torso_to_locked(T_L_m), T_R_flat, q14)
+    T_R_flat = np.asarray(ctrl_q.target[RIGHT], dtype=float)
+    q_flat = ik.solve(T_L_m, T_R_flat, q14)
     check("倾斜 15° 与不倾斜给出不同解（说明朝向真的进了反解）",
           np.abs(q_sol - q_flat).max() > 1e-3,
           f"最大关节差 {np.rad2deg(np.abs(q_sol - q_flat).max()):.2f}°")
