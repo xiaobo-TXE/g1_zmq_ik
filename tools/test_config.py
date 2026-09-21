@@ -211,8 +211,9 @@ def main_check() -> int:
           f"grasp={d2.marker_to_grasp}")
     example = Path(__file__).resolve().parent.parent / "robot.example.json"
     d3 = det.parse_args(["--config", str(example)])
-    check("仓库示例配置里的 aruco 段可直接用（含 -15mm 抓取偏移）",
-          tuple(d3.marker_to_grasp) == (0.0, 0.0, -0.015) and d3.config_ignored == []
+    check("仓库示例配置里的 aruco 段可直接用（抓腰部 -9cm + 水平进/左右开合）",
+          tuple(d3.marker_to_grasp) == (0.0, 0.0, -0.09) and d3.config_ignored == []
+          and tuple(round(v, 4) for v in d3.grasp_align_rpy) == (0.0, 0.0, -1.5708)
           and d3.target_endpoint == "tcp://127.0.0.1:6003",
           f"grasp={d3.marker_to_grasp} ignored={d3.config_ignored}")
 
