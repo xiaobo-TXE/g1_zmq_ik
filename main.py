@@ -45,6 +45,7 @@ import numpy as np
 import joint_map
 from arrival import ArrivalMonitor, ArrivalThresholds, format_event
 from controller import ArmController, LEFT, RIGHT, format_step
+from grip_control import SoftClose, SoftCloseConfig
 from g1_ik import G1ArmModel, make_ik, rotation_to_rpy
 from sim_arm import SimulatedArmState, SimulatedStateSource
 from target_io import TargetReceiver
@@ -166,6 +167,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="机器人侧标定的闭合角（rad；上游默认 0.0）")
     g.add_argument("--grip-on-arrive", type=float, metavar="PCT",
                    help="到位后自动把两侧夹爪压到这个开合百分比（例：0 = 到位即闭爪）；不给则不动夹爪")
+    g.add_argument("--grip-on-arrive-soft", type=float, metavar="TAU", nargs="?", const=0.3,
+                   help="到位后做**力限软闭合**：慢慢闭合，|tau_est| 达到该阈值就冻结（默认 0.3）。"
+                        "与 --grip-on-arrive 互斥；需要 --gripper-port 的 6004 力反馈")
+    g.add_argument("--grip-soft-tau", type=float, default=0.3,
+                   help="软闭合的默认 τ 阈值（交互命令 gc 不指定时用它）")
+    g.add_argument("--grip-soft-rate", type=float, default=1.5,
+                   help="软闭合的目标推进速度 rad/s（默认 1.5 ≈ 2.3cm/s 开口变化）")
 
     g = p.add_argument_group("到位判定（实测末端是否已稳定到达目标）")
     g.add_argument("--no-arrive", action="store_true", help="关闭到位判定（默认开启）")
@@ -232,6 +240,7 @@ HELP_TEXT = """
   a left|right|both   切换受控手臂
   t POS_MM ROT_DEG    设置到位判据（实测残差）       例: t 2 1      t 5 2 = 放宽
   g [R [L]]      夹爪开合百分比（0=闭 100=全开）     例: g 0      g 0 100     g=看当前
+  gc [TAU]       力限软闭合（慢闭到 |τ|≥TAU 就冻结） 例: gc        gc 0.2
   go             夹爪张开到 100%（释放）
   h              打印当前实测/目标/误差/到位状态
   j              打印当前下发的 14 个关节角
@@ -348,8 +357,20 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
                 apply_grip_percent(ctrl, r, l, source="交互命令 g")
             else:
                 print(HELP_TEXT)
+        elif head == "gc":
+            soft = flags.get("soft")
+            if soft is None:
+                log.warning("软闭合不可用")
+            else:
+                tau = float(args[0]) if args else None
+                for m in soft.start(ctrl, tau_limit=tau, source="交互命令 gc"):
+                    log.info("%s", m)
+                if soft.active and flags.get("grip_rx") is None:
+                    log.warning("注意：没有 6004 力反馈（--gripper-port 0？）—— 软闭合会立刻中止")
         elif head == "go":
             apply_grip_percent(ctrl, 100, 100, source="交互命令 go（张开/释放）")
+            if flags.get("soft") is not None:
+                flags["soft"].stop("改为张开")
         elif head == "t" and len(args) == 2:
             mon = flags.get("arrival")
             if mon is None:
@@ -383,6 +404,18 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
 # ---------------------------------------------------------------------------
 def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
     """把一帧目标流数据应用到控制器（最新优先，直接覆盖上一条目标）。"""
+    # 软闭合请求（Tag 程序可以一帧说"到位了，慢慢合上，夹住就停"）
+    if pkt.get("grip_close_tau") is not None and flags.get("soft") is not None:
+        try:
+            tau = float(pkt["grip_close_tau"])
+        except Exception:
+            log.warning("grip_close_tau 不是数字，忽略")
+        else:
+            sides = ("right", "left") if (pkt.get("grip_sides") is None) else tuple(pkt["grip_sides"])
+            for m in flags["soft"].start(ctrl, sides=sides, tau_limit=tau, source="6003 grip_close_tau"):
+                log.info("%s", m)
+            return          # 这一帧只表达"软闭合"，不再当位置目标用
+
     # 可选夹爪字段（与位置目标无关，可以单独发一帧"只动夹爪"）
     #   grip     = 开合百分比（0=闭 100=全开）      grip_rad = 直接给弧度（输出侧量纲）
     if pkt.get("grip_rad"):
@@ -709,9 +742,17 @@ def main(argv=None) -> int:
         log.info("上行订阅已关闭（--gripper-port 0 --mode-port 0）")
     last_mode_warn = 0.0
 
+    soft = SoftClose(SoftCloseConfig(tau_limit=args.grip_soft_tau,
+                                     rate_rad_s=args.grip_soft_rate))
+    if args.grip_on_arrive is not None and args.grip_on_arrive_soft is not None:
+        log.error("--grip-on-arrive（位置闭合）与 --grip-on-arrive-soft（力限软闭合）互斥，"
+                  "请只给一个")
+        return 2
+    log.info("软闭合参数: %s", soft.cfg.describe())
+
     flags = {"arms": arms, "force_print": False, "print_joints": args.print_joints,
              "last_stream_pos": {}, "pending_delta": [], "hint_time": 0.0,
-             "arrival": arrival, "frozen": False, "grip_rx": grip_rx}
+             "arrival": arrival, "frozen": False, "grip_rx": grip_rx, "soft": soft}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
     last_target_warn = 0.0
     console = None
@@ -794,6 +835,7 @@ def main(argv=None) -> int:
                 flags["force_print"] = False
                 extra = " ".join(t for t in (
                     grip_line(grip_rx, ctrl),
+                    soft.status(),
                     "" if mode_rx is None else mode_rx.line(),
                     " [已冻结]" if flags["frozen"] else "") if t)
                 for arm in flags["arms"]:
@@ -808,13 +850,22 @@ def main(argv=None) -> int:
                     print("  " + format_event(ev))
                 sys.stdout.flush()
 
-            # 到位后的动作（所有受控臂都到位）：--grip-on-arrive / --on-arrive
+            # 软闭合推进（每周期读最新 τ / dq；到达接触判据就冻结该侧）
+            if soft.active:
+                for m in soft.update(ctrl, grip_rx, dt):
+                    log.info("软闭合: %s", m)
+
+            # 到位后的动作（所有受控臂都到位）：--grip-on-arrive / --grip-on-arrive-soft / --on-arrive
             all_arrived_now = (arrival is not None
                                and any(ev.kind == "arrived" for ev in arrive_events)
                                and arrival.all_arrived(flags["arms"]))
             if all_arrived_now and args.grip_on_arrive is not None:
                 apply_grip_percent(ctrl, args.grip_on_arrive, args.grip_on_arrive,
                                    source=f"到位后 --grip-on-arrive {args.grip_on_arrive:g}%")
+            if all_arrived_now and args.grip_on_arrive_soft is not None and not soft.active:
+                for m in soft.start(ctrl, tau_limit=args.grip_on_arrive_soft,
+                                    source=f"到位后 --grip-on-arrive-soft {args.grip_on_arrive_soft:g}"):
+                    log.info("%s", m)
             if all_arrived_now and args.on_arrive != "none":
                 if args.on_arrive == "exit":
                     log.info("已到位（--on-arrive exit）-> 退出")

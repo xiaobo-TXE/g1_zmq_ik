@@ -15,6 +15,8 @@
     {"pos_left": [...], "pos_right": [...]}# 可选：一次给两条手臂（优先于 pos/arm）
     {"grip": 0}                             # 可选：夹爪开合百分比 0=闭 100=全开（也可 {"right":0}）
     {"grip_rad": {"right": 0.0}}            # 可选：直接给夹爪弧度（输出侧量纲，跳过百分比换算）
+    {"grip_close_tau": 0.3}                 # 可选：力限软闭合请求（|τ|≥0.3 就冻结）；**可单独成帧**
+    {"grip_sides": ["right"]}               # 可选：软闭合只做这几侧（right/left）；不给=两侧
     {"timestamp": 1788514855.53}            # 可选，只用于诊断乱序
 
 示例（发送端）：
@@ -149,9 +151,34 @@ class TargetReceiver:
         except Exception as exc:
             logger.warning("夹爪字段被忽略: %s（原始前 120 字节: %r）", exc, payload[:120])
             out["grip"] = out["grip_rad"] = None
+
+        # 可选：力限软闭合请求（|τ| ≥ grip_close_tau 就冻结）。这是**动作型**字段，
+        # 允许单独成帧（Tag 端可以只说"到位了，慢慢合上，夹住就停"，不带任何位置）。
+        tau = pkt.get("grip_close_tau")
+        if tau is not None:
+            try:
+                v = float(tau)
+                if not np.isfinite(v) or v <= 0.0:
+                    raise ValueError(f"需要正的有限值，收到 {tau!r}")
+                out["grip_close_tau"] = v
+            except Exception as exc:
+                logger.warning("grip_close_tau 被忽略: %s（原始前 120 字节: %r）", exc, payload[:120])
+        sides = pkt.get("grip_sides")
+        if sides is not None:
+            try:
+                seq = [sides] if isinstance(sides, str) else list(sides)
+                bad = [s for s in seq if str(s).lower() not in ("right", "left")]
+                if not seq or bad:
+                    raise ValueError(f"只能是 right/left 的列表，收到 {sides!r}")
+                out["grip_sides"] = [str(s).lower() for s in seq]
+            except Exception as exc:
+                logger.warning("grip_sides 被忽略: %s（原始前 120 字节: %r）", exc, payload[:120])
+
         if (out["pos"] is None and out["delta"] is None and not out["per_arm"]
-                and out["grip"] is None and out["grip_rad"] is None):
-            raise ValueError("帧里需要 pos / delta / pos_left / pos_right / grip / grip_rad 之一")
+                and out["grip"] is None and out["grip_rad"] is None
+                and out.get("grip_close_tau") is None):
+            raise ValueError("帧里需要 pos / delta / pos_left / pos_right / grip / grip_rad / "
+                             "grip_close_tau 之一")
         ts = pkt.get("timestamp")
         if ts is not None:
             try:
