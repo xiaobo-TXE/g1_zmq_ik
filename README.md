@@ -396,6 +396,9 @@ y（开合方向）横跨盒子的 3cm 那一维；不对就调 `--grasp-align-r
 **实测例子**（LIVOX 盒子立着、18cm 高、3cm 窄面朝机器人、标签平贴顶面；要"水平进入 + 手指左右开合 + 抓腰部"）：
 
 ```bash
+# 不知道该填哪个 --grasp-align-rpy？让工具从当前标签轴自己算（四选一，并打印预期结果）：
+python tools/detect_aruco_zmq.py --config robot.json --no-send --suggest-align
+
 python tools/detect_aruco_zmq.py --no-send --marker-to-grasp 0 0 -0.09 --grasp-align-rpy 0 0 0
 # 判定标准（打印出来的 axes(ee/torso)）：
 #   x ≈ (+1, 0, 0)  水平向前（从机器人朝盒子探入）   ← 探入方向

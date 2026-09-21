@@ -47,8 +47,9 @@
 
 用法::
 
-    # ① 只检测，不发目标（确认检测稳定、看标记轴朝向）
-    python tools/detect_aruco_zmq.py --no-send --endpoint tcp://10.3.42.221:5556
+    # ① 只检测，不发目标（确认检测稳定、看标记轴朝向；--suggest-align 会直接给出该填的
+    #    --grasp-align-rpy，省得反复试）
+    python tools/detect_aruco_zmq.py --no-send --suggest-align --endpoint tcp://10.3.42.221:5556
 
     # ② 检测 + 下发（另一个终端跑主程序，先 --sim 验证）
     python main.py --sim --arm right --interactive --target-frame torso
@@ -544,6 +545,44 @@ def _quat_to_rotation(quaternion):
     ], dtype=np.float64)
 
 
+def suggest_grasp_align(result):
+    """从当前标签轴推荐 `--grasp-align-rpy`（只绕竖直轴转，四选一）。
+
+    默认抓法：**末端 x = 水平向前**（从机器人朝盒子探入）、**y = 另一个面内轴**（手指开合）、
+    **z = 朝上**。因为 ``R_ee = R_marker @ Rz(theta)``，末端 x 只能是四个面内方向之一：
+
+        theta = 0 -> +marker.x     theta = pi/2  -> +marker.y
+        theta = pi -> -marker.x    theta = -pi/2 -> -marker.y
+
+    所以"哪个面内轴在 torso +x（前方）上分量最大"就唯一决定了 theta。
+
+    返回 ``(theta, 该方向的单位向量, marker.z 在 torso 下的向量)``。
+    """
+    R = _quat_to_rotation(result['torso_quaternion'])
+    mx, my, mz = R[:, 0], R[:, 1], R[:, 2]
+    cands = [(0.0, mx), (math.pi / 2.0, my), (math.pi, -mx), (-math.pi / 2.0, -my)]
+    theta, axis = max(cands, key=lambda item: float(item[1][0]))     # torso 前方分量最大
+    return float(theta), axis, mz
+
+
+def print_align_suggestion(result):
+    """打印推荐的 --grasp-align-rpy，以及按它算出的末端三轴（核对标准）。"""
+    theta, axis, mz = suggest_grasp_align(result)
+    R = _quat_to_rotation(result['torso_quaternion'])
+    ee = R @ rotation_from_rpy(0.0, 0.0, theta)
+    print('    --suggest-align: --grasp-align-rpy 0 0 {:.4f}   探入方向 {}'.format(
+        theta, vector_text(axis)), flush=True)
+    print('                     预期 axes(ee/torso) x={} y={} z={}'.format(
+        vector_text(ee[:, 0]), vector_text(ee[:, 1]), vector_text(ee[:, 2])), flush=True)
+    if float(mz[2]) < 0.7:
+        print('    [WARN] 标记 z 轴没朝上（z 的 torso 分量 {:.2f}）：上面假设标签平贴、面朝上，'
+              '请先摆平再测'.format(float(mz[2])), file=sys.stderr, flush=True)
+    if abs(float(ee[1, 1])) < 0.7:
+        print('    [提示] 按这个值手指开合方向不在左右（y={}）：若盒子窄面（3cm）朝左右，'
+              '请把盒子原地转 90°（探入要向前、开合只能是另一个面内轴，两者垂直，改 rpy 无法同时满足）'
+              .format(vector_text(ee[:, 1])), file=sys.stderr, flush=True)
+
+
 def print_marker_axes(result, align_rpy=(0.0, 0.0, 0.0)):
     """打印标记三个轴在 torso 系下的单位方向，用来决定 --marker-to-grasp 的偏移方向。
 
@@ -609,6 +648,10 @@ def build_parser():
                         help='只检测不发送（回到原脚本行为）')
     parser.add_argument('--send-quat', dest='send_quat', action='store_true', default=True,
                         help='帧里附带抓取朝向 quat（默认开；用 --no-quat 关掉）')
+    parser.add_argument('--suggest-align', dest='suggest_align', action='store_true',
+                        default=False,
+                        help='打印推荐的 --grasp-align-rpy（按"末端 x 水平向前、y 左右、z 朝上"'
+                             '从当前标签轴算出来），并打印按它得到的 axes(ee/torso) 供核对')
     parser.add_argument('--print-axes', dest='print_axes', action='store_true',
                         default=True,
                         help='打印标记三轴在 torso 系下的指向（判断 --marker-to-grasp 该往哪偏）')
@@ -714,6 +757,8 @@ def main():
                 if args.print_axes:
                     print_marker_axes(min(results, key=lambda r: float(r['distance'])),
                                       args.grasp_align_rpy)
+                if args.suggest_align:
+                    print_align_suggestion(min(results, key=lambda r: float(r['distance'])))
                 last_log_time = now
 
             # 把（已确认的）标记位姿换算成抓取位姿（位置 + 朝向），发给 6003

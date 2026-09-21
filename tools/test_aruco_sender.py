@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""检测端目标发送器（TargetSender）的防抖/跳变恢复自检：python tools/test_aruco_sender.py
+"""检测端自检：TargetSender 的防抖/跳变恢复 + --suggest-align 的推荐值。
+
+用法：python tools/test_aruco_sender.py
 
 回归点（真机上会表现成"Tag 明明看得见，但手臂不动"）：
   半米外的**单帧**跳变要当误检丢掉；但同一个新位置**持续出现**够久，必须判为真实移动
@@ -143,6 +145,36 @@ def main() -> int:
     s3.close()
     pull.close(linger=0)
     ctx.term()
+
+    print("\n[6] --suggest-align：从标签轴推荐 grasp_align_rpy")
+    mod2 = mod
+
+    def quat_from(R):
+        return list(mod2.matrix_to_quaternion(np.asarray(R, dtype=float)))
+
+    def rot_z(deg):
+        t = np.deg2rad(deg)
+        return np.array([[np.cos(t), -np.sin(t), 0.0], [np.sin(t), np.cos(t), 0.0], [0.0, 0.0, 1.0]])
+
+    # 标签平放（z 朝上），x 轴分别朝：前（+x）、左（+y）、后（−x）、右（−y）
+    cases = [("x 朝前", 0.0), ("x 朝左", 90.0), ("x 朝后", 180.0), ("x 朝右", -90.0)]
+    for tag, yaw in cases:
+        Rm = rot_z(yaw)                                     # marker 相对 torso
+        res = {"torso_quaternion": quat_from(Rm)}
+        theta, axis, mz = mod2.suggest_grasp_align(res)
+        E = Rm @ mod2.rotation_from_rpy(0.0, 0.0, theta)
+        ex, ey = E[:, 0], E[:, 1]
+        check(f"{tag} 时推荐值让探入方向水平向前（{np.round(theta, 4)}）",
+              float(ex[0]) > 0.99, f"ee.x={np.round(ex, 3)}")
+        check(f"{tag} 时手指开合方向在左右、z 朝上",
+              abs(float(ey[1])) > 0.99 and float(E[2, 2]) > 0.99, f"ee.y={np.round(ey, 3)}")
+    # 覆盖四个候选：θ 必须是 90° 的整数倍
+    thetas = []
+    for _, yaw in cases:
+        Rm = rot_z(yaw)
+        thetas.append(round(mod2.suggest_grasp_align({"torso_quaternion": quat_from(Rm)})[0], 4))
+    check("推荐值只取 0 / ±π/2 / π 四种（不会给出奇怪的角）",
+          all(t in (0.0, 1.5708, -1.5708, 3.1416, -3.1416) for t in thetas), f"{thetas}")
 
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
     print("\n" + "=" * 74)
