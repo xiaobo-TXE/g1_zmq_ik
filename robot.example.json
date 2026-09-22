@@ -56,6 +56,8 @@
     "target_hz": 20.0,
     "deadband_mm": 2.0,
     "jump_reject_mm": 100.0,
+    "_锁存目标": "latch_first=true 时只下发【第一次成功发出的】目标，之后检测不再更新它——用于切断『夹爪碰到 Tag 把码推远 -> 控制器追新位置 -> 再推』的追逐环（真机上表现为手臂一直追、永远到不了位，夹爪自然也不动作）。代价：之后盒子/相机真的移动了也不会自动更新，需重启检测端重新锁存；若担心控制端中途重启，可加 latch_resend_hz=1 让它按秒重发同一个锁存值（重发旧值，不是更新）",
+    "latch_first": true,
     "print_axes": true,
     "send_quat": false,
     "_标定提示": "先用 --no-send 看 axes(marker/torso) 与 axes(ee/torso)，确认偏移方向和手指开合方向",

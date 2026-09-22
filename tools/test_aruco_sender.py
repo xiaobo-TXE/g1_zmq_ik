@@ -140,6 +140,52 @@ def main() -> int:
     check("丢帧不假装发成功（sent 不再增长）", dead.sent <= 1, f"sent={dead.sent}")
     dead.close()
 
+    print("\n[7] --latch-first：锁存第一次成功下发的值，之后不再更新")
+    drain()                                            # 清掉上一节遗留的帧
+    s4 = mod.TargetSender(endpoint, hz=50.0, deadband_mm=2.0, jump_reject_mm=100.0,
+                          enabled=True, recover_s=0.5, latch_first=True)
+    t7 = 5000.0
+    first = [0.30, -0.20, 0.15]
+    check("首帧发出并锁存", s4.maybe_send(first, now=t7) is True and s4.latched is not None,
+          f"latched={None if s4.latched is None else np.round(s4.latched, 3)}")
+    check("只发出 1 帧", len(drain()) == 1)
+    for dx in (0.02, 0.05, -0.03, 0.10):               # 模拟被夹爪推远/推近
+        t7 += 0.1
+        s4.maybe_send([first[0] + dx, first[1], first[2]], now=t7)
+    check("锁存后位置再怎么变都不再下发", len(drain()) == 0 and s4.sent == 1,
+          f"sent={s4.sent} skipped={s4.skipped}")
+    check("锁存值仍是第一次那个",
+          float(np.linalg.norm(s4.latched - np.asarray(first))) < 1e-9)
+    s4.close()
+
+    print("\n[8] 只在**发送成功**之后才锁存（发不出去就不锁，下次还试）")
+    s5 = mod.TargetSender(endpoint, hz=50.0, deadband_mm=2.0, jump_reject_mm=100.0,
+                          enabled=True, recover_s=0.5, latch_first=True)
+    s5._send_raw = lambda p, q, now: False             # 模拟"对端不在，这一帧发不出去"
+    t8 = 6000.0
+    check("发不出去 -> 不锁存", s5.maybe_send([0.10, 0.0, 0.0], now=t8) is False
+          and s5.latched is None)
+    t8 += 1.0
+    check("仍会继续尝试（没有把目标锁死在没人收到的值上）",
+          s5.maybe_send([0.20, 0.0, 0.0], now=t8) is False and s5.latched is None)
+    s5.close()
+
+    print("\n[9] --latch-resend-hz：重发的是**同一个**锁存值，不更新")
+    drain()
+    s6 = mod.TargetSender(endpoint, hz=50.0, deadband_mm=2.0, jump_reject_mm=100.0,
+                          enabled=True, recover_s=0.5, latch_first=True, latch_resend_hz=2.0)
+    t9 = 7000.0
+    s6.maybe_send(first, now=t9)
+    drain()
+    t9 += 0.2                                          # 未到 1/2s
+    check("未到重发周期不发", s6.maybe_send([first[0] + 0.2, 0.0, 0.0], now=t9) is False)
+    t9 += 0.4                                          # 累计 0.6s > 0.5s
+    s6.maybe_send([first[0] + 0.2, 0.0, 0.0], now=t9)
+    frames = drain()
+    check("到点重发，且发的是锁存值（不是新检测）", len(frames) == 1
+          and abs(frames[0]["pos"][0] - first[0]) < 1e-6, f"frames={frames}")
+    s6.close()
+
     sender.close()
     s2.close()
     s3.close()

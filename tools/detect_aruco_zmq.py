@@ -280,18 +280,25 @@ def receive_frame(socket, camera_name, publisher_rgb_jpeg):
 class TargetSender:
     """把 torso 系下的目标位置发给 g1_zmq_ik（ZMQ PUSH -> 对方 6003 PULL）。
 
-    三道防护（Tag 检测会抖，直接 30Hz 灌会让手臂一直微动）：
+    四道防护（Tag 检测会抖，直接 30Hz 灌会让手臂一直微动）：
       * 限频        ：最快 --target-hz 帧/秒（默认 20）
       * 死区        ：与上一帧发送值的差 < --deadband-mm 就不发
       * 跳变拒绝    ：单帧跳变 > --jump-reject-mm 判为误检，丢弃并告警
+      * 锁存        ：--latch-first 时**第一次成功发出的值**被记住，之后**不再接受新检测**
+
+    为什么需要"锁存"：手臂/夹爪一旦碰到 Tag（或盒子），码会被推动，检测到的目标就"跑"了；
+    控制器于是重新规划去追那个新位置，再碰、再推 —— 形成"推远→追→再推"的追逐环，永远到不了位，
+    自然也触发不了到位后的夹爪动作。锁存第一次的结果就能把这条反馈环切断。
+    （代价：之后盒子/相机真的移动了也不会自动更新，需要重启检测端重新锁存。）
 
     对端（g1_zmq_ik 的 6003）没起/重启时，send 会因 SNDTIMEO 抛 ``zmq.Again``：
     这里**接住它按丢帧处理**（计数 + 限频告警），绝不让它把整个检测循环干掉；
-    对端一起来，下一帧自动恢复发送。
+    对端一起来，下一帧自动恢复发送。锁存只在**发送成功**之后才生效，所以不会把目标锁在"没人收"的时候。
     """
 
     def __init__(self, endpoint, hz, deadband_mm, jump_reject_mm,
-                 send_quat=False, enabled=True, recover_s=0.5):
+                 send_quat=False, enabled=True, recover_s=0.5,
+                 latch_first=False, latch_resend_hz=0.0):
         self.enabled = bool(enabled)
         self.send_quat = bool(send_quat)
         self.period = 1.0 / max(float(hz), 1e-3)
@@ -302,6 +309,12 @@ class TargetSender:
         # 连续看到同一个新位置超过这么久 = 目标真的动了（盒子被挪走/相机被碰），
         # 接受它并重置基准；否则一旦跳变就一直拒绝，6003 会永远停在旧点
         self.recover_s = max(float(recover_s), 0.0)
+        # ---- 锁存：第一次**成功发出**的值被记住，之后不再接受新检测 ----
+        self.latch_first = bool(latch_first)
+        self.latch_resend_period = (1.0 / float(latch_resend_hz)
+                                    if float(latch_resend_hz) > 0 else 0.0)
+        self.latched = None                       # 锁存的位置；None = 尚未锁存
+        self.latched_quat = None
         self.last_sent = None
         self.last_time = 0.0
         self.sent = 0
@@ -328,14 +341,47 @@ class TargetSender:
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.connect(endpoint)
         print('[INFO] 目标发送 -> {} (PUSH connect)，限频 {:.0f}Hz 死区 {:.0f}mm '
-              '跳变拒绝 {:.0f}mm'.format(endpoint, hz, deadband_mm, jump_reject_mm),
+              '跳变拒绝 {:.0f}mm{}'.format(endpoint, hz, deadband_mm, jump_reject_mm,
+              '，**锁存第一次**（之后不再更新）' if self.latch_first else ''),
               flush=True)
+
+    def _send_raw(self, p, quaternion_torso, now):
+        """把一帧目标推进 socket（含丢帧处理）。返回是否真的发出去了。"""
+        frame = {'pos': [round(float(v), 6) for v in p]}
+        if self.send_quat and quaternion_torso is not None:
+            q = np.asarray(quaternion_torso, dtype=np.float64).reshape(4)
+            frame['quat'] = [round(float(v), 6) for v in q]
+        try:
+            self.socket.send_string(json.dumps(frame))
+        except self.zmq.Again:
+            # SNDTIMEO 到点：对端没起或收不过来。丢这一帧就好（目标流本来就"最新优先"），
+            # 关键是别让响应中断后挂在这里、更别让异常飞出把检测循环干掉。
+            self.dropped += 1
+            self.last_time = now                           # 别在 send 上反复干等，按目标频率重试
+            if now - self._last_drop_warn >= 1.0:          # 告警限频，别刷屏
+                self._last_drop_warn = now
+                print('[WARN] 目标发不出去（{} 没人收？），已丢帧；对端起来会自动恢复'
+                      .format(self.endpoint), file=sys.stderr, flush=True)
+            return False
+        self.last_time = now
+        self.sent += 1
+        return True
 
     def maybe_send(self, position_torso, quaternion_torso=None, now=None):
         """返回 True 表示本帧真的发出去了。"""
         if not self.enabled or self.socket is None:
             return False
         now = time.monotonic() if now is None else now
+
+        # ---- 已锁存：不再接受任何新检测。只有 latch_resend_period>0 时会重发**同一个**锁存值
+        #      （重发旧值不算更新，只是让中途重启的控制端还能重新拿到目标）----
+        if self.latched is not None:
+            if (self.latch_resend_period > 0
+                    and now - self.last_time >= self.latch_resend_period):
+                return self._send_raw(self.latched, self.latched_quat, now)
+            self.skipped += 1
+            return False
+
         if now - self.last_time < self.period:
             self.skipped += 1
             return False
@@ -371,25 +417,16 @@ class TargetSender:
             if jump < self.deadband:
                 self.skipped += 1
                 return False
-        frame = {'pos': [round(float(v), 6) for v in p]}
-        if self.send_quat and quaternion_torso is not None:
-            q = np.asarray(quaternion_torso, dtype=np.float64).reshape(4)
-            frame['quat'] = [round(float(v), 6) for v in q]
-        try:
-            self.socket.send_string(json.dumps(frame))
-        except self.zmq.Again:
-            # SNDTIMEO 到点：对端没起或收不过来。丢这一帧就好（目标流本来就"最新优先"），
-            # 关键是别让响应中断后挂在这里、更别让异常飞出把检测循环干掉。
-            self.dropped += 1
-            self.last_time = now                           # 别在 send 上反复干等，按目标频率重试
-            if now - self._last_drop_warn >= 1.0:          # 告警限频，别刷屏
-                self._last_drop_warn = now
-                print('[WARN] 目标发不出去（{} 没人收？），已丢帧；对端起来会自动恢复'
-                      .format(self.endpoint), file=sys.stderr, flush=True)
-            return False
+        if not self._send_raw(p, quaternion_torso, now):
+            return False                                   # 对端不在 -> 不锁存，等下一帧重试
         self.last_sent = p.copy()
-        self.last_time = now
-        self.sent += 1
+        if self.latch_first:
+            # 只在**成功发出**之后锁存：对端没起时不要把目标锁死在一个没人收到的值上
+            self.latched = p.copy()
+            self.latched_quat = (None if quaternion_torso is None
+                                 else np.asarray(quaternion_torso, dtype=np.float64).reshape(4).copy())
+            print('[INFO] 已锁存目标 pos={}：之后检测不再更新（要重新锁存请重启检测端）'
+                  .format(vector_text(self.latched)), flush=True)
         return True
 
     def close(self):
@@ -694,6 +731,12 @@ def build_parser():
     parser.add_argument('--jump-recover-s', type=float, default=0.5, metavar='S',
                         help='同一个新位置持续这么久就认它是真实移动（盒子被挪走/相机被碰），'
                              '接受并重置跳变基准；0=只要跳变就接受（不推荐）')
+    parser.add_argument('--latch-first', dest='latch_first', action='store_true',
+                        help='锁存第一次**成功下发**的目标：之后检测不再更新它。用于切断'
+                             '"夹爪碰到 Tag 把码推远 -> 控制器追新位置 -> 再推"的追逐环')
+    parser.add_argument('--latch-resend-hz', type=float, default=0.0, metavar='HZ',
+                        help='锁存后按该频率重发同一个锁存值（0=不重发）。只用于控制端中途重启后'
+                             '还能重新拿到目标；重发的是旧值，不会更新目标')
     parser.add_argument('--no-send', action='store_true',
                         help='只检测不发送（回到原脚本行为）')
     parser.add_argument('--send-quat', dest='send_quat', action='store_true', default=True,
@@ -765,7 +808,8 @@ def main():
     # 目标发送器
     sender = TargetSender(args.target_endpoint, args.target_hz, args.deadband_mm,
                           args.jump_reject_mm, send_quat=args.send_quat,
-                          enabled=not args.no_send, recover_s=args.jump_recover_s)
+                          enabled=not args.no_send, recover_s=args.jump_recover_s,
+                          latch_first=args.latch_first, latch_resend_hz=args.latch_resend_hz)
     last_log_time = 0.0
     send_log_time = 0.0
     warned_resolution = False
@@ -831,6 +875,8 @@ def main():
                         state = '已下发(累计 {} 帧)'.format(sender.sent)
                     elif sender.dropped > dropped_before:
                         state = '对端未就绪，已丢帧(累计丢 {})'.format(sender.dropped)
+                    elif sender.latched is not None:
+                        state = '已锁存目标，不再更新(累计下发 {} 帧)'.format(sender.sent)
                     else:
                         state = '跳过(死区/限频)'
                     print('[INFO] 抓取位姿 torso p={} q={}  (id={}, {})'.format(
