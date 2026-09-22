@@ -81,6 +81,32 @@ def _rot_exp(w: np.ndarray) -> np.ndarray:
 
 
 @dataclass
+class WaypointPlan:
+    """一串路点 + 每段的运动方式，控制器按顺序逐段执行。
+
+    这是"轴序分解"这类规划方法的载体：**它只约束路点，不约束路点之间的路径** ——
+    路径形状由每段的 `mode` 决定：
+
+      'lin' : 该段走笛卡尔直线（LinearMove）—— 端点之间真的是直线
+      'ptp' : 该段只是"把目标设成这个路点"，末端在段内仍然会划弧（关节空间最短路径的像）
+
+    所以 `mode` 必须每段都显式给：想要"轴对齐的直线"，就必须每段都是 'lin'。
+    """
+    segs: List[Tuple[np.ndarray, str]]          # [(目标位姿 4x4, 'lin'|'ptp'), ...]
+    idx: int = 0                                # 当前执行到第几段
+
+    @property
+    def done(self) -> bool:
+        return self.idx >= len(self.segs)
+
+    def head(self) -> Optional[Tuple[np.ndarray, str]]:
+        return None if self.done else self.segs[self.idx]
+
+    def targets(self) -> List[np.ndarray]:
+        return [T for T, _ in self.segs]
+
+
+@dataclass
 class LinearMove:
     """一段**笛卡尔直线**：位置线性，姿态沿测地线（轴角 / SLERP）插值。
 
@@ -437,6 +463,10 @@ class ArmController:
         self.lin_abort_cycles: int = 5
         #: 第一段（PTP 到 pre-grasp）判定"到了"的容差（m）
         self.lin_reach_tol: float = 0.005
+        #: 多段路点计划（轴序分解等）。有计划时按段顺序执行，优先于单段 LIN / 两段式接近
+        self.plan: Dict[str, Optional[WaypointPlan]] = {LEFT: None, RIGHT: None}
+        #: 路点自检阈值（m）：逐点试解 IK，残差超过它就认为该路点不可达
+        self.axis_check_mm: float = 10.0
         #: 目标小幅更新时的"不重起"容差（m）。Tag 目标流会以 20Hz 重发同一条目标，
         #: 若每次都重启接近/直线段，直线段会被无限打断（实测：20Hz 重发 -> 被打断 259 次、
         #: 一次都没走完）。所以只有目标真的挪动了（超过这个容差）才重新起段。
@@ -644,8 +674,163 @@ class ArmController:
         self._approach[arm] = None
         self._lin_fail[arm] = 0
 
+    # ------------------------------------------------------------------ 多段路点计划
+    def start_waypoints(self, arm: str, segs: Sequence[Tuple[np.ndarray, str]],
+                        T_from: Optional[np.ndarray] = None) -> WaypointPlan:
+        """按顺序执行一串路点。segs = [(T1,'lin'), (T2,'ptp'), ...]。
+
+        终端目标 = 最后一段的位姿（`self.target[arm]`），所以**到位判定看的仍然是终点**，
+        中途的每一段只是"路过点"，不会被判到位。
+        """
+        clean: List[Tuple[np.ndarray, str]] = []
+        for T, mode in segs:
+            m = str(mode).lower()
+            if m not in ("lin", "ptp"):
+                raise ValueError(f"路点模式只能是 lin / ptp，收到 {mode!r}")
+            clean.append((np.asarray(T, dtype=float).reshape(4, 4).copy(), m))
+        if not clean:
+            raise ValueError("路点计划是空的")
+        self.lin[arm] = None
+        self._approach[arm] = None
+        self._lin_fail[arm] = 0
+        self.plan[arm] = WaypointPlan(segs=clean)
+        self._assign_target(arm, clean[-1][0])          # 到位判定看最后一站
+        logger.info("路点计划[%s]: %d 段（%s）", arm, len(clean),
+                    ", ".join(m for _, m in clean))
+        if T_from is not None:
+            self.plan[arm].segs = ([(np.asarray(T_from, dtype=float).copy(), "lin")] +
+                                   self.plan[arm].segs)
+        return self.plan[arm]
+
+    def cancel_plan(self, arm: str, why: str = "") -> None:
+        if self.plan[arm] is not None:
+            logger.warning("取消路点计划[%s]%s", arm, f"（{why}）" if why else "")
+        self.plan[arm] = None
+
+    def axis_waypoints(self, arm: str, T_goal: np.ndarray,
+                       order: str = "zyx") -> List[np.ndarray]:
+        """把"从当前指令位姿到 T_goal"按**躯干系的轴**逐轴对齐，返回中间路点。
+
+        order="zyx"：先只改 z 到目标高度 -> 再只改 y -> 最后只改 x（= 进给轴）。
+        姿态全程保持 T_goal 的姿态（轴序分解只拆位置）。
+        """
+        T_goal = np.asarray(T_goal, dtype=float).reshape(4, 4)
+        cur = self._cmd_pose_in_target_frame(arm)
+        if cur is None:
+            cur = self._base_pose(arm)
+        p0 = np.asarray(cur, dtype=float)[:3, 3].copy()
+        p1 = T_goal[:3, 3].copy()
+        axis_idx = {"x": 0, "y": 1, "z": 2}
+        order = "".join(ch for ch in str(order).lower() if ch in axis_idx)
+        if sorted(order) != ["x", "y", "z"]:
+            raise ValueError(f"order 必须恰好包含 x/y/z 各一次，收到 {order!r}")
+        p = p0.copy()
+        out = []
+        for ch in order:
+            p = p.copy()
+            p[axis_idx[ch]] = p1[axis_idx[ch]]
+            T = np.eye(4)
+            T[:3, :3] = T_goal[:3, :3]
+            T[:3, 3] = p
+            out.append(T)
+        return out
+
+    def check_waypoints(self, arm: str, poses: Sequence[np.ndarray],
+                        verbose: bool = True) -> List[float]:
+        """逐点试解 IK，返回每个路点的可达性残差（m）。用来在启用前拦住不可达的中间点。
+
+        注意：路点可达**不等于**"从当前位姿一路走过去都可达" —— 这是个必要不充分检查，
+        但它能抓出 `(x0, y0, z_t)` 这类明显出界的中间点。
+        """
+        other = RIGHT if arm == LEFT else LEFT
+        T_other = self.target.get(other)
+        if T_other is None:
+            T_other = self._cmd_pose_in_target_frame(other)
+        q = self.q_meas if self.q_meas is not None else self.model.neutral()
+        out: List[float] = []
+        T_other_ok = T_other if T_other is not None else None
+        for T in poses:
+            T = np.asarray(T, dtype=float).reshape(4, 4).copy()
+            # ik.solve(T_L, T_R, q)：注意参数是**左、右**两臂。探哪个臂，就把 T 放在
+            # 对应的那一侧；另一侧用当前目标（没有就退回探针自身），否则量出来的残差
+            # 是"另一条臂 vs 这个路点"，会得到毫无意义的几百毫米。
+            T_other_use = T_other_ok if T_other_ok is not None else T
+            T_L, T_R = (T, T_other_use) if arm == LEFT else (T_other_use, T)
+            try:
+                q_try = self.ik.solve(T_L, T_R, q)
+                i = 0 if arm == LEFT else 1
+                res = float(np.linalg.norm(self.model.fk(q_try)[i][:3, 3] - T[:3, 3]))
+            except Exception:
+                res = float("inf")
+            out.append(res)
+            q = q_try if np.isfinite(res) else q
+        if verbose:
+            bad = [k for k, r in enumerate(out) if r * 1000 > self.axis_check_mm]
+            for k, r in enumerate(out):
+                logger.info("路点自检[%s] #%d: 残差 %.2f mm %s", arm, k, r * 1000,
+                            "" if r * 1000 <= self.axis_check_mm else "← 超阈值")
+            if bad:
+                logger.warning("路点自检[%s]: %d 个路点残差超过 %.0fmm（可能不可达/接近奇异），"
+                               "建议先核对这几个点的坐标", arm, len(bad), self.axis_check_mm)
+        return out
+
+    def start_axis_approach(self, arm: str, T_grasp: np.ndarray, approach_dist: float,
+                            order: str = "zyx", final: str = "tool",
+                            check: bool = True) -> Optional[WaypointPlan]:
+        """**轴序对齐 + 工具轴进给**（本分支要跑的规划路线）。
+
+        阶段1：按躯干系的轴逐轴对齐到 **pre-grasp**（每段走笛卡尔直线）
+                 当前 → (x0,y0,z_pre) → (x0,y_pre,z_pre) → (x_pre,y_pre,z_pre)
+        阶段2：沿**工具轴**从 pre-grasp 直线进给到抓取点（与 --lin-approach 的进给段相同）
+
+        这样"转场"是几条短的、轴对齐的直线（人脑可核对），"进给"是沿夹爪方向的直线。
+        final="none" 时不加阶段2，直接把最后一个轴对齐点当终点（纯轴序分解）。
+        """
+        T_grasp = np.asarray(T_grasp, dtype=float).reshape(4, 4).copy()
+        x_tool = T_grasp[:3, :3][:, 0]
+        n = float(np.linalg.norm(x_tool))
+        if n < 1e-9:
+            raise ValueError("目标姿态的工具轴退化，无法算 pre-grasp")
+        x_tool = x_tool / n
+        T_pre = T_grasp.copy()
+        if approach_dist > 0:
+            T_pre[:3, 3] = T_grasp[:3, 3] - float(approach_dist) * x_tool
+
+        # 幂等：同一条目标的小幅更新不重来
+        pl = self.plan.get(arm)
+        if pl is not None and not pl.done:
+            last = pl.segs[-1][0][:3, 3]
+            if float(np.linalg.norm(T_grasp[:3, 3] - last)) <= self.lin_replan_tol:
+                pl.segs[-1] = (T_grasp, pl.segs[-1][1])
+                self._assign_target(arm, T_grasp)
+                return pl
+
+        mids = self.axis_waypoints(arm, T_pre, order=order)
+        # 去掉"已经在那儿"的退化段，避免 0 长度的直线段
+        cur = self._cmd_pose_in_target_frame(arm)
+        p_cur = None if cur is None else np.asarray(cur, dtype=float)[:3, 3]
+        segs: List[Tuple[np.ndarray, str]] = []
+        for T in mids:
+            if p_cur is not None and float(np.linalg.norm(T[:3, 3] - p_cur)) < 1e-4:
+                continue
+            segs.append((T, "lin"))
+            p_cur = T[:3, 3]
+        if final == "tool" and approach_dist > 0:
+            segs.append((T_grasp, "lin"))
+        elif final == "none" and segs:
+            segs[-1] = (T_grasp, "lin")          # 纯轴序：最后一段直接到抓取点
+        if not segs:
+            segs = [(T_grasp, "lin")]
+
+        if check:
+            self.check_waypoints(arm, [T for T, _ in segs])
+        return self.start_waypoints(arm, segs)
+
     def lin_status(self, arm: str) -> str:
         """给日志用的一行状态（没有直线段时返回空串）。"""
+        pl = self.plan.get(arm)
+        if pl is not None and not pl.done:
+            return f"路点 {pl.idx + 1}/{len(pl.segs)}"
         ap = self._approach.get(arm)
         if ap is not None:
             return "接近: 前往 pre-grasp"
@@ -660,6 +845,33 @@ class ArmController:
         """本周期真正喂给 IK 的位姿：有直线段就用路点，否则直接用最终目标。"""
         out = {}
         for arm, T_tgt in ((LEFT, T_L_tgt), (RIGHT, T_R_tgt)):
+            # ---- 多段路点计划优先（轴序分解等）----
+            pl = self.plan.get(arm)
+            if pl is not None:
+                if pl.done:
+                    self.plan[arm] = None
+                else:
+                    T_seg, mode = pl.head()
+                    if mode == "lin":
+                        mv = self.lin.get(arm)
+                        if mv is None:                     # 该起这一段了
+                            self.start_linear(arm, T_seg)
+                            # start_linear 会把 self.target 设成**这一段**的终点；
+                            # 计划模式下到位判定/制动距离必须始终看**最后一站**，改回来。
+                            self._assign_target(arm, pl.segs[-1][0])
+                            mv = self.lin.get(arm)
+                        out[arm] = mv.advance(dt)
+                        if mv.done:
+                            self.lin[arm] = None
+                            pl.idx += 1                    # 本段走完，下一拍起下一段
+                    else:                                  # 'ptp'：只把目标设成这个路点
+                        self._assign_target(arm, T_seg)
+                        T_cmd = self._cmd_pose_in_target_frame(arm)
+                        if (T_cmd is not None and float(np.linalg.norm(
+                                T_cmd[:3, 3] - T_seg[:3, 3])) <= self.lin_reach_tol):
+                            pl.idx += 1
+                        out[arm] = T_seg
+                    continue
             ap = self._approach.get(arm)
             if ap is not None and self.lin[arm] is None:
                 # 第一段：普通追 pre-grasp；**指令**位姿到了就切直线进给

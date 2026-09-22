@@ -194,6 +194,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="直线段的加加速度上限（默认沿用 --ee-jerk）")
     L.add_argument("--lin-rot-speed", type=float, default=None, metavar="RAD_S",
                    help="直线段的角速度上限（默认沿用 --ee-rot-speed）")
+    L.add_argument("--lin-axis-seq", choices=["off", "zyx", "zyx-tool"], default="off",
+                   help="轴序分解：off=关闭（默认）/ zyx=把转场按躯干系 z→y→x 逐轴对齐后直接到抓取点 / "
+                        "zyx-tool=轴序对齐到 pre-grasp 后再沿工具轴直线进给（推荐）")
+    L.add_argument("--lin-axis-order", default="zyx", metavar="XYZ",
+                   help="轴序（默认 zyx = 先对齐高度、再横向、最后沿 x 进给）")
+    L.add_argument("--lin-axis-check-mm", type=float, default=10.0, metavar="MM",
+                   help="启用轴序前的路点自检阈值：逐点试解 IK，残差超过它就告警（默认 10mm）")
     L.add_argument("--lin-abort-cycles", type=int, default=5, metavar="N",
                    help="直线段里反解连续失败 N 个周期就取消该段并停住（默认 5 = 100ms）")
 
@@ -479,13 +486,29 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
     lin_mm = float(flags.get("lin_approach_mm", 0.0))
 
     def apply_abs_target(arm: str, pos) -> None:
-        """绝对位置目标：开了 --lin-approach 就先到 pre-grasp，再直线进给。
+        """绝对位置目标：按 --lin-axis-seq / --lin-approach 决定怎么过去。
 
         pre-grasp 用**锁定姿态的工具轴 x** 算：位置指令不携带姿态也能得到正确的进给方向；
         6003 协议一个字都不用改。姿态没锁定时退回旧的"直接设目标"。
         """
         T = ctrl.make_target_pose(arm, pos, rpy=rpy, quat=quat)
-        if lin_mm > 0 and T is not None:
+        if T is None:
+            ctrl.set_target_position(arm, pos, rpy=rpy, quat=quat)
+            return
+        if args.lin_axis_seq != "off":
+            # zyx-tool: 轴序对齐到 pre-grasp（沿工具轴后退 lin_approach），再沿工具轴进给
+            # zyx     : 纯轴序，最后一个轴对齐点就是抓取点（不再单独进给）
+            d = 0.0 if args.lin_axis_seq == "zyx" else lin_mm / 1000.0
+            try:
+                ctrl.start_axis_approach(arm, T, d, order=args.lin_axis_order,
+                                         final=("tool" if args.lin_axis_seq == "zyx-tool"
+                                                else "none"))
+                flags["retreated"] = False
+            except Exception as exc:
+                log.warning("轴序分解失败，退回直接设目标: %s", exc)
+                ctrl.set_target_position(arm, pos, rpy=rpy, quat=quat)
+            return
+        if lin_mm > 0:
             ctrl.start_approach(arm, T, lin_mm / 1000.0)
             flags["retreated"] = False
         else:
@@ -766,6 +789,7 @@ def main(argv=None) -> int:
     ctrl.lin_jerk = args.lin_jerk
     ctrl.lin_rot_speed = args.lin_rot_speed
     ctrl.lin_abort_cycles = max(1, int(args.lin_abort_cycles))
+    ctrl.axis_check_mm = float(args.lin_axis_check_mm)
     if args.lin_approach > 0:
         log.info("抓取进给: 先到 pre-grasp（沿工具轴后退 %.0fmm）再直线进给 %.0fmm/s、"
                  "jerk %s；反解失败 %d 周期即取消该段",
@@ -775,6 +799,10 @@ def main(argv=None) -> int:
                  ctrl.lin_abort_cycles)
     if args.lin_retreat > 0:
         log.info("抓取退出: 到位并闭爪完成后沿工具轴直线退出 %.0fmm", args.lin_retreat)
+    if args.lin_axis_seq != "off":
+        log.info("轴序分解: %s（轴序 %s）；转场按躯干系逐轴对齐后每段走笛卡尔直线，"
+                 "路点自检阈值 %.0fmm。注意：路点会先试解 IK，超阈值就在日志里告警",
+                 args.lin_axis_seq, args.lin_axis_order, args.lin_axis_check_mm)
 
     # 初始目标（--pos/--pos-left/--pos-right）
     #   注意：这一步发生在收到第一帧状态**之前**，参考姿态还没锁定 -> 工具轴未知，
@@ -958,11 +986,17 @@ def main(argv=None) -> int:
                     for a, p in parse_initial_targets(args).items():
                         if p is None or ctrl.target.get(a) is None:
                             continue
+                        T0 = np.asarray(ctrl.target[a], dtype=float).copy()
                         try:
-                            ctrl.start_approach(a, np.asarray(ctrl.target[a], dtype=float).copy(),
-                                                args.lin_approach / 1000.0)
+                            if args.lin_axis_seq != "off":
+                                d0 = 0.0 if args.lin_axis_seq == "zyx" else args.lin_approach / 1000.0
+                                ctrl.start_axis_approach(
+                                    a, T0, d0, order=args.lin_axis_order,
+                                    final=("tool" if args.lin_axis_seq == "zyx-tool" else "none"))
+                            else:
+                                ctrl.start_approach(a, T0, args.lin_approach / 1000.0)
                         except Exception as exc:
-                            log.warning("初始目标的两段式接近失败[%s]: %s", a, exc)
+                            log.warning("初始目标的接近段失败[%s]: %s", a, exc)
             except Exception as exc:
                 # 任何一帧的异常（IK/数值/API）都只该丢掉这一周期：直接退出会停止下发，
                 # 而这是会动机器人的程序 —— 连续失败太多才停手并报错退出。
