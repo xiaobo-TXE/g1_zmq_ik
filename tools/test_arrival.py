@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from arrival import (  # noqa: E402
     R_BLOCKED, R_FROZEN, R_MOVING, R_NEAR, R_STALE, R_TRACKING, R_UNREACHABLE,
-    ArrivalEvent, ArrivalMonitor, ArrivalThresholds, format_event,
+    ArrivalEvent, ArrivalMonitor, ArrivalThresholds, check_tolerance_guard,
+    format_event,
 )
 
 ARM = "right"
@@ -279,6 +280,35 @@ def s14_not_driven(dt: float = 0.02):
     return mon, events
 
 
+def s15_hunting_unreachable(dt: float = 0.02):
+    """真机踩过的情形：目标不可达，手臂停在"能到的最近处"但**仍在以 ~1.5mm/s 微调**。
+
+    旧实现把"停下"的门槛定成 1mm/s，于是这条永远不满足 -> 原因被报成"仍在跟随"。
+    实测日志就是：反解残差 67mm，却写"原因：仍在跟随（伺服滞后 / 腰角换算偏置）"，
+    排查方向被完全带偏（会去查控制器/腰角，而问题是目标根本到不了）。
+    """
+    mon = ArrivalMonitor(thresholds(timeout_s=0.0))
+    t, events = 0.0, []
+    pos = P_TGT + DIR * 0.067
+    for _ in range(200):                    # 4s：每帧 0.03mm = 1.5mm/s 的微调
+        pos = pos + DIR * 0.00003
+        events += step(mon, info(0.067, pos, np.zeros(14), ik_pos=0.067), t, dt)
+        t += dt
+    return mon, events
+
+
+def s16_guard_cases():
+    """容差护栏的几种取值（返回 [(说明, errors, warnings), ...]）。"""
+    cases = [
+        ("默认 2mm/1°", ArrivalThresholds(pos_m=0.002, rot_rad=float(np.deg2rad(1.0)))),
+        ("放到 80mm/90°", ArrivalThresholds(pos_m=0.080,
+                                            rot_rad=float(np.deg2rad(90.0)))),
+        ("20mm/20°（只告警）", ArrivalThresholds(pos_m=0.020,
+                                                rot_rad=float(np.deg2rad(20.0)))),
+    ]
+    return [(name, *check_tolerance_guard(th, 0.030)) for name, th in cases]
+
+
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
@@ -300,7 +330,7 @@ def main() -> int:
     print("\n[0] 判据与格式化")
     th = thresholds()
     check("阈值描述可生成", "位置≤2.0mm" in th.describe(), th.describe())
-    check("format_event 三种事件都不抛异常", all(
+    check("format_event 四种事件都不抛异常", all(
         format_event(e) for e in (
             ArrivalEvent(kind="arrived", arm=ARM, t=1.0, settle_s=0.5,
                          dwell_s=0.2, track_pos=0.001, track_rot=1e-3,
@@ -308,6 +338,10 @@ def main() -> int:
             ArrivalEvent(kind="departed", arm=ARM, t=1.0,
                          track_pos=0.005, track_rot=1e-3, exit_pos=0.004,
                          exit_rot=0.02, hysteresis=2.0),
+            ArrivalEvent(kind="unreachable", arm=ARM, t=1.0, track_pos=0.067,
+                         track_rot=0.64, ik_pos=0.067, ik_rot=0.64,
+                         speed=0.0015, joint_speed=0.01, at_limit=1,
+                         ik_status="ok"),
             ArrivalEvent(kind="timeout", arm=ARM, t=6.0, elapsed_s=5.0,
                          reason=R_UNREACHABLE, track_pos=0.045,
                          track_rot=0.02, ik_pos=0.045, ik_rot=0.02,
@@ -352,12 +386,18 @@ def main() -> int:
     mon, events = s3_unreachable()
     show(events)
     kinds = [e.kind for e in events]
-    check("只有一条超时事件", kinds == ["timeout"], f"kinds={kinds}")
+    # "不可达"现在是**独立结论**：有自己的事件、比通用 timeout 更早报出来，
+    # 报到之后就不再补一句 timeout（两条消息说同一件事会让人以为有两个问题）。
+    check("报出一条 unreachable 事件（且没有多余的 timeout）",
+          kinds == ["unreachable"], f"kinds={kinds}")
     if events:
         check("原因 = 不可达", events[0].reason == R_UNREACHABLE, events[0].reason)
         check("文本含 '不可达'", "不可达" in format_event(events[0]))
         check("文本含实测残差 45.0mm", "45.0mm" in format_event(events[0]))
+        check("比 --arrive-timeout(2s) 更早报出（不是等超时）",
+              events[0].t < 2.0, f"t={events[0].t:.2f}s")
     check("状态行标注 ✗不可达", "不可达" in mon.line(ARM), mon.line(ARM))
+    check("unreachable() 查询可用", mon.unreachable(ARM) is True)
 
     # --- 场景 4：被挡住 + 限位
     print("\n[5] 末端静止但离目标 30mm（被挡住/限位）")
@@ -429,8 +469,9 @@ def main() -> int:
     show(events)
     check("追赶中原因 = 跟随中（不是不可达）", r_transient == R_TRACKING, r_transient)
     if events:
-        check("超时事件原因 = 不可达（已停下）", events[0].reason == R_UNREACHABLE,
-              events[0].reason)
+        check("停稳后报出 unreachable 事件（不是含糊的 timeout）",
+              events[0].kind == "unreachable" and events[0].reason == R_UNREACHABLE,
+              f"kind={events[0].kind} reason={events[0].reason}")
         check("文本含 '不可达'", "不可达" in format_event(events[0]))
 
     # --- 场景 13：判据过严的近失
@@ -455,8 +496,38 @@ def main() -> int:
         txt = format_event(events[0])
         check("文本解释是 --arm 没选中它", "--arm" in txt, txt)
 
+    # --- 场景 15：停在不可行位姿但仍在微调（真机踩过的那条）
+    print("\n[17] 不可达但仍在 ~1.5mm/s 微调（旧实现会误报'跟随中'）")
+    mon, events = s15_hunting_unreachable()
+    show(events)
+    check("原因 = 不可达（不是'跟随中'）", mon.reason(ARM) == R_UNREACHABLE, mon.reason(ARM))
+    check("报出了 unreachable 事件", [e.kind for e in events] == ["unreachable"],
+          f"kinds={[e.kind for e in events]}")
+    if events:
+        check("文本给出反解残差 67.0mm（而不是含糊的'伺服滞后'）",
+              "67.0mm" in format_event(events[0]), format_event(events[0]))
+    check("状态行标注 ✗不可达", "不可达" in mon.line(ARM), mon.line(ARM))
+
+    # --- 场景 16：容差护栏
+    print("\n[18] 容差护栏（判据不能宽到'随便什么位姿都算到位'）")
+    guards = s16_guard_cases()
+    for name, errs, warns in guards:
+        print(f"     {name}: errors={len(errs)} warnings={len(warns)}")
+        for msg in errs + warns:
+            print(f"        {msg}")
+    g = dict((name, (e, w)) for name, e, w in guards)
+    check("默认 2mm/1° 对 30mm 物体：无错误、无告警",
+          not g["默认 2mm/1°"][0] and not g["默认 2mm/1°"][1])
+    check("放到 80mm/90°：两项都报错（会夹空 + 不约束姿态）",
+          len(g["放到 80mm/90°"][0]) == 2, f"errors={g['放到 80mm/90°'][0]}")
+    check("20mm/20°：只告警不报错",
+          not g["20mm/20°（只告警）"][0] and len(g["20mm/20°（只告警）"][1]) == 2,
+          f"warnings={g['20mm/20°（只告警）'][1]}")
+    check("--arrive-object-mm 0：护栏关闭（不误伤不用夹爪的场合）",
+          not any(check_tolerance_guard(ArrivalThresholds(pos_m=0.5), 0.0)[0]))
+
     # --- 统计行
-    print("\n[16] 统计输出")
+    print("\n[19] 统计输出")
     check("stats() 非空", bool(mon.stats()), mon.stats()[:110] + " ...")
 
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)

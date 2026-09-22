@@ -38,13 +38,15 @@ import os
 import sys
 import threading
 import time
+from dataclasses import replace
 from typing import Dict, Optional
 
 import numpy as np
 
 import joint_map
 from config_file import add_config_argument, describe_applied, parse_args_with_config
-from arrival import ArrivalMonitor, ArrivalThresholds, format_event
+from arrival import (ArrivalMonitor, ArrivalThresholds, check_tolerance_guard,
+                     format_event)
 from controller import ArmController, LEFT, RIGHT, format_step
 from grip_control import SoftClose, SoftCloseConfig
 from g1_ik import G1ArmModel, make_ik
@@ -220,6 +222,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="判据⑤：关节速度上限（EMA），防止在零空间里还在漂")
     g.add_argument("--arrive-timeout", type=float, default=5.0, metavar="S",
                    help="目标变更后多久仍未到位就报告一次原因（只报告，不影响控制）；0=不报告")
+    g.add_argument("--arrive-object-mm", type=float, default=30.0, metavar="MM",
+                   help="被夹物体的最小尺寸，用于**容差护栏**（默认 30 = 盒子窄边）。容差不是能"
+                        "随便拍的数：位置容差 ≥ 该尺寸时启动即报错（偏差比整个物体还大，夹爪合上"
+                        "必然夹空）；≥ 一半时告警。0=关闭护栏")
     g.add_argument("--on-arrive", default="none", choices=["none", "freeze", "exit"],
                    help="到位后的动作：none=只报告 / freeze=停止自动目标推进(demo 轨迹、"
                         "ZMQ 目标流)，交互命令 p/d/r 可解冻 / exit=到位即退出")
@@ -428,9 +434,19 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
             if mon is None:
                 log.warning("到位判定已关闭（--no-arrive），t 命令无效")
             else:
-                mon.th.pos_m = abs(float(args[0])) / 1000.0
-                mon.th.rot_rad = float(np.deg2rad(abs(float(args[1]))))
-                log.info("到位判据 -> %s", mon.th.describe())
+                # 运行时放宽也过同一道护栏：判据不能松到"随便什么位姿都算到位"，
+                # 否则真机上会变成一个安静的夹空（启动时的护栏在这里被绕开就没意义了）
+                new_th = replace(mon.th, pos_m=abs(float(args[0])) / 1000.0,
+                                 rot_rad=float(np.deg2rad(abs(float(args[1])))))
+                errs, warns = check_tolerance_guard(new_th, flags.get("arrive_object_m", 0.0))
+                if errs:
+                    for msg in errs:
+                        log.error("拒绝改为该判据: %s", msg)
+                else:
+                    mon.th.pos_m, mon.th.rot_rad = new_th.pos_m, new_th.rot_rad
+                    for msg in warns:
+                        log.warning("到位判据: %s", msg)
+                    log.info("到位判据 -> %s", mon.th.describe())
         elif head == "a" and len(args) == 1 and args[0] in ("left", "right", "both"):
             ctrl.controlled = args[0]
             flags["arms"] = [LEFT, RIGHT] if args[0] == "both" else [args[0]]
@@ -862,7 +878,7 @@ def main(argv=None) -> int:
     # 到位判定
     arrival = None
     if not args.no_arrive:
-        arrival = ArrivalMonitor(ArrivalThresholds(
+        th = ArrivalThresholds(
             pos_m=args.arrive_pos / 1000.0,
             rot_rad=float(np.deg2rad(args.arrive_rot)),
             ik_pos_m=args.arrive_ik_pos / 1000.0,
@@ -870,7 +886,19 @@ def main(argv=None) -> int:
             dwell_s=args.arrive_dwell,
             speed_mps=args.arrive_speed / 1000.0,
             joint_speed_rps=float(np.deg2rad(args.arrive_joint_speed)),
-            timeout_s=args.arrive_timeout), on_arrive=args.on_arrive)
+            timeout_s=args.arrive_timeout)
+        # 容差护栏：判据放宽到"随便什么位姿都算到位"时，它会把"明显没到"变成"到了"
+        # （实测：容差 80mm 时会 ✅ 到位在离目标 67.6mm 处，而盒子窄边只有 30mm）。
+        # 这种配置必须在启动时就拒绝，而不是让它到真机上去夹空。
+        guard_errors, guard_warnings = check_tolerance_guard(th, args.arrive_object_mm / 1000.0)
+        for msg in guard_warnings:
+            log.warning("到位判据: %s（--arrive-object-mm %.0f）", msg, args.arrive_object_mm)
+        if guard_errors:
+            for msg in guard_errors:
+                log.error("到位判据护栏: %s", msg)
+            log.error("请收紧 --arrive-pos / --arrive-rot，或用 --arrive-object-mm 0 显式关闭护栏")
+            return 2
+        arrival = ArrivalMonitor(th, on_arrive=args.on_arrive)
         log.info("到位判定: %s", arrival.describe())
         if args.on_arrive != "none":
             log.info("到位后动作=%s（首次到位时生效；freeze 可用交互命令 p/d/r 解冻）", args.on_arrive)
@@ -901,7 +929,8 @@ def main(argv=None) -> int:
              "startup_approach_pending": bool(args.lin_approach > 0 and not args.lin_all),
              "startup_move_pending": bool(args.lin_all) and any(
                  p is not None for p in parse_initial_targets(args).values()),
-             "arrival": arrival, "frozen": False, "grip_rx": grip_rx, "soft": soft}
+             "arrival": arrival, "frozen": False, "grip_rx": grip_rx, "soft": soft,
+             "arrive_object_m": args.arrive_object_mm / 1000.0}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
     last_target_warn = 0.0
     console = None

@@ -10,6 +10,12 @@
    但根本没停住（`--demo circle` 就是这种情形）。所以要求末端/关节速度也小。
 4. **要判目标可达**。反解残差大说明目标在可达范围之外，手臂停在"能到的最近处"，
    这时即使实测误差偶然很小也不算到位（默认 3mm/2°，可用 `--arrive-ik-pos 0` 关掉）。
+   "不可达"是**独立结论**：它有自己的事件（`kind="unreachable"`）和查询接口，
+   一旦成立就**短路**掉"跟随中/被挡住/临界未达"这些解释，并且比 `timeout` 更早报出来
+   —— 否则真机上表现为"手臂一直在微调、状态行永远写'跟随中'"，没人知道目标根本到不了。
+   **但速度判据不能去掉**：反解残差大有两个来源 —— 目标真的不可行，和 **IK 热启动太远
+   导致本帧没收敛**（限速追赶时就是这样，追上后残差自己会回落）。两者只能靠"手臂是否
+   已经停下"区分（`settled_speed_mps`），光看残差会把追赶误报成不可达。
 5. **要判数据可信**。状态帧超时、本帧没下发时不做判定——否则会把"僵住的旧数据"
    当成到位。
 6. **目标真的变了才重新计时**。ZMQ 目标流会以 30Hz 重复下发同一个目标，
@@ -129,7 +135,11 @@ class ArrivalThresholds:
     timeout_s: float = 5.0                        # 目标变更后多久未到位就报告一次原因，0=不报告
     max_state_age_s: float = 0.15                 # 状态帧年龄上限（超过则数据不可信）
     speed_ema: float = 0.35                       # 速度 EMA 系数
-    blocked_speed_mps: float = 0.001              # 判定"疑似被挡住"的速度上限 1mm/s
+    #: 判"手臂已经停下"的速度上限（5mm/s）。不可达/被挡住都是**稳态**结论，必须先确认停下：
+    #: 定 1mm/s 太紧 —— 真机停在不可行位姿处仍会以 ~1.5mm/s 来回微调，于是永远不满足，
+    #: 状态行就一直写"跟随中"（实测日志：反解残差 67mm 却报"伺服滞后/腰角换算偏置"）。
+    #: 5mm/s 比微调高 3 倍、比限速追赶（250mm/s 量级）低 50 倍，两边都有足够余量。
+    settled_speed_mps: float = 0.005
 
     def describe(self) -> str:
         ik = ("不判" if self.ik_pos_m <= 0
@@ -139,6 +149,52 @@ class ArrivalThresholds:
                 f"驻留{self.dwell_s:.2f}s 末端速度≤{_mm(self.speed_mps)}/s "
                 f"关节速度≤{_deg_s(self.joint_speed_rps)} "
                 f"滞回×{self.hysteresis:.1f} 超时报告={to}")
+
+
+#: 姿态容差硬上限：超过 45° 就已经越过"夹的是哪一对面"的分界 —— 再宽等于不约束姿态。
+GUARD_MAX_ROT_RAD = float(np.deg2rad(45.0))
+#: 位置容差相对物体窄边的告警线：超过半个物体，夹取线就已经滑出物面。
+GUARD_WARN_FRACTION = 0.5
+#: 姿态容差相对"开合方向"的告警线。
+GUARD_WARN_ROT_RAD = float(np.deg2rad(15.0))
+
+
+def check_tolerance_guard(th: "ArrivalThresholds", object_m: float):
+    """容差护栏：挡住"把判据放宽到随便什么位姿都算到位"。
+
+    返回 ``(errors, warnings)``（字符串列表）。容差不是能随便拍的数 —— 它必须小到
+    "夹爪合上时物体确实在两指之间"：
+
+    * ``pos_m >= 物体窄边`` —— **必然夹空**（偏差比整个物体还大，夹取点不可能落在物体上）。
+      硬错误，启动时就拒绝。实测过：容差放到 80mm 时它会"✅ 到位"在离目标 67.6mm 的
+      地方，而盒子窄边只有 30mm —— 判据越松越危险，因为它把"明显没到"变成了"到了"。
+    * ``pos_m >= 半个物体窄边`` —— 夹取线已经滑出物面，只是可能还凑巧在两指之间，告警。
+    * ``rot_rad >= 45°`` —— 越过"夹哪一对面"的分界，硬错误。
+    * ``rot_rad >= 15°`` —— 平行夹爪的开合方向明显偏了，告警。
+
+    `object_m` 是被夹方向上物体的最小尺寸；<=0 表示没给，直接不判。
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    obj = float(object_m)
+    if obj <= 0:
+        return errors, warnings
+    if th.pos_m >= obj:
+        errors.append(
+            f"位置容差 {_mm(th.pos_m)} 不小于物体窄边 {_mm(obj)}：偏差比整个物体还大，"
+            f"夹爪合上必然夹空 —— 这不是'到位'，是放弃判定")
+    elif th.pos_m >= obj * GUARD_WARN_FRACTION:
+        warnings.append(
+            f"位置容差 {_mm(th.pos_m)} 已达物体窄边 {_mm(obj)} 的 "
+            f"{100.0 * th.pos_m / obj:.0f}%：夹取线可能滑出物面")
+    if th.rot_rad >= GUARD_MAX_ROT_RAD:
+        errors.append(
+            f"姿态容差 {_deg(th.rot_rad)} 不小于 45°：已越过'夹哪一对面'的分界，"
+            f"等价于不约束姿态")
+    elif th.rot_rad >= GUARD_WARN_ROT_RAD:
+        warnings.append(
+            f"姿态容差 {_deg(th.rot_rad)} 偏大：平行夹爪的开合方向已明显偏移")
+    return errors, warnings
 
 
 @dataclass
@@ -187,6 +243,9 @@ class _ArmState:
     cycles: int = 0
     n_targets: int = 0                 # 目标变更计数
     n_arrived: int = 0
+    ik_bad_since: float = float("nan")      # 反解残差连续超阈的起始时刻（不可达的判据）
+    unreachable_reported: bool = False      # 本目标是否已报过"不可达"（同目标只报一次）
+    n_unreachable: int = 0
 
 
 def format_event(ev: ArrivalEvent) -> str:
@@ -205,6 +264,21 @@ def format_event(ev: ArrivalEvent) -> str:
         return (f"↩ 离开到位区 [{ev.arm}] 实测残差 {_mm(ev.track_pos)}/{_deg(ev.track_rot)}"
                 f" 超过离开阈值 {_mm(ev.exit_pos)}/{_deg(ev.exit_rot)}"
                 f"（到位阈值 ×{ev.hysteresis:.1f}），重新开始计时{p}")
+
+    if ev.kind == "unreachable":
+        # 独立结论：目标本身到不了，不是"还没走到"。提前报出来，免得只看到一句
+        # 含糊的"仍在跟随"而查错方向（实测踩过：反解残差 67mm 却报"伺服滞后"）。
+        hints = ["手臂已停稳"]
+        if ev.at_limit:
+            hints.append(f"顶到关节限位（{ev.at_limit} 个关节）")
+        if np.isfinite(ev.waist_bias) and ev.waist_bias > 0.001:
+            hints.append(f"腰部换算偏置 {_mm(ev.waist_bias)}（建议 --waist state）")
+        if ev.ik_status:
+            hints.append(f"求解器: {ev.ik_status}")
+        return (f"⛔ 目标不可达 [{ev.arm}] 反解残差 {_mm(ev.ik_pos)}/{_deg(ev.ik_rot)} "
+                f"超出可达判据，手臂停在能到的最近处（实测残差 "
+                f"{_mm(ev.track_pos)}/{_deg(ev.track_rot)}，末端 {_mm(ev.speed)}/s）；"
+                f"{'；'.join(hints)}{p}")
 
     if ev.kind == "timeout":
         hints: List[str] = []
@@ -328,6 +402,8 @@ class ArrivalMonitor:
             st.arrived = False
             st.timeout_reported = False
             st.settle_s = float("nan")
+            st.ik_bad_since = float("nan")      # 换了目标：可达性重新计
+            st.unreachable_reported = False
 
         # ---- 采集 + 速度
         self._speeds(info, st, arm, dt)
@@ -370,13 +446,28 @@ class ArrivalMonitor:
                     and (st.jv_ema is None
                          or (np.isfinite(vals["jv"]) and vals["jv"] <= th.joint_speed_rps)))
 
+        # ---- 可达性：反解残差连续超阈多久（"不可达"的判据，见下）
+        #  超阈要**连续**成立：单帧抖动、以及 IK 换热启动的那一帧不算。
+        ik_over = (not ok_ik) and ok_fresh and driven
+        if ik_over:
+            if not np.isfinite(st.ik_bad_since):
+                st.ik_bad_since = now
+        else:
+            st.ik_bad_since = float("nan")
+
         # ---- 原因分类（只影响诊断文本，不改变"是否到位"的结论）
-        #  "目标不可达 / 被挡住"都是**稳态**结论：必须先确认手臂已经停下来
+        #  "不可达 / 被挡住"都是**稳态**结论：必须先确认手臂已经停下来
         #  （末端速度≈0 且距目标变更已过一段稳定时间），否则只是在限速/伺服滞后的
         #  追赶过程中（--max-step-deg 限速时 ik_err 会瞬时很大），不能下这个结论。
-        settled = (np.isfinite(vals["v"]) and vals["v"] < th.blocked_speed_mps
+        settled = (np.isfinite(vals["v"]) and vals["v"] < th.settled_speed_mps
                    and np.isfinite(st.t_change)
                    and (now - st.t_change) > 2.0 * th.dwell_s + 0.1)
+        # 不可达 = 反解残差连续超阈 ≥dwell **且**手臂确已停稳。
+        # 停稳这一条不能省：ik_err 大也可能是 IK 热启动太远、本帧没收敛（追赶中就是这样，
+        # 追上后自己会回落），光看残差会把追赶误报成不可达。
+        unreachable = bool(settled
+                           and np.isfinite(st.ik_bad_since)
+                           and (now - st.ik_bad_since) >= th.dwell_s)
         if not ok_data:
             reason = R_NO_STATE
         elif age_ms > th.max_state_age_s * 1000.0:
@@ -385,11 +476,13 @@ class ArrivalMonitor:
             reason = R_NOT_SENT
         elif not driven:
             reason = R_FROZEN               # 压根没被驱动，谈不上"不可达/被挡住"
+        elif unreachable:
+            # 短路：目标本身就到不了，这与实测残差大小、与是否"还在动"都无关，
+            # 必须先说这个，否则会退化成含糊的"跟随中/被挡住"（真机排障会查错方向）
+            reason = R_UNREACHABLE
         elif not ok_pos:
             if not settled:
                 reason = R_TRACKING        # 还在动：限速/伺服滞后，先别下"不可达"的结论
-            elif not ok_ik:
-                reason = R_UNREACHABLE
             elif (np.isfinite(vals["tp"]) and
                   vals["tp"] > max(5.0 * th.pos_m, 0.01)):
                 reason = R_BLOCKED         # 差得远 + 停住 -> 疑似被挡住/卡住
@@ -434,6 +527,17 @@ class ArrivalMonitor:
                                   target, at_limit, bias, ik_status)
             return None
 
+        # ---- 不可达：作为独立结论提前报出来（每个目标只报一次）
+        #   它比通用 timeout 更早、更明确："目标本身到不了"和"还没走到"是两回事，
+        #   后者要继续等，前者等下去也不会有结果。报到之后就不再报通用 timeout 了 ——
+        #   两条消息说同一件事只会让人以为有两个问题。
+        if unreachable and not st.unreachable_reported:
+            st.unreachable_reported = True
+            st.timeout_reported = True
+            st.n_unreachable += 1
+            return self._make(st, arm, now, "unreachable", R_UNREACHABLE, ok_all, vals,
+                              target, at_limit, bias, ik_status)
+
         # ---- 超时：报告一次原因（不改变任何控制行为）
         if (th.timeout_s > 0 and not st.timeout_reported
                 and np.isfinite(st.t_change) and (now - st.t_change) >= th.timeout_s):
@@ -456,6 +560,14 @@ class ArrivalMonitor:
 
     def reason(self, arm: str) -> str:
         return self._st(arm).reason
+
+    def unreachable(self, arm: str) -> bool:
+        """该臂当前目标是否已判为**不可达**（独立结论，见 update）。
+
+        与 `reason() == R_UNREACHABLE` 等价，给调用方一个明确的门 ——
+        等到它比等到位更没意义，上层可以据此退开 / 放弃 / 重新对准。
+        """
+        return self.reason(arm) == R_UNREACHABLE
 
     def line(self, arm: str) -> str:
         """给状态行用的短标注（没有显式目标时返回空串）。"""
@@ -486,7 +598,8 @@ class ArrivalMonitor:
             avg = ""
             if st.n_arrived and np.isfinite(st.settle_s):
                 avg = f" / 末次耗时 {st.settle_s:.2f}s"
-            parts.append(f"{arm}: 目标 {st.n_targets} 个 / 到位 {st.n_arrived} 次{avg}"
+            unreach = f" / 不可达 {st.n_unreachable} 次" if st.n_unreachable else ""
+            parts.append(f"{arm}: 目标 {st.n_targets} 个 / 到位 {st.n_arrived} 次{avg}{unreach}"
                          f" / 末次实测残差 {_mm(st.res_pos)}/{_deg(st.res_rot)}"
                          f" / 当前 {REASON_TEXT.get(st.reason, st.reason)}")
         if not parts:

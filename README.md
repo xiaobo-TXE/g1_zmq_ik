@@ -341,6 +341,25 @@ for p in my_trajectory:                 # 想发多快就发多快，积压时�
   —— 防止目标快速移动时"路过"目标点被判到位
 - 状态帧不超时、本帧确实下发了
 
+**"不可达"是独立结论，不是含糊的"还在走"**。反解残差超阈且手臂已停稳时，会直接打印一条
+`⛔ 目标不可达 [右臂] 反解残差 67.1mm/36.75° ...`（**比 `--arrive-timeout` 更早报出**，
+每个目标只报一次，且不再补一句通用 timeout）。`ArrivalMonitor.unreachable(arm)` 也能查。
+这样区分是因为两者的处置完全相反：**没走到**要继续等，**到不了**等下去也不会有结果。
+
+> 注意"停稳"这一条不能省：反解残差大有两个来源 —— 目标真的不可行，和 **IK 热启动太远、
+> 本帧没收敛**（限速追赶时就是这样，追上后残差自己会回落）。两者只能靠"手臂是否已经停下"
+> 区分，只看残差会把追赶误报成不可达。停下判据是 5mm/s（不是 1mm/s）—— 真机停在不可行
+> 位姿处仍会以 ~1.5mm/s 微调，门槛定到 1mm/s 就永远满足不了，于是把"不可达"误报成
+> `✗跟随中（伺服滞后）`，排查方向全错。
+
+**容差护栏**：判据不能宽到"随便什么位姿都算到位"—— 判据越松越危险，因为它把"明显没到"
+变成了"到了"（实测：容差 80mm 时会 ✅ 到位在离目标 **67.6mm** 处，而盒子窄边只有 30mm，
+夹爪合上必然夹空）。所以启动时会按 `--arrive-object-mm`（默认 30 = 盒子窄边）校验：
+
+- `--arrive-pos` ≥ 该尺寸 → **启动即报错退出**（偏差比整个物体还大）；≥ 一半 → 告警
+- `--arrive-rot` ≥ 45° → **启动即报错**（越过"夹哪一对面"的分界，等于不约束姿态）；≥ 15° → 告警
+- `--arrive-object-mm 0` 关闭护栏（不用夹爪的场合）
+
 到位后的动作由 `--on-arrive` 决定：`none` 只报告（默认）；`freeze` 停止自动推进目标（交互命令
 `p/d/r` 可解冻）；`exit` 到位即退出并打印残差与耗时。它与 `--grip-on-arrive*` 正交，可以一起用。
 
@@ -381,7 +400,8 @@ Dex1 抓取中心；0.185=指尖平面；Dex3 用 0.05）、`--solver auto|casad
 
 **到位判定**：`--no-arrive`、`--arrive-pos`（2.0mm）、`--arrive-rot`（1.0°）、`--arrive-ik-pos`（3.0mm）、
 `--arrive-ik-rot`（2.0°）、`--arrive-dwell`（0.2s）、`--arrive-speed`（15mm/s）、
-`--arrive-joint-speed`（10°/s）、`--arrive-timeout`（5.0s）、`--on-arrive none|freeze|exit`。
+`--arrive-joint-speed`（10°/s）、`--arrive-timeout`（5.0s）、`--arrive-object-mm`（30，容差护栏，
+`0`=关）、`--on-arrive none|freeze|exit`。
 
 **安全**：`--max-step-deg`（每周期每关节最大增量 2.0°，0=不限）、`--ee-speed`（0.10m/s，0=不限）、
 `--ee-accel`（0.20m/s²）、`--ee-jerk`（0=不限；给了就把梯形曲线变成 S 形）、`--ee-rot-speed`、
@@ -392,7 +412,8 @@ Dex1 抓取中心；0.185=指尖平面；Dex3 用 0.05）、`--solver auto|casad
 **检测端**（`tools/detect_aruco_zmq.py`）：`--endpoint`（相机图像流）、`--camera-name`（默认
 `ego_view`）、`--marker-size`（米）、`--dictionary`、`--ids`、`--confirmation-frames`（3）、
 `--max-distance`、`--max-reprojection-error-px`、`--marker-to-grasp DX DY DZ`、
-`--grasp-align-rpy R P Y`、`--no-quat`、`--target-endpoint`（6003）、`--target-hz`（20）、
+`--grasp-align-rpy R P Y`、`--no-quat`、`--marker-up`/`--no-marker-up`（IPPE 镜像支先验，默认开）、
+`--target-endpoint`（6003）、`--target-hz`（20）、
 `--deadband-mm`（2）、`--jump-reject-mm`（100）、`--jump-recover-s`（0.5）、`--no-send`、
 `--print-axes`、`--suggest-align`、`--no-display`。
 
