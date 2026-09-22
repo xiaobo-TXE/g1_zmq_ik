@@ -324,6 +324,7 @@ class StepInfo:
     q_waist: Optional[np.ndarray] = None
     ee_meas: Dict[str, np.ndarray] = field(default_factory=dict)
     ee_cmd: Dict[str, np.ndarray] = field(default_factory=dict)
+    ee_ik: Dict[str, np.ndarray] = field(default_factory=dict)     # 反解解出的点位（目标系，与 tgt 逐轴可比）
     ee_target: Dict[str, np.ndarray] = field(default_factory=dict)
     err_ik_pos: Dict[str, float] = field(default_factory=dict)     # 指令离目标多远（求解精度）
     err_ik_rot: Dict[str, float] = field(default_factory=dict)
@@ -348,13 +349,24 @@ def format_step(info: StepInfo, arm: str, with_joints: bool = False,
         return f"[{info.t:7.2f}s] #{info.cycle:<5d} {info.state_age_ms:6.1f}ms  {'; '.join(info.notes)}"
     p_m = info.ee_meas[arm][:3, 3]
     p_t = info.ee_target[arm][:3, 3]
+    T_i = info.ee_ik.get(arm)
+    p_i = None if T_i is None else T_i[:3, 3]
     eik = info.err_ik_pos.get(arm, float("nan")) * 1000
     rik = np.rad2deg(info.err_ik_rot.get(arm, float("nan")))
     etr = info.err_track_pos.get(arm, float("nan")) * 1000
     rtr = np.rad2deg(info.err_track_rot.get(arm, float("nan")))
+    # 反解到达点 ik= 是"反解解出的关节角再正解回去"的位置（目标系），
+    # 与 tgt= 逐轴相减得到 d_ik=：想直接看某个轴差多少毫米（比如 y 方向偏了几厘米）就看它，
+    # 不用自己拿 tgt 减 ik。d_ik 的模长就是 ik_err。
+    ik_part = ""
+    if p_i is not None:
+        d = (p_i - p_t) * 1000.0
+        ik_part = (f"ik=({p_i[0]:+.3f},{p_i[1]:+.3f},{p_i[2]:+.3f}) "
+                   f"d_ik=({d[0]:+6.1f},{d[1]:+6.1f},{d[2]:+6.1f})mm ")
     line = (f"[{info.t:7.2f}s] #{info.cycle:<5d} {info.state_age_ms:5.1f}ms "
             f"meas=({p_m[0]:+.3f},{p_m[1]:+.3f},{p_m[2]:+.3f}) "
             f"tgt=({p_t[0]:+.3f},{p_t[1]:+.3f},{p_t[2]:+.3f}) "
+            f"{ik_part}"
             f"ik_err={eik:6.1f}mm/{rik:5.1f}° track_err={etr:6.1f}mm/{rtr:5.1f}° "
             f"ik={info.ik_ms:5.1f}ms "
             f"v={info.ee_speed_mm_s:6.1f}mm/s"
@@ -1347,13 +1359,23 @@ class ArmController:
             info.sent = True
 
         # 9) 诊断（全部在【目标系】里比较，与 target_frame 一致）
-        #    ik_err   : 求解系（torso）下比较"IK 原始解 FK"与"IK 目标" -> 纯求解精度
+        #    ik_err   : 求解系（torso）下比较"IK 原始解 FK"与"IK 目标" -> 求解精度
         #    track_err: 目标系下比较"实测 FK"与"目标"                -> 真实物理偏差（伺服滞后等）
         #    注：target_frame="torso" 时目标相对躯干，求解系与目标系同为 torso 系，腰角不进入误差；
         #        target_frame="pelvis" 时 track_err 还含腰部换算偏置（见 info.waist_bias_mm）
+        #    注：有直线段时 IK 追的是**路点**，而这里的 T_*_tgt 是**终点**（到位判定看终点）。
+        #        所以直线段进行中 ik_err 主要是"路点落后终点多少"，只在路点走完/无直线段时
+        #        才等于纯求解精度。想看求解精度要看直线段结束后的那几帧。
         T_L_raw_base, T_R_raw_base = self.model.fk(q_raw)   # IK 原始解（未限幅）-> 纯求解质量
         T_L_cmd_tf, T_R_cmd_tf = self.ee_in_target_frame(q_send, waist_true, use_true_waist=True)
         info.ee_cmd = {LEFT: T_L_cmd_tf, RIGHT: T_R_cmd_tf}
+        # 反解"到达点"：把 IK 解 q_raw 再正解回去，表达在【目标系】里，和日志里的 tgt= 逐轴可比。
+        # 这是"反解认为末端会被送到哪儿"，不含伺服滞后；与 ik_err 的区别只在于表达方式：
+        # ik_err 是求解系(torso)下的偏差模长，这里是目标系下的坐标 + 逐轴毫米差。
+        # 默认 target_frame=torso 时两者同源；pelvis 模式下 ik= 还含一次腰部换算。
+        # （IK 失败时上面已经 return，走到这里 q_raw 一定是有限的有效解。）
+        T_L_ik_tf, T_R_ik_tf = self.ee_in_target_frame(q_raw, waist_true, use_true_waist=True)
+        info.ee_ik = {LEFT: T_L_ik_tf, RIGHT: T_R_ik_tf}
         # 本周期指令末端实际移动速度（用于核对速度上限是否生效）
         for arm, T_now in ((LEFT, T_L_cmd_tf), (RIGHT, T_R_cmd_tf)):
             T_prev = self._prev_ee_cmd.get(arm)
