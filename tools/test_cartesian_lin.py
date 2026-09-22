@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -27,7 +28,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from arrival import ArrivalMonitor, ArrivalThresholds          # noqa: E402
-from controller import ArmController, LEFT, RIGHT, LinearMove, _rot_log  # noqa: E402
+from controller import (ArmController, LEFT, RIGHT, LinearMove, _rot_log,  # noqa: E402
+                        format_step)
 from g1_ik import G1ArmModel, make_ik, rotation_to_quat        # noqa: E402
 
 HERE = Path(__file__).resolve().parent.parent
@@ -254,16 +256,23 @@ def main() -> int:
     ctrl.start_linear(RIGHT, goal)
     lin = ctrl.lin[RIGHT]
     traj, targets, progs = [], [], []
+    ikpts, ikerrs, dnorm, lines = [], [], [], []
     for _ in range(400):
         info = ctrl.step(0.02)
         traj.append(info.ee_cmd[RIGHT][:3, 3].copy())
         targets.append(info.ee_target[RIGHT][:3, 3].copy())
+        ikpts.append(info.ee_ik[RIGHT][:3, 3].copy())
+        ikerrs.append(info.err_ik_pos[RIGHT])
         progs.append(lin.progress())
+        lines.append(format_step(info, RIGHT))
         if lin.done and lin.progress() >= 1.0:
             for _ in range(20):
                 info = ctrl.step(0.02)
                 traj.append(info.ee_cmd[RIGHT][:3, 3].copy())
                 targets.append(info.ee_target[RIGHT][:3, 3].copy())
+                ikpts.append(info.ee_ik[RIGHT][:3, 3].copy())
+                ikerrs.append(info.err_ik_pos[RIGHT])
+                lines.append(format_step(info, RIGHT))
             break
     traj = np.array(traj)
     p0, p1 = lin.p0, lin.p1
@@ -280,6 +289,33 @@ def main() -> int:
           f"与终点最大偏差 {tgt_err:.2e} m（到位判定因此不会中途误判）")
     check("直线段跑完后自动清空", ctrl.lin[RIGHT] is None)
     check("进度全程单调不减", bool(np.all(np.diff(np.array(progs)) >= -1e-12)))
+
+    # 控制端日志里的"反解到达点"：ik=(x,y,z) + 逐轴差 d_ik=(dx,dy,dz)mm
+    #   定义：把 IK 解 q_raw 再正解一次、表达在目标系里；所以 |ik − tgt| 必须恒等于 ik_err。
+    ikpts = np.array(ikpts)
+    worst = max(abs(float(np.linalg.norm(T_ik - T_tg)) - e)
+                for T_ik, T_tg, e in zip(ikpts, targets, ikerrs))
+    check("每周期都带反解到达点，且 |ik−tgt| 恒等于 ik_err",
+          len(ikpts) == len(traj) and worst < 1e-9,
+          f"{len(ikpts)} 周期，最大不一致 {worst:.2e} m")
+    k = int(np.argmax(ikerrs))                    # 挑残差最大的那帧来验打印格式
+    m_ik = re.search(r"ik=\(([-+0-9.]+),([-+0-9.]+),([-+0-9.]+)\)", lines[k])
+    m_d = re.search(r"d_ik=\(([-+0-9. ]+),([-+0-9. ]+),([-+0-9. ]+)\)mm", lines[k])
+    m_e = re.search(r"ik_err=\s*([0-9.]+)mm", lines[k])
+    check("日志行里能解析出 ik= / d_ik=(mm) / ik_err=", bool(m_ik and m_d and m_e),
+          f"该帧 ik_err={ikerrs[k]*1000:.1f}mm")
+    if m_ik and m_d and m_e:
+        p_ik = np.array([float(v) for v in m_ik.groups()])
+        p_d = np.array([float(v) for v in m_d.groups()])
+        check("打印的 ik= 就是该帧反解到达点坐标（对齐到 0.001m）",
+              np.abs(p_ik - ikpts[k]).max() <= 5e-4,
+              f"最大 {np.abs(p_ik - ikpts[k]).max()*1000:.3f} mm")
+        check("打印的 d_ik 逐轴等于 ik − tgt（mm）",
+              np.abs(p_d - (ikpts[k] - targets[k]) * 1000.0).max() < 0.11,
+              f"最大 {np.abs(p_d - (ikpts[k] - targets[k]) * 1000.0).max():.3f} mm")
+        check("d_ik 的模长就是同一行的 ik_err（同一含义、两种表达）",
+              abs(float(np.linalg.norm(p_d)) - float(m_e.group(1))) < 0.5,
+              f"|d_ik|={np.linalg.norm(p_d):.1f}mm  ik_err={m_e.group(1)}mm")
 
     # ---------------- [5] IK 失效即停 ----------------
     print("\n[5] IK 失效即停：路点冻结 -> 取消整段")
