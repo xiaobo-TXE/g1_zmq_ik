@@ -411,38 +411,3 @@ python tools/test_cartesian_lin.py    # 笛卡尔直线段（直线度/姿态插
 python tools/test_axis_sequence.py    # 轴序分解路点计划（分支上的功能）
 python tools/selftest_offline.py      # 正解一致性 / 反解精度 / 轨迹跟踪
 ```
-
----
-
-## 11. 目录
-
-```
-main.py             主程序：参数、控制循环、键盘命令、日志
-g1_ik.py            正解/反解核心（CasADi+IPOPT 原算法，含 DLS 回退求解器）
-controller.py       闭环控制：读 → 正解 → 目标 → 反解 → 限幅 → 下发
-arrival.py          到位判定：判据 + 状态机 + 没到位的原因分类
-zmq_link.py         6001 订阅读状态 / 6002 推送指令
-joint_map.py        电机序 ↔ SDK 关节名 ↔ LeRobot 键名
-target_io.py        6003 目标流输入
-grip_control.py     夹爪：力限软闭合状态机
-sim_arm.py          一阶跟随仿真手臂（--sim 与 mock_robot 共用）
-config_file.py      --config 的共用实现
-robot.example.json  --config 示例（main / aruco 两段），复制成 robot.json 用
-assets/g1/          官方 URDF（只需 URDF，不需要 meshes）
-tools/              相机检测端、发送/仿真工具、离线单测、审计脚本
-docs/               与宇树源码的逐行对照、ZMQ 协议逐字段说明
-```
-
-`tools/` 里除了检测端 `detect_aruco_zmq.py`，还有：`send_target.py`（6003 目标发生器）、
-`mock_robot.py` / `mock_groot_status.py` / `mock_gripper_box.py`（不接真机联调）、
-`read_state.py` / `send_test.py`（裸端口收发）、`tune_motion.py`（速度/加速度标定）、
-`selftest_offline.py` 与 `test_*.py`（离线单测）、以及 `audit_*.py`（独立核对脚本，
-用合成真值验证坐标系与轨迹，不依赖机器人）。
-
----
-
-## 12. 来源与许可
-
-反解算法抽取自 Unitree 官方 `xr_teleoperate` 的 `teleop/robot_control/robot_arm_ik.py`（G1_29_ArmIK），
-权重与 IPOPT 选项逐项对照见 `docs/对照宇树源码.md`；ZMQ 协议逐字段说明见 `docs/协议与实测.md`。
-许可见 `NOTICE`。
