@@ -268,6 +268,79 @@ def main() -> int:
     check("没有上一帧时返回重投影最小的解（有限值）", np.isfinite(reproj) and reproj < 1.0,
           f"reproj={reproj:.3f}px")
 
+    print("\n[8] IPPE 首帧选解：--marker-up 物理先验（重投影两支只差零点几像素，判不出来）")
+
+    def _se3(R, t):
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = t
+        return T
+
+    def _torso_normal_z(rvec):
+        """标记法向在 torso 系的竖直分量：平贴朝上的正确支 ≈ +1，镜像支明显更小。"""
+        R = mod2.R_TORSO_D435 @ mod2.R_D435_OPTICAL @ mod2.cv2.Rodrigues(rvec)[0]
+        return float(R[2, 2])
+
+    def _img_points(gt_T_torso):
+        chain = _se3(mod2.R_TORSO_D435, mod2.T_TORSO_D435) @ _se3(
+            mod2.R_D435_OPTICAL, np.zeros(3))
+        gt_T_optical = np.linalg.inv(chain) @ gt_T_torso
+        pts, _ = mod2.cv2.projectPoints(objp,
+                                        mod2.cv2.Rodrigues(gt_T_optical[:3, :3])[0],
+                                        gt_T_optical[:3, 3],
+                                        mod2.CAMERA_MATRIX, mod2.DISTORTION)
+        return pts.reshape(4, 2), gt_T_optical[:3, :3]
+
+    # ---- 平贴朝上（盒顶标签）：先验应当稳定选中正确支 ----
+    # 角点必须**有噪声**：无噪声时两支重投影都是 0，平局靠迭代顺序偶然选对，测不出问题。
+    # 真机角点噪声约 0.2~0.5px —— 正是它让"按重投影选"变成掷硬币（见下面的失败计数）。
+    chain_flat = _se3(mod2.R_TORSO_D435, mod2.T_TORSO_D435) @ _se3(
+        mod2.R_D435_OPTICAL, np.zeros(3))
+
+    def _rz(angle):
+        c, s = np.cos(angle), np.sin(angle)
+        return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+    def _flat_corners(yaw_deg):
+        """标签平贴（法向朝上）、面内转 yaw 度，投影出的角点。"""
+        gt = _se3(_rz(np.radians(yaw_deg)), [0.40, -0.06, 0.13])
+        gto = np.linalg.inv(chain_flat) @ gt
+        pts, _ = mod2.cv2.projectPoints(objp, mod2.cv2.Rodrigues(gto[:3, :3])[0],
+                                        gto[:3, 3], mod2.CAMERA_MATRIX, mod2.DISTORTION)
+        return pts.reshape(4, 2)
+
+    n_trial, n_up, n_reproj, n_total = 40, 0, 0, 0
+    for yaw_deg in range(-60, 61, 20):
+        base_pts = _flat_corners(yaw_deg)
+        rng_t = np.random.default_rng(7)
+        for _ in range(n_trial):
+            ip = base_pts + rng_t.normal(0.0, 0.3, (4, 2))     # ~0.3px 角点噪声
+            rv_up, _, _ = mod2.choose_pose_solution(objp, ip, previous=None,
+                                                    prefer_normal_up=True)
+            rv_rp, _, _ = mod2.choose_pose_solution(objp, ip, previous=None,
+                                                    prefer_normal_up=False)
+            n_up += int(_torso_normal_z(rv_up) > 0.9)
+            n_reproj += int(_torso_normal_z(rv_rp) > 0.9)
+            n_total += 1
+    check(f"平贴朝上：先验在 {n_total} 帧带噪声角点上全部选对",
+          n_up == n_total, f"{n_up}/{n_total} 帧法向朝上")
+    check("只看重投影会选到镜像支（证明这个'平局'是真的、先验是必要的）",
+          n_reproj < n_total,
+          f"只按重投影 {n_reproj}/{n_total} 帧选对 → 剩下的姿态被噪声定成了镜像支")
+
+    # ---- 竖贴（法向水平）：两支都不朝上 → 先验必须自动让位，退回重投影 ----
+    gt_R_vert = np.array([[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]])  # Ry(90°)：法向 +x
+    ip_vert, _ = _img_points(_se3(gt_R_vert, [0.40, -0.06, 0.13]))
+    rv_v_off, tv_v_off, _ = mod2.choose_pose_solution(objp, ip_vert, previous=None,
+                                                      prefer_normal_up=False)
+    rv_v_on, tv_v_on, _ = mod2.choose_pose_solution(objp, ip_vert, previous=None,
+                                                    prefer_normal_up=True)
+    vert_z = max(_torso_normal_z(rv_v_off), _torso_normal_z(rv_v_on))
+    check("竖贴标签（两支法向都不朝上）→ 先验自动让位，退回按重投影选",
+          vert_z < mod2.MARKER_UP_MIN_Z
+          and np.array_equal(rv_v_on, rv_v_off) and np.array_equal(tv_v_on, tv_v_off),
+          f"两支最大 z·up={vert_z:+.3f} < 阈值 {mod2.MARKER_UP_MIN_Z}")
+
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
     print("\n" + "=" * 74)
     print(f"结果: {len(_RESULTS)-n_fail}/{len(_RESULTS)} 通过"

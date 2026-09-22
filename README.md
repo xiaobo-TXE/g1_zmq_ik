@@ -174,6 +174,15 @@ python tools/detect_aruco_zmq.py --config robot.json --no-send --print-axes
 判定标准是打印出来的 `axes(marker/torso)` 与 `axes(ee/torso)`：末端的 x 是探入方向、
 y 是手指开合方向、z 朝上。标签平贴盒顶时 `marker z ≈ (0,0,+1)`。
 
+**IPPE 双解与镜像支**：平面方标签的 solvePnP 会给出**两个解**（位置几乎相同、姿态差可达 ~90°），
+而**两支的重投影误差只差零点几像素** —— 落在角点噪声量级内。首帧没有上一帧可比，按重投影选
+等于让噪声决定姿态；一旦选中镜像支，时间连续性会一直把它锁死。后果不只是姿态错：抓取点 =
+标记中心 + R_marker @ offset，offset 会被错误的 R_marker 转掉，**只发位置也会偏 100mm 以上**。
+
+所以检测端默认用 `--marker-up`（标签平贴朝上）这个物理先验给首帧破平局：取法向 torso +z
+分量更大的一支。标签竖贴时两支都不朝上，先验自动让位、退回按重投影选（也可用
+`--no-marker-up` 显式关掉）。是否命中镜像支，看 `axes(marker/torso)`：平贴时 z 应 ≈ (0,0,+1)。
+
 ### 3.3 只发位置时的两个坑
 
 `--no-quat`（配置里 `send_quat=false`）时帧里只有 `{"pos": ...}`，末端姿态保持**启动瞬间锁定的

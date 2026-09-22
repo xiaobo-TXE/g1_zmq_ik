@@ -13,8 +13,11 @@
   * 新增 `--print-axes`：打印标记三个轴在 torso 系下的指向，用来确定"往哪个轴偏移"
   * 平面方标签的 **IPPE 双解消歧**：`SOLVEPNP_IPPE_SQUARE` 的两个解**位置几乎相同、姿态差约 10°**，
     只取第一个解时姿态会在两解之间翻；而 6003 的跳变过滤器**只看位置**，抓不到这种翻转 ✗。
-    现在用**时间连续性**选解（`choose_pose_solution()`：与上一帧位姿最接近的那个；
-    没有上一帧时取重投影最小的）
+    选解见 `choose_pose_solution()`：有上一帧时用**时间连续性**（与上一帧位姿最接近的那个）；
+    首帧没有上一帧可比，而两支的重投影误差只差零点几像素（噪声量级）—— 按重投影选等于让噪声定姿态，
+    选中镜像支后时间连续性会一直锁死它（姿态差 ~90°，`--marker-to-grasp` 的 offset 被 R_marker
+    旋转，抓取点能偏 100mm 以上）。所以首帧用 `--marker-up` 的**物理先验**破平局：标签平贴朝上时
+    取法向 torso +z 分量更大的一支；标签竖贴时（两支法向都不朝上）自动退回按重投影选
   * 图像流名自适应：publisher 用 `observation.images.left_wrist` 这类键、而 `--camera-name`
     写的是 `ego_view` 时，按"精确名 → 带前缀同名键 → 唯一一路图像"退让，且**只提示一次**
     （原来每帧刷 `[WARN] camera ... not found`，把目标位置打印淹掉了）
@@ -434,15 +437,30 @@ class TargetSender:
             self.socket.close(linger=0)
 
 
-def choose_pose_solution(object_points, image_points, previous=None):
+#: 用"法向朝上"破 IPPE 平局时，候选支的法向至少要达到的 torso +z 分量。
+#: 实测正确支 +0.8~+1.0、镜像支 -0.5~+0.1（两支相差约 0.9~1.3），取 0.5（法向离竖直 60° 内）
+#: 既能稳定选中正确支，又能在"标签本来就竖着贴"（两支都不朝上）时自动让位给重投影判据。
+MARKER_UP_MIN_Z = 0.5
+
+
+def choose_pose_solution(object_points, image_points, previous=None,
+                         prefer_normal_up=False):
     """平面方标签的 IPPE **双解消歧**，返回 ``(rvec, tvec, reproj)``。
 
     平面正方形标记用 IPPE 求解时会有**两个解**：两者重投影误差都极小（实测 0.1~0.4px），
     但三维位姿能差几十毫米、姿态差 10° 以上。只取第一个解时，检测会在两簇之间来回翻 ——
     表现为 6003 的目标位置"跳变"，被跳变过滤器大量丢弃（实测 195/415 帧）。
 
-    做法（**时间连续性**）：两个解里选与**上一帧该标记的位姿**最接近的那个；
-    没有上一帧时选重投影误差更小的那个。这样同一标记不会在两簇间翻，且不会引入额外滤波。
+    做法（**时间连续性**）：两个解里选与**上一帧该标记的位姿**最接近的那个。
+
+    首帧没有上一帧可比，只能另找判据 —— 而两支的重投影误差只差 0.17~0.64px，
+    落在角点噪声量级内，按重投影选等于**让噪声决定姿态**：选中镜像支后时间连续性会
+    一直把它锁死（姿态差约 90~100°；`--marker-to-grasp` 的 offset 会被 R_marker 旋转，
+    抓取点因此能偏 100mm 以上 —— 只发位置也中招）。
+
+    `prefer_normal_up` 就用"标签平贴朝上"这个物理先验破这个平局：取法向 torso +z 分量
+    更大的一支。只有当某支法向确实朝上（>= ``MARKER_UP_MIN_Z``，即标签确实平贴）时才启用，
+    标签竖贴时自动退回按重投影选。
 
     `previous` 是 estimator 里保存的轨迹字典（含 ``translation``(optical 系) 与 ``rotation_vector``）。
     """
@@ -469,12 +487,21 @@ def choose_pose_solution(object_points, image_points, previous=None):
     if previous is not None and previous.get("rotation_vector") is not None:
         prev_R = cv2.Rodrigues(np.asarray(previous["rotation_vector"], dtype=np.float64))[0]
 
+    use_up_prior = prefer_normal_up and previous is None
     best = None
     best_cost = float("inf")
+    up_best = None
+    up_best_z = float("-inf")
     for rvec, tvec in solutions:
         projected, _ = cv2.projectPoints(object_points, rvec, tvec, CAMERA_MATRIX, DISTORTION)
         reproj = float(np.sqrt(np.mean(np.sum(
             (projected.reshape(-1, 2) - image_points) ** 2, axis=1))))
+        if use_up_prior:
+            # 标记法向(torso 系)的竖直分量：正确支贴近 +1，镜像支明显更小
+            rotation_torso = R_TORSO_D435 @ R_D435_OPTICAL @ cv2.Rodrigues(rvec)[0]
+            z_up = float(rotation_torso[2, 2])
+            if z_up > up_best_z:
+                up_best, up_best_z = (rvec, tvec, reproj), z_up
         cost = reproj                       # 没有上一帧：取重投影最小的解
         if previous is not None:
             dpos = float(np.linalg.norm(tvec - previous["translation"]))
@@ -484,6 +511,9 @@ def choose_pose_solution(object_points, image_points, previous=None):
                 cost += 0.5 * dR            # 姿态差加权（0.5 rad ≈ 记 1）
         if cost < best_cost:
             best, best_cost = (rvec, tvec, reproj), cost
+    # 首帧：只有确实存在"朝上"的那一支时才用先验，否则退回重投影（标签竖贴的场合）
+    if use_up_prior and up_best_z >= MARKER_UP_MIN_Z:
+        return up_best
     if best is None:
         return None, None, float("inf")
     return best
@@ -500,6 +530,7 @@ class ArucoPoseEstimator:
         self.min_perimeter = args.min_marker_perimeter_px
         self.max_reprojection_error = args.max_reprojection_error_px
         self.max_translation_jump = args.max_translation_jump
+        self.marker_up = bool(args.marker_up)
         self.detect_markers = make_detector(
             args.dictionary, args.error_correction_rate)
         self.tracks = {}
@@ -539,7 +570,8 @@ class ArucoPoseEstimator:
             # IPPE 双解消歧（用上一帧位姿做时间连续性），避免同一标记在两簇之间翻
             previous = self.tracks.get(marker_id)
             rotation_vector, translation_vector, reprojection_error = choose_pose_solution(
-                self.object_points, image_points, previous)
+                self.object_points, image_points, previous,
+                prefer_normal_up=self.marker_up)
             if rotation_vector is None:
                 continue
 
@@ -750,6 +782,12 @@ def build_parser():
                         help='打印标记三轴在 torso 系下的指向（判断 --marker-to-grasp 该往哪偏）')
     parser.add_argument('--no-print-axes', dest='print_axes', action='store_false',
                         help='关掉上面的轴打印')
+    parser.add_argument('--marker-up', dest='marker_up', action='store_true', default=True,
+                        help='标签平贴朝上（贴盒顶）：首帧用"法向朝上"这个物理先验破 IPPE 镜像支的平局'
+                             '（默认开）。没有它时首帧只能按重投影选，而两支只差零点几像素，'
+                             '选中镜像支后会被时间连续性一直锁死（姿态差 ~90°、抓取点偏 100mm 以上）')
+    parser.add_argument('--no-marker-up', dest='marker_up', action='store_false',
+                        help='标签不是平贴朝上（竖贴等）：关掉该先验，首帧退回按重投影最小选解')
     parser.add_argument('--grasp-align-rpy', type=float, nargs=3, default=(0.0, 0.0, 0.0),
                         metavar=('R', 'P', 'Y'),
                         help='夹爪相对标记的对准旋转(rad, ZYX, 在标记坐标系里)；'
@@ -805,6 +843,9 @@ def main():
     print('[INFO] camera={}, dictionary={}, marker_size={} m, ids={}'.format(
         args.camera_name, args.dictionary, args.marker_size,
         args.ids if args.ids else 'ALL'))
+    print('[INFO] IPPE 双解消歧: 时间连续性 + {}'.format(
+        '标签平贴朝上先验（--no-marker-up 可关）' if args.marker_up
+        else '**仅重投影误差**（--no-marker-up：标签竖贴时才这样用）'))
     # 目标发送器
     sender = TargetSender(args.target_endpoint, args.target_hz, args.deadband_mm,
                           args.jump_reject_mm, send_quat=args.send_quat,

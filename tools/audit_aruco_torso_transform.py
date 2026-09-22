@@ -184,7 +184,7 @@ def main():
         marker_size=0.025, ids=[3], confirmation_frames=1, max_distance=2.0,
         min_marker_perimeter_px=60.0, max_reprojection_error_px=5.0,
         max_translation_jump=0.15, dictionary="DICT_APRILTAG_36H11",
-        error_correction_rate=0.2)
+        error_correction_rate=0.2, marker_up=True)
 
     T_torso_d435 = se3(D.R_TORSO_D435, D.T_TORSO_D435)
     # R_D435_OPTICAL 本身就把光学系坐标映到 d435 机体系 => 它同时就是"光学系在 d435 里的姿态"
