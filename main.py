@@ -196,6 +196,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="直线段的角速度上限（默认沿用 --ee-rot-speed）")
     L.add_argument("--lin-abort-cycles", type=int, default=5, metavar="N",
                    help="直线段里反解连续失败 N 个周期就取消该段并停住（默认 5 = 100ms）")
+    L.add_argument("--lin-all", action="store_true",
+                   help="整段 moveL：所有绝对位置目标都从**当前位置**平滑走到目标；路径自动按 "
+                        "Z→Y→X 轴分解成若干轴对齐直线段（只挑真正变了的轴），每段直线、"
+                        "段间速度归零（角点停一下），默认关。与 --lin-approach 同开时本项优先")
 
     g = p.add_argument_group("到位判定（实测末端是否已稳定到达目标）")
     g.add_argument("--no-arrive", action="store_true", help="关闭到位判定（默认开启）")
@@ -360,8 +364,13 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
         if head == "p" and len(args) == 3:
             pos = [float(v) for v in args]
             for arm in flags["arms"]:
-                ctrl.set_target_position(arm, pos)
-            log.info("目标位置 -> %s", np.round(pos, 4))
+                T = ctrl.make_target_pose(arm, pos) if ctrl.linear_all else None
+                if T is not None:
+                    ctrl.move_linear_to(arm, T)        # --lin-all：整段笛卡尔直线
+                else:
+                    ctrl.set_target_position(arm, pos)
+            log.info("目标位置 -> %s%s", np.round(pos, 4),
+                     "（整段直线 moveL）" if ctrl.linear_all else "")
         elif head == "d" and len(args) == 3:
             d = [float(v) for v in args]
             for arm in flags["arms"]:
@@ -477,15 +486,24 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
 
     quat = pkt.get("quat")            # 可选目标朝向（四元数 x,y,z,w）
     lin_mm = float(flags.get("lin_approach_mm", 0.0))
+    lin_all = bool(getattr(ctrl, "linear_all", False))
 
     def apply_abs_target(arm: str, pos) -> None:
-        """绝对位置目标：开了 --lin-approach 就先到 pre-grasp，再直线进给。
+        """绝对位置目标的路由（优先级从高到低）：
 
-        pre-grasp 用**锁定姿态的工具轴 x** 算：位置指令不携带姿态也能得到正确的进给方向；
-        6003 协议一个字都不用改。姿态没锁定时退回旧的"直接设目标"。
+        * --lin-all       ：从**当前位置**沿笛卡尔直线整段走到目标（moveL）；
+        * --lin-approach  ：先按普通方式走到 pre-grasp，再沿工具轴直线进给；
+        * 都没有          ：直接设目标（关节空间 PTP，末端走弧）。
+
+        moveL / pre-grasp 的方向都基于**锁定姿态的工具轴 x**：位置指令不携带姿态也能得到
+        正确的进给方向，6003 协议一个字都不用改。姿态没锁定时 `make_target_pose` 返回 None，
+        退回旧的"直接设目标"。
         """
         T = ctrl.make_target_pose(arm, pos, rpy=rpy, quat=quat)
-        if lin_mm > 0 and T is not None:
+        if lin_all and T is not None:
+            ctrl.move_linear_to(arm, T)
+            flags["retreated"] = False
+        elif lin_mm > 0 and T is not None:
             ctrl.start_approach(arm, T, lin_mm / 1000.0)
             flags["retreated"] = False
         else:
@@ -766,7 +784,15 @@ def main(argv=None) -> int:
     ctrl.lin_jerk = args.lin_jerk
     ctrl.lin_rot_speed = args.lin_rot_speed
     ctrl.lin_abort_cycles = max(1, int(args.lin_abort_cycles))
-    if args.lin_approach > 0:
+    # 整段 moveL：绝对位置目标从当前位姿走笛卡尔直线到目标（默认关）
+    ctrl.linear_all = bool(args.lin_all)
+    if args.lin_all and args.lin_approach > 0:
+        log.warning("--lin-all 与 --lin-approach 同开：整段直线（--lin-all）优先，"
+                    "两段式接近（--lin-approach）被忽略")
+    if args.lin_all:
+        log.info("整段直线(moveL): 绝对位置目标将按 Z→Y→X 轴分解成若干轴对齐直线段，"
+                 "每段直线、段间角点停")
+    if args.lin_approach > 0 and not args.lin_all:
         log.info("抓取进给: 先到 pre-grasp（沿工具轴后退 %.0fmm）再直线进给 %.0fmm/s、"
                  "jerk %s；反解失败 %d 周期即取消该段",
                  args.lin_approach,
@@ -781,7 +807,11 @@ def main(argv=None) -> int:
     #   所以两段式接近要等第一帧之后再做（见循环里的 startup_approach_pending）。
     targets = parse_initial_targets(args)
     for arm, pos in targets.items():
-        if pos is not None:
+        if pos is None:
+            continue
+        # --lin-all：先不设目标。此时还没收到状态帧，"当前位置"未知，无法起直线段，
+        # 等第一帧之后再按整段直线走（见循环里的 startup_move_pending）。
+        if not args.lin_all:
             ctrl.set_target_position(arm, pos, rpy=args.rpy, quat=args.quat)
     for arm in (LEFT, RIGHT):
         if arm not in arms and targets.get(arm) is None:
@@ -868,7 +898,9 @@ def main(argv=None) -> int:
              "last_stream_pos": {}, "pending_delta": [], "hint_time": 0.0,
              "retreated": False, "soft_was_active": False,
              "lin_approach_mm": args.lin_approach,
-             "startup_approach_pending": bool(args.lin_approach > 0),
+             "startup_approach_pending": bool(args.lin_approach > 0 and not args.lin_all),
+             "startup_move_pending": bool(args.lin_all) and any(
+                 p is not None for p in parse_initial_targets(args).values()),
              "arrival": arrival, "frozen": False, "grip_rx": grip_rx, "soft": soft}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
     last_target_warn = 0.0
@@ -963,6 +995,21 @@ def main(argv=None) -> int:
                                                 args.lin_approach / 1000.0)
                         except Exception as exc:
                             log.warning("初始目标的两段式接近失败[%s]: %s", a, exc)
+
+                # 初始 --pos 的整段直线（--lin-all）：等锁定了参考姿态、q_cmd 就绪再起段
+                if flags.get("startup_move_pending") and ctrl._ref_rot is not None:
+                    flags["startup_move_pending"] = False
+                    for a, p in parse_initial_targets(args).items():
+                        if p is None:
+                            continue
+                        try:
+                            T = ctrl.make_target_pose(a, p, rpy=args.rpy, quat=args.quat)
+                            if T is not None:
+                                ctrl.move_linear_to(a, T)
+                                continue
+                        except Exception as exc:
+                            log.warning("初始目标的整段直线起段失败[%s]: %s，改为直接设目标", a, exc)
+                        ctrl.set_target_position(a, p, rpy=args.rpy, quat=args.quat)
             except Exception as exc:
                 # 任何一帧的异常（IK/数值/API）都只该丢掉这一周期：直接退出会停止下发，
                 # 而这是会动机器人的程序 —— 连续失败太多才停手并报错退出。

@@ -11,6 +11,8 @@
   [5] IK 失效即停 ：路点冻结 -> 连续失败到阈值就取消整段，且不下发发散的解
   [6] 到位判据    ：直线段中途不判到位，走完（并停稳 dwell）才判到位
   [7] 两段式接近  ：先 PTP 到 pre-grasp，指令到位后自动切直线进给，方向沿工具轴
+  [8] 整段 moveL  ：move_linear_to 从当前指令位姿起段、重复目标幂等、全程走直线
+  [9] 轴分解 moveL：Z→Y→X 逐段轴对齐直线、段间角点停、全程落在线段并集上
 
 用法：python tools/test_cartesian_lin.py [-v]
 """
@@ -400,6 +402,101 @@ def main() -> int:
         check("直线方向就是工具轴（进给方向）", float(d4 @ x_tool) > 0.999,
               f"与工具轴夹角 {math.degrees(math.acos(max(-1,min(1,float(d4@x_tool))))):.2f}°")
         check("直线段终点 = 抓取点", float(np.linalg.norm(lin4.p1 - T_grasp[:3, 3])) < 1e-12)
+
+    # ---------------- [8] 整段 moveL（--lin-all） ----------------
+    print("\n[8] 整段 moveL：move_linear_to 幂等 + 全程直线")
+    ctrl5, st5, pub5 = make_rig(model, ik, q0, max_step_deg=6.0, ee_speed=0.10,
+                                ee_accel=0.20, ee_jerk=2.0)
+    ctrl5.linear_all = True
+    ctrl5.step(0.02)                                   # 首帧：锁参考姿态
+    start5 = ctrl5._cmd_pose_in_target_frame(RIGHT).copy()
+    goal5 = start5.copy()
+    goal5[2, 3] += 0.04                                # 竖直向上 4cm（保持姿态，可达）
+    T_goal5 = ctrl5.make_target_pose(RIGHT, goal5[:3, 3])
+    mv5 = ctrl5.move_linear_to(RIGHT, T_goal5)
+    check("move_linear_to 从当前指令位姿起了一段直线段",
+          mv5 is not None and ctrl5.lin[RIGHT] is mv5
+          and float(np.linalg.norm(mv5.p0 - start5[:3, 3])) < 1e-9,
+          f"起点误差 {0.0 if mv5 is None else float(np.linalg.norm(mv5.p0 - start5[:3, 3])):.1e} m")
+    mv5_again = ctrl5.move_linear_to(RIGHT, T_goal5)   # 20~30Hz 重发同一条目标
+    check("重复下发同一条目标不重起直线段（幂等）",
+          ctrl5.lin[RIGHT] is mv5 and mv5_again is mv5, "段对象未变")
+    traj5 = []
+    for _ in range(400):
+        info = ctrl5.step(0.02)
+        if RIGHT not in info.ee_cmd:           # IK 失败帧（不预期，兜底避免 KeyError）
+            break
+        traj5.append(info.ee_cmd[RIGHT][:3, 3].copy())
+        if ctrl5.lin[RIGHT] is None:
+            for _ in range(20):
+                info = ctrl5.step(0.02)
+                if RIGHT in info.ee_cmd:
+                    traj5.append(info.ee_cmd[RIGHT][:3, 3].copy())
+            break
+    traj5 = np.array(traj5)
+    p0_5, p1_5 = mv5.p0, mv5.p1
+    u5 = (p1_5 - p0_5) / np.linalg.norm(p1_5 - p0_5)
+    rel5 = traj5 - p0_5
+    perp5 = rel5 - np.outer(rel5 @ u5, u5)
+    check("整段 moveL 末端严格落在线段上（离弦 < 0.5mm）",
+          float(np.abs(perp5).max()) < 5e-4, f"最大离弦 {np.abs(perp5).max()*1000:.3f} mm")
+    check("整段 moveL 精确到达终点（< 1mm）",
+          float(np.linalg.norm(traj5[-1] - p1_5)) < 1e-3,
+          f"{np.linalg.norm(traj5[-1] - p1_5)*1000:.3f} mm")
+    none5 = ctrl5.move_linear_to(RIGHT, T_goal5)
+    check("已在目标上时不再新起零长直线段", none5 is None and ctrl5.lin[RIGHT] is None,
+          "未新建段" if none5 is None else "又起了段")
+
+    # ---------------- [9] 轴分解 moveL（--lin-all）：Z→Y→X 逐段直线、角点停 ----------------
+    print("\n[9] 轴分解 moveL：Z→Y→X 逐段直线、角点停")
+    ctrl6, st6, pub6 = make_rig(model, ik, q0, max_step_deg=6.0, ee_speed=0.10,
+                                ee_accel=0.20, ee_jerk=2.0)
+    ctrl6.linear_all = True
+    ctrl6.step(0.02)
+    start6 = ctrl6._cmd_pose_in_target_frame(RIGHT).copy()
+    goal6 = start6.copy()
+    goal6[0, 3] += 0.03                                # x
+    goal6[1, 3] += 0.02                                # y
+    goal6[2, 3] += 0.03                                # z
+    ctrl6.move_linear_to(RIGHT, ctrl6.make_target_pose(RIGHT, goal6[:3, 3]))
+    segs6 = ctrl6._queue[RIGHT]
+    axis_of = [int(np.argmax(np.abs(m.p1 - m.p0))) for m in segs6]   # 每段动的是哪根轴
+    check("三轴都变 -> 拆成 3 段", len(segs6) == 3, f"{len(segs6)} 段")
+    check("每段只动一个轴（轴对齐直线）",
+          all(int(np.sum(np.abs(m.p1 - m.p0) > 1e-9)) == 1 for m in segs6),
+          f"各段动的轴: {axis_of}")
+    check("轴序 = Z→Y→X", axis_of == [2, 1, 0], f"{axis_of}（2=z,1=y,0=x）")
+    wps6 = [segs6[0].p0] + [m.p1 for m in segs6]
+    traj6 = []
+    for _ in range(2000):
+        info = ctrl6.step(0.02)
+        if RIGHT not in info.ee_cmd:
+            break
+        traj6.append(info.ee_cmd[RIGHT][:3, 3].copy())
+        if ctrl6.lin[RIGHT] is None and not ctrl6._queue[RIGHT]:
+            for _ in range(20):
+                info = ctrl6.step(0.02)
+                if RIGHT in info.ee_cmd:
+                    traj6.append(info.ee_cmd[RIGHT][:3, 3].copy())
+            break
+    traj6 = np.array(traj6)
+    check("轴分解路径精确到达目标（< 1mm）",
+          float(np.linalg.norm(traj6[-1] - goal6[:3, 3])) < 1e-3,
+          f"{np.linalg.norm(traj6[-1] - goal6[:3, 3])*1000:.3f} mm")
+
+    def _dist_to_seg(P, a, b):
+        ab = b - a
+        L2 = float(ab @ ab)
+        tt = 0.0 if L2 < 1e-18 else float(np.clip((P - a) @ ab / L2, 0.0, 1.0))
+        return float(np.linalg.norm(P - (a + tt * ab)))
+
+    worst6 = max(min(_dist_to_seg(q, wps6[i], wps6[i + 1]) for i in range(len(wps6) - 1))
+                 for q in traj6)
+    check("全程每点都落在三段直线的并集上（< 0.5mm）", worst6 < 5e-4,
+          f"最大偏离 {worst6*1000:.3f} mm")
+    for i, w in enumerate(wps6[1:-1], start=1):        # 角点确实被"经过"（停一下）
+        d = min(float(np.linalg.norm(q - w)) for q in traj6)
+        check(f"经过第 {i} 个角点（< 1mm）", d < 1e-3, f"最近 {d*1000:.3f} mm")
 
     n_fail = sum(1 for _, ok, _ in _R if not ok)
     print("\n" + "=" * 76)

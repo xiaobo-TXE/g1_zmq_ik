@@ -28,7 +28,9 @@
     "grip_soft_tau": 0.3,
     "_笛卡尔直线段": "抓取进给/退出走笛卡尔直线（PTP 转场 + LIN 进给）。lin_approach=0 时完全关闭，行为与没这个功能时逐字一致。开之前确认 pre-grasp 点（= 抓取点沿工具轴后退 lin_approach）落在自由空间里：启动日志会打印『两段式接近[right]: 先到 pre-grasp [...]』",
     "lin_approach": 60,
-    "lin_jerk": 2.0
+    "lin_jerk": 2.0,
+    "_整段直线(moveL)": "lin_all=true 时所有绝对位置目标都从当前位置按 Z→Y→X 自动轴分解成若干轴对齐直线段（只挑真正变了的轴），每段直线、段间速度归零（角点停一下）。与 lin_approach 同开时 lin_all 优先（两段式接近被忽略）；反解连续失败 lin_abort_cycles 个周期会自动取消整条路径并停住",
+    "lin_all": true
   },
   "aruco": {
     "_说明": "相机 Tag 检测 → 抓取点 → 6003。用 python tools/detect_aruco_zmq.py --config robot.json 启动。",

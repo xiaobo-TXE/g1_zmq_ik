@@ -50,6 +50,17 @@ LEFT, RIGHT = "left", "right"
 TARGET_EPS_POS = 1e-4
 TARGET_EPS_ROT = 1e-4
 
+#: moveL 里判"已经站在目标上、不必再起一段"时的姿态容差（rad，≈1.1°）。
+#: 位置部分复用 lin_replan_tol（10mm）。
+MOVE_LINEAR_MIN_ROT = 0.02
+
+#: 轴分解 moveL 的默认轴序：先抬/降到目标高度(z)，再横向(y)，最后前向(x)。
+#: 每段都是**轴对齐的直线**，段与段之间速度归零（角点停一下）——比一条长斜线更稳
+#: （每段都短、IK 局部、不跨奇异点、肘部不翻分支）。
+AXIS_ORDER: Tuple[str, ...] = ("z", "y", "x")
+#: 轴分解时，某根轴的位移 ≤ 这个值就不单独成段（m）。避免为几微米造一段。
+AXIS_MIN_STEP = 1e-3
+
 #: 笛卡尔直线段时间律的内部积分步长（s）。比控制周期细得多，保证
 #: "先算好整条曲线再按时间采样"的确定性，也让限幅不受控制周期抖动破坏。
 LIN_PROFILE_DT = 1e-3
@@ -453,6 +464,16 @@ class ArmController:
         #: 若每次都重启接近/直线段，直线段会被无限打断（实测：20Hz 重发 -> 被打断 259 次、
         #: 一次都没走完）。所以只有目标真的挪动了（超过这个容差）才重新起段。
         self.lin_replan_tol: float = 0.010
+        #: 整段 moveL 开关（--lin-all / config lin_all）。True 时所有"绝对位置目标"
+        #: 都从当前指令位姿走**笛卡尔直线**到目标，而不是关节空间 PTP 划弧（默认 False，
+        #: 行为与旧版逐字一致）。带幂等，见 move_linear_to()。
+        self.linear_all: bool = False
+        #: 轴分解 moveL 的段队列（按 axis_order 拆出来、逐段执行）；self.lin[arm] = 队首。
+        self._queue: Dict[str, List[LinearMove]] = {LEFT: [], RIGHT: []}
+        #: 本次轴分解共几段（仅用于日志显示 "第 k/n 段"）
+        self._seg_total: Dict[str, int] = {LEFT: 0, RIGHT: 0}
+        #: 轴分解顺序（默认 Z->Y->X），可按需改
+        self.axis_order: Tuple[str, ...] = AXIS_ORDER
 
         self.q_cmd: Optional[np.ndarray] = None
         self.q_meas: Optional[np.ndarray] = None
@@ -585,6 +606,8 @@ class ArmController:
         mv = LinearMove(np.asarray(T_from, dtype=float).copy(),
                         np.asarray(T_goal, dtype=float).copy(), **lim)
         self.lin[arm] = mv
+        self._queue[arm] = []               # 显式单段 = 取消同臂的轴分解路径
+        self._seg_total[arm] = 0
         self._approach[arm] = None          # 显式起段 = 取消同臂的待接近阶段
         self._lin_fail[arm] = 0
         self._assign_target(arm, np.asarray(T_goal, dtype=float))
@@ -592,6 +615,104 @@ class ArmController:
                     arm, mv.length * 1000, np.rad2deg(mv.rot_angle), mv.duration,
                     lim["v_max"] * 1000, lim["a_max"], lim["j_max"])
         return mv
+
+    @staticmethod
+    def _pose_close(Ta: np.ndarray, Tb: np.ndarray,
+                    pos_tol: float, rot_tol: Optional[float] = None) -> bool:
+        """两个位姿是否"够近"。rot_tol=None 时只看位置。"""
+        if float(np.linalg.norm(np.asarray(Ta)[:3, 3] - np.asarray(Tb)[:3, 3])) > pos_tol:
+            return False
+        if rot_tol is None:
+            return True
+        return float(np.linalg.norm(log3_error(np.asarray(Ta)[:3, :3],
+                                               np.asarray(Tb)[:3, :3]))) <= rot_tol
+
+    def _axis_waypoints(self, p0: np.ndarray, p1: np.ndarray) -> List[np.ndarray]:
+        """把 起点->终点 按 axis_order 拆成若干**轴对齐**路点（含两端）。
+
+        每根轴只在自己那一段里变一次；位移 ≤ AXIS_MIN_STEP 的轴不单独成段。
+        返回至少 2 个点（纯旋转 / 极小位移时退化成一段）。
+        """
+        axis_idx = {"x": 0, "y": 1, "z": 2}
+        p0 = np.asarray(p0, dtype=float).reshape(3)
+        p1 = np.asarray(p1, dtype=float).reshape(3)
+        wps = [p0.copy()]
+        for a in self.axis_order:
+            i = axis_idx[a]
+            if abs(p1[i] - wps[-1][i]) > AXIS_MIN_STEP:
+                nxt = wps[-1].copy()
+                nxt[i] = p1[i]
+                wps.append(nxt)
+        if float(np.linalg.norm(p1 - wps[-1])) > AXIS_MIN_STEP:
+            wps.append(p1.copy())
+        if len(wps) == 1:
+            wps.append(p1.copy())
+        return wps
+
+    def start_axis_path(self, arm: str, T_goal: np.ndarray) -> LinearMove:
+        """轴分解 moveL：当前指令位姿 -> `T_goal`，按 `axis_order`（默认 Z->Y->X）拆成若干
+        **轴对齐直线段**逐段执行。
+
+        每段都是 位置直线 + 姿态测地线 + 预计算 S 形时间律（复用 `LinearMove`），
+        段末速度精确归零，所以段与段之间是"角点停一下"的平滑停顿。姿态变化按段数均摊。
+        """
+        T_goal = np.asarray(T_goal, dtype=float).reshape(4, 4)
+        if not np.isfinite(T_goal).all():
+            raise ValueError(f"{arm} 的直线目标位姿含 NaN/Inf，已拒绝")
+        T0 = self._cmd_pose_in_target_frame(arm)
+        if T0 is None:
+            T0 = self._base_pose(arm)
+        wps = self._axis_waypoints(T0[:3, 3], T_goal[:3, 3])
+        R0, R1 = T0[:3, :3], T_goal[:3, :3]
+        dR = _rot_log(R0.T @ R1)
+        n = len(wps) - 1
+        lim = self._lin_limits()
+        segs: List[LinearMove] = []
+        for k in range(n):
+            Tf = np.eye(4)
+            Tf[:3, 3], Tf[:3, :3] = wps[k], R0 @ _rot_exp((k / n) * dR)
+            Tt = np.eye(4)
+            Tt[:3, 3], Tt[:3, :3] = wps[k + 1], R0 @ _rot_exp(((k + 1) / n) * dR)
+            segs.append(LinearMove(Tf, Tt, **lim))
+        self._queue[arm] = segs
+        self._seg_total[arm] = n
+        self.lin[arm] = segs[0]
+        self._approach[arm] = None
+        self._lin_fail[arm] = 0
+        self._assign_target(arm, T_goal)
+        axes = "->".join(a.upper() for a in self.axis_order)
+        logger.info("轴分解直线[%s]: 共 %d 段（轴序 %s），总长 %.1fmm，段间角点停",
+                    arm, n, axes, sum(m.length for m in segs) * 1000)
+        return segs[0]
+
+    def move_linear_to(self, arm: str, T_goal: np.ndarray) -> Optional[LinearMove]:
+        """整段 moveL（`--lin-all`）：从**当前指令位姿**沿直线走到 `T_goal`。
+
+        路径按 `axis_order` **自动轴分解**（默认 Z->Y->X，只挑真正变化了的轴），逐段执行，
+        段间速度归零（角点停一下）——每段都短、IK 局部、不跨奇异点、肘部不翻分支。
+
+        幂等（6003 会以 20~30Hz 重发同一条目标）：
+          * 正在走这条路径、且新终点没挪动（≤ `lin_replan_tol`）→ 只更新"到位判定的终点"；
+          * 已经站在目标上（位置/姿态都很近）→ 不新起段（否则每帧建出零长段、日志刷屏）；
+          * 否则（目标真的换了 / 当前没在走）→ 从当前指令位姿重新起一条轴分解路径。
+        """
+        T_goal = np.asarray(T_goal, dtype=float).reshape(4, 4)
+        if not np.isfinite(T_goal).all():
+            raise ValueError(f"{arm} 的直线目标位姿含 NaN/Inf，已拒绝")
+        active = bool(self._queue.get(arm)) or self.lin.get(arm) is not None
+        if active:
+            tgt = self.target.get(arm)
+            if tgt is not None and self._pose_close(T_goal, tgt, self.lin_replan_tol,
+                                                    MOVE_LINEAR_MIN_ROT):
+                self._assign_target(arm, T_goal)          # 同一条目标：路径不动
+                return self.lin.get(arm)
+        else:
+            T_cur = self._cmd_pose_in_target_frame(arm)
+            if T_cur is not None and self._pose_close(T_goal, T_cur, self.lin_replan_tol,
+                                                      MOVE_LINEAR_MIN_ROT):
+                self._assign_target(arm, T_goal)          # 已在目标上：不新起零长段
+                return None
+        return self.start_axis_path(arm, T_goal)
 
     def start_approach(self, arm: str, T_grasp: np.ndarray, approach_dist: float,
                        T_from: Optional[np.ndarray] = None) -> None:
@@ -628,6 +749,8 @@ class ArmController:
             return
 
         self.lin[arm] = None
+        self._queue[arm] = []               # 两段式接近 = 取消同臂的轴分解路径
+        self._seg_total[arm] = 0
         self._lin_fail[arm] = 0
         self._approach[arm] = {"T_pre": T_pre, "T_grasp": T_grasp, "from": T_from}
         self._assign_target(arm, T_pre)
@@ -649,11 +772,14 @@ class ArmController:
         return self.start_linear(arm, T_goal, T_from=T_from)
 
     def cancel_linear(self, arm: str, why: str = "") -> None:
-        """取消该臂的直线段 / 待接近阶段（目标保持不变）。"""
-        if self.lin[arm] is not None or self._approach[arm] is not None:
+        """取消该臂的直线段 / 轴分解路径 / 待接近阶段（目标保持不变）。"""
+        if (self.lin[arm] is not None or self._approach[arm] is not None
+                or self._queue.get(arm)):
             logger.warning("取消直线段[%s]%s", arm, f"（{why}）" if why else "")
         self.lin[arm] = None
         self._approach[arm] = None
+        self._queue[arm] = []
+        self._seg_total[arm] = 0
         self._lin_fail[arm] = 0
 
     def lin_status(self, arm: str) -> str:
@@ -664,7 +790,12 @@ class ArmController:
         mv = self.lin.get(arm)
         if mv is None:
             return ""
-        return (f"直线: {mv.progress() * 100:5.1f}% 剩 {mv.remaining_m() * 1000:5.1f}mm "
+        q = self._queue.get(arm) or []
+        total = self._seg_total.get(arm, 0)
+        seg = ""
+        if total > 1:                       # 轴分解路径：显示"第 k/n 段"
+            seg = f"[{total - len(q) + 1}/{total}] "
+        return (f"{seg}直线: {mv.progress() * 100:5.1f}% 剩 {mv.remaining_m() * 1000:5.1f}mm "
                 f"({mv.t:.2f}/{mv.duration:.2f}s)")
 
     def _advance_lin(self, dt: float, T_L_tgt: np.ndarray, T_R_tgt: np.ndarray,
@@ -692,10 +823,18 @@ class ArmController:
                 continue
             out[arm] = mv.advance(dt)
             if mv.done:
-                # 走到终点即结束该段；目标（self.target）本来就是终点，语义不变
-                logger.info("直线段[%s]完成（长 %.1fmm，用时 %.2fs）",
-                            arm, mv.length * 1000, mv.duration)
-                self.lin[arm] = None
+                q = self._queue.get(arm) or []
+                if q and q[0] is mv:
+                    q.pop(0)
+                if q:
+                    # 轴分解路径的下一段：上一段已 v=0，这里从角点重新起一段（角点停一下）
+                    self.lin[arm] = q[0]
+                else:
+                    logger.info("整段直线[%s]完成（%d 段，末段长 %.1fmm，用时 %.2fs）",
+                                arm, self._seg_total.get(arm, 1), mv.length * 1000,
+                                mv.duration)
+                    self.lin[arm] = None
+                    self._seg_total[arm] = 0
         return out[LEFT], out[RIGHT]
 
     def pose_at_lin_start(self, arm: str, fallback: np.ndarray) -> np.ndarray:
@@ -748,6 +887,13 @@ class ArmController:
         if self._pending_positions:
             pending, self._pending_positions = self._pending_positions, []
             for arm, pos in pending:
+                # linear_all：启动前排队的位置目标也要按整段直线走（此时 q_cmd 已就绪，
+                # 见 step() 里把 q_cmd 初始化放在本调用之前的说明）
+                if self.linear_all:
+                    T = self.make_target_pose(arm, pos)
+                    if T is not None:
+                        self.move_linear_to(arm, T)
+                        continue
                 self.set_target_position(arm, pos)
 
     # ------------------------------------------------------------------ 夹爪
@@ -1024,9 +1170,9 @@ class ArmController:
                 and waist_true is not None and np.any(np.abs(waist_true) > 1e-6)):
             info.waist_bias_mm = 1000.0 * float(np.linalg.norm(T_R_true[:3, 3] - T_R_meas[:3, 3]))
 
-        # 3) 首帧初始化：锁定参考姿态、以实测姿态作为起点
-        if self._ref_rot is None:
-            self.lock_reference_orientation()
+        # 3) 首帧初始化：先以实测姿态作为起点（q_cmd 就绪），再锁定参考姿态。
+        #    顺序很重要：--lin-all 的 moveL 从"当前指令位姿"起段，而 lock_reference_orientation
+        #    里会补上"启动前排队的位置目标"，所以 q_cmd 必须先就绪。
         if self.q_cmd is None:
             self.q_cmd = q14.copy()
             if hasattr(self.ik, "reset"):
@@ -1036,6 +1182,8 @@ class ArmController:
                     # 注意：这里刻意不经过 _assign_target，target_rev 保持 0 =
                     # "还没有显式目标"，到位判定不会对启动时的保持位姿报"到位"
                     self.target[arm] = T.copy()
+        if self._ref_rot is None:
+            self.lock_reference_orientation()
 
         # 4) 目标 -> IK 求解系（= torso_link 系）
         #    T_*_tgt : **用户目标**（终点）—— 到位判定、制动距离都用它
