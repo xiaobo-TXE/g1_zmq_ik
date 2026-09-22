@@ -9,7 +9,10 @@
   2. 去掉 pin.rnea 力矩计算：ZMQ 6002 协议只接受 14 个关节角，没有 tau 字段。
   3. 用 pin.buildModelFromUrdf + pin.buildReducedModel 代替 RobotWrapper.BuildFromURDF +
      buildReducedRobot：只建运动学模型，**不需要 200MB 的 meshes 目录**。
-  4. 缓存加 URDF mtime/size 校验（原版缓存永不失效，改了 URDF 会静默加载旧模型）。
+  4. 缓存加 URDF mtime/size 校验（原版缓存永不失效，改了 URDF 会静默加载旧模型）；
+     缓存文件名再带**环境指纹**（pinocchio 版本/安装路径/py/平台/numpy），因为跨 pinocchio
+     构建反序列化那个 boost 序列化的 C++ 模型会**段错误**——try/except 兜不住，只能靠换文件名
+     隔离；写缓存也用原子 rename，避免留下会崩的半个 pickle（见 cache_fingerprint）。
   5. 增加 FK、腰部投影、关节限位查询等本工具需要的接口。
   6. 增加一个不依赖 CasADi/IPOPT 的 DLS 迭代求解器作为回退与交叉验证。
 
@@ -66,6 +69,32 @@ LEG_WAIST_JOINT_NAMES = [
 
 #: 手部/夹爪关节名的识别关键字（只用于日志里报"检测到哪种末端"）
 HAND_KEYWORDS = ("hand", "dex1", "dex3", "gripper", "finger", "thumb", "index", "middle")
+
+
+def cache_fingerprint() -> str:
+    """影响"pickle 出来的 pinocchio 模型能不能安全反序列化"的环境指纹。
+
+    pinocchio 的 ``Model`` 是 C++ 对象，序列化用的是 boost archive（pickle 里能看到
+    ``serialization::archive``）。用一个**不同的 pinocchio 构建**（不同版本 / 不同 boost /
+    不同 ABI，例如 conda 装的与 pip/cmeel 装的）去反序列化它会直接**段错误**——这是进程级
+    崩溃，Python 的 ``try/except`` 完全兜不住（"坏缓存就重建"那段代码根本来不及执行）。
+
+    所以把指纹**做进缓存文件名**：换了环境就是另一个缓存文件，永远不会去 unpickle 一个
+    来路不明的模型。指纹含：pinocchio 版本 + 其安装目录（区分同版本的不同构建）
+    + python 小版本 + 平台 + numpy 主次版本。
+    """
+    import hashlib
+    import platform
+    pin_dir = os.path.dirname(str(getattr(pin, "__file__", "")))
+    py = "py" + ".".join(platform.python_version_tuple()[:2])
+    parts = [
+        "pin" + str(getattr(pin, "__version__", "?")),
+        py,
+        platform.system().lower() + "-" + platform.machine(),
+        "np" + ".".join(np.__version__.split(".")[:2]),
+        hashlib.md5(pin_dir.encode("utf-8")).hexdigest()[:8],
+    ]
+    return "_".join(parts)
 
 
 def locked_joint_names(model) -> List[str]:
@@ -227,25 +256,34 @@ class G1ArmModel:
 
         if not self.cache_dir:
             return build()
-        # 缓存键要带 URDF 文件名：手版(43)与夹爪版(33)在同一个目录下共享 offset 时不能串味
+        # 缓存键要带 URDF 文件名：手版(43)与夹爪版(33)在同一个目录下共享 offset 时不能串味；
+        # 还要带**环境指纹**（见 cache_fingerprint）：pinocchio 的模型是 boost 序列化的 C++
+        # 对象，换一个构建去反序列化会段错误（try/except 兜不住），所以让每个环境各用各的缓存
+        # 文件，从根上避免去 unpickle 一个不兼容的模型。
+        fp = cache_fingerprint()
         stem = os.path.splitext(os.path.basename(urdf_path))[0]
-        cache_path = os.path.join(self.cache_dir, f"_model_cache_{stem}_ee{ee_offset:g}.pkl")
+        cache_path = os.path.join(
+            self.cache_dir, f"_model_cache_{stem}_ee{ee_offset:g}_{fp}.pkl")
         stamp = {"urdf": stem, "mtime": os.path.getmtime(urdf_path),
-                 "size": os.path.getsize(urdf_path)}
+                 "size": os.path.getsize(urdf_path), "env": fp}
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, "rb") as f:
                     blob = pickle.load(f)
                 if blob.get("stamp") == stamp:
-                    logger.info("加载模型缓存 %s", cache_path)
+                    logger.info("加载模型缓存 %s", os.path.basename(cache_path))
                     return blob["model"]
                 logger.info("URDF 已变化，重建模型缓存")
             except Exception as exc:  # 缓存坏了就重建，不影响使用
                 logger.warning("模型缓存不可用(%s)，重建", exc)
         model = build()
         try:
-            with open(cache_path, "wb") as f:
+            # 原子落盘：先写临时文件再 rename。写到一半被杀会留下"半个 pickle"，
+            # 那东西下次照样会在反序列化时崩，所以不能让半成品出现在正式路径上。
+            tmp = f"{cache_path}.tmp{os.getpid()}"
+            with open(tmp, "wb") as f:
                 pickle.dump({"stamp": stamp, "model": model}, f)
+            os.replace(tmp, cache_path)
         except Exception as exc:
             logger.warning("写模型缓存失败: %s", exc)
         return model

@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 _model_cache_*.pkl
+_model_cache_*.tmp*
 *.csv
 .DS_Store
 .venv/

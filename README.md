@@ -403,6 +403,7 @@ python tools/test_target_io.py        # 6003 字段解析
 python tools/test_arrival.py          # 到位判据状态机
 python tools/test_config.py           # --config 解析
 python tools/test_state_guard.py      # 状态守门与软闭合参数
-python tools/test_cartesian_lin.py    # 笛卡尔直线段（直线度/姿态插值/限幅/IK 失效即停）
+python tools/test_cartesian_lin.py    # 笛卡尔直线段（直线度/姿态插值/限幅/IK 失效即停/整段 moveL）
+python tools/test_model_cache.py      # 模型缓存环境指纹（旧缓存忽略/损坏重建/原子落盘）
 python tools/selftest_offline.py      # 正解一致性 / 反解精度 / 轨迹跟踪
 ```
