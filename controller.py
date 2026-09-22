@@ -437,6 +437,10 @@ class ArmController:
         self.lin_abort_cycles: int = 5
         #: 第一段（PTP 到 pre-grasp）判定"到了"的容差（m）
         self.lin_reach_tol: float = 0.005
+        #: 目标小幅更新时的"不重起"容差（m）。Tag 目标流会以 20Hz 重发同一条目标，
+        #: 若每次都重启接近/直线段，直线段会被无限打断（实测：20Hz 重发 -> 被打断 259 次、
+        #: 一次都没走完）。所以只有目标真的挪动了（超过这个容差）才重新起段。
+        self.lin_replan_tol: float = 0.010
 
         self.q_cmd: Optional[np.ndarray] = None
         self.q_meas: Optional[np.ndarray] = None
@@ -595,6 +599,22 @@ class ArmController:
             return
         T_pre = T_grasp.copy()
         T_pre[:3, 3] = T_grasp[:3, 3] - float(approach_dist) * x_tool
+
+        # ---- 幂等：同一条目标的小幅更新只"更新终点"，不重起状态机 ----
+        # 否则 20Hz 重发的目标流会把正在走的直线段每 50ms 打断一次，永远走不完。
+        ap = self._approach.get(arm)
+        if ap is not None and float(np.linalg.norm(
+                T_pre[:3, 3] - ap["T_pre"][:3, 3])) <= self.lin_replan_tol:
+            ap["T_grasp"] = T_grasp                     # 终点跟着更新
+            self._assign_target(arm, ap["T_pre"])       # pre-grasp 不变，第一段继续走
+            return
+        mv = self.lin.get(arm)
+        if mv is not None and float(np.linalg.norm(T_grasp[:3, 3] - mv.p1)) <= self.lin_replan_tol:
+            # 已经在直线进给中，新目标就在旁边：直线段保持不动（不被重置），
+            # 只更新"到位判定的终点"；走完直线后由普通跟踪补上剩下这几毫米。
+            self._assign_target(arm, T_grasp)
+            return
+
         self.lin[arm] = None
         self._lin_fail[arm] = 0
         self._approach[arm] = {"T_pre": T_pre, "T_grasp": T_grasp, "from": T_from}
