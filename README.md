@@ -207,19 +207,6 @@ python main.py --config robot.json \
 - 开之前确认 pre-grasp 点（= 抓取点沿工具轴后退 `--lin-approach`）落在自由空间里，
   启动日志会打印它的坐标。
 
-### 4.1 轴序分解（分支 `feat/axis-seq-planning` 上的实验功能）
-
-把转场按躯干系的轴**逐轴对齐**，每段都走笛卡尔直线，最后再沿工具轴进给：
-
-```bash
-python main.py --config robot.json --lin-axis-seq zyx-tool --lin-approach 60
-python main.py --config robot.json --lin-axis-seq zyx          # 纯轴序，最后一段就直接到抓取点
-```
-
-`--lin-axis-order zyx` 是轴序（先对齐高度、再横向、最后沿 x）。启用时会对每个路点先试解一次 IK，
-残差超过 `--lin-axis-check-mm`（默认 10mm）就在日志里告警 —— 因为 `(x0, y0, z_t)` 这类中间点
-是直线移动永远不会经过的，必须单独核对。
-
 ---
 
 ## 5. 夹爪
@@ -347,9 +334,7 @@ Dex1 抓取中心；0.185=指尖平面；Dex3 用 0.05）、`--solver auto|casad
 `--grip-on-arrive-soft [TAU]`、`--grip-soft-tau`（0.3）、`--grip-soft-rate`（1.5）。
 
 **直线段**：`--lin-approach MM`（0=关）、`--lin-retreat MM`（0=不动）、`--lin-speed`、`--lin-accel`、
-`--lin-jerk`、`--lin-rot-speed`（都不写=沿用末端那套）、`--lin-abort-cycles`（5）。分支
-`feat/axis-seq-planning` 上另有 `--lin-axis-seq off|zyx|zyx-tool`、`--lin-axis-order`（zyx）、
-`--lin-axis-check-mm`（10）。
+`--lin-jerk`、`--lin-rot-speed`（都不写=沿用末端那套）、`--lin-abort-cycles`（5）。
 
 **到位判定**：`--no-arrive`、`--arrive-pos`（2.0mm）、`--arrive-rot`（1.0°）、`--arrive-ik-pos`（3.0mm）、
 `--arrive-ik-rot`（2.0°）、`--arrive-dwell`（0.2s）、`--arrive-speed`（15mm/s）、
@@ -419,6 +404,5 @@ python tools/test_arrival.py          # 到位判据状态机
 python tools/test_config.py           # --config 解析
 python tools/test_state_guard.py      # 状态守门与软闭合参数
 python tools/test_cartesian_lin.py    # 笛卡尔直线段（直线度/姿态插值/限幅/IK 失效即停）
-python tools/test_axis_sequence.py    # 轴序分解路点计划（分支上的功能）
 python tools/selftest_offline.py      # 正解一致性 / 反解精度 / 轨迹跟踪
 ```
