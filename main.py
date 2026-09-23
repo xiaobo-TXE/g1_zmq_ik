@@ -47,7 +47,8 @@ import joint_map
 from config_file import add_config_argument, describe_applied, parse_args_with_config
 from arrival import (ArrivalMonitor, ArrivalThresholds, check_tolerance_guard,
                      format_event)
-from controller import ArmController, LEFT, RIGHT, format_step
+from controller import (PLACE_CLEARANCE_DEFAULT, ArmController, LEFT, RIGHT,
+                        format_step)
 from grip_control import SoftClose, SoftCloseConfig
 from g1_ik import G1ArmModel, make_ik
 from sim_arm import SimulatedArmState, SimulatedStateSource
@@ -278,6 +279,7 @@ HELP_TEXT = """
   ap [MM]        从当前位置沿工具轴后退 MM 再直线进给到当前目标（默认 120mm）
   rt [MM]        沿工具轴反方向直线退出 MM（默认 100mm）
   lin            打印直线段状态
+  place X Y Z [MM]  放置一条龙：抬升(默认50mm) -> 平移到 X Y Z -> 下落 -> 松开夹爪
   h              打印当前实测/目标/误差/到位状态
   j              打印当前下发的 14 个关节角
   ?              显示本帮助
@@ -425,6 +427,32 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
         elif head == "lin":
             for arm in (LEFT, RIGHT):
                 log.info("直线段[%s]: %s", arm, ctrl.lin_status(arm) or "（未在走）")
+        elif head == "place" and len(args) in (3, 4):
+            pos = [float(v) for v in args[:3]]
+            clr = abs(float(args[3])) / 1000.0 if len(args) == 4 else PLACE_CLEARANCE_DEFAULT
+            started = []
+            for arm in flags["arms"]:
+                T = ctrl.make_target_pose(arm, pos)
+                if T is None:
+                    log.warning("参考姿态还没锁定，place 暂不可用（等收到状态帧后再试）")
+                    continue
+                try:
+                    ctrl.start_place_path(arm, T, clearance=clr)
+                except Exception as exc:
+                    log.warning("place 起段失败[%s]: %s", arm, exc)
+                    continue
+                started.append(arm)
+            if started:
+                flags["place_arms"] = started
+                # 搬运/放置期间关掉"到位自动闭爪"：否则放置目标判到位时会再一次把夹爪捏上，
+                # 若那一刻恰好落在下面的松爪之后，盒子就被重新夹住（放不下去）。
+                # 收到新的 Tag 位置目标（= 下一次抓取）时自动恢复，见 apply_stream_target()。
+                flags["autoclose_off"] = True
+                log.info("place[%s]: 抬升 %.0fmm -> 平移到 %s -> 下落 -> 走完自动松开夹爪"
+                         "（期间关闭『到位自动闭爪』）",
+                         "/".join(started), clr * 1000, np.round(pos, 4))
+            else:
+                log.warning("place 未起段：目标非法或没有可用的受控臂")
         elif head == "go":
             apply_grip_percent(ctrl, 100, 100, source="交互命令 go（张开/释放）")
             if flags.get("soft") is not None:
@@ -495,6 +523,11 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
     elif pkt.get("grip"):
         gp = pkt["grip"]
         apply_grip_percent(ctrl, gp.get("right"), gp.get("left"), source="6003 grip")
+
+    # 收到新的 Tag **位置**目标 = 新的一次抓取：恢复"到位自动闭爪"
+    # （`place` 搬运期间会把它关掉，避免放置目标判到位时又把夹爪捏上）
+    if pkt.get("per_arm") or pkt.get("pos") is not None or pkt.get("delta") is not None:
+        flags["autoclose_off"] = False
 
     arms = flags["arms"]
     arm = pkt.get("arm") or ctrl.controlled
@@ -930,7 +963,8 @@ def main(argv=None) -> int:
              "startup_move_pending": bool(args.lin_all) and any(
                  p is not None for p in parse_initial_targets(args).values()),
              "arrival": arrival, "frozen": False, "grip_rx": grip_rx, "soft": soft,
-             "arrive_object_m": args.arrive_object_mm / 1000.0}
+             "arrive_object_m": args.arrive_object_mm / 1000.0,
+             "place_arms": [], "autoclose_off": False}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
     last_target_warn = 0.0
     console = None
@@ -1052,6 +1086,18 @@ def main(argv=None) -> int:
                 continue
             step_errors = 0
 
+            # place 放置路径：该臂的几段直线都走完（直线段清空）后自动松开夹爪
+            if flags["place_arms"]:
+                for a in list(flags["place_arms"]):
+                    if ctrl.lin_status(a):
+                        continue
+                    flags["place_arms"].remove(a)
+                    log.info("放置路径[%s]已走完", a)
+                if not flags["place_arms"]:
+                    if flags.get("soft") is not None:
+                        flags["soft"].stop("place 走完松开夹爪")
+                    apply_grip_percent(ctrl, 100, 100, source="place 走完（松开夹爪）")
+
             # --delta：等首帧拿到 q_cmd（=测量位姿）后再叠加相对位移
             if args.delta is not None and info.q_cmd is not None and not delta_done:
                 for arm in flags["arms"]:
@@ -1125,10 +1171,11 @@ def main(argv=None) -> int:
             all_arrived_now = (arrival is not None
                                and any(ev.kind == "arrived" for ev in arrive_events)
                                and arrival.all_arrived(flags["arms"]))
-            if all_arrived_now and args.grip_on_arrive is not None:
+            auto_grip_ok = all_arrived_now and not flags["autoclose_off"]
+            if auto_grip_ok and args.grip_on_arrive is not None:
                 apply_grip_percent(ctrl, args.grip_on_arrive, args.grip_on_arrive,
                                    source=f"到位后 --grip-on-arrive {args.grip_on_arrive:g}%")
-            if all_arrived_now and args.grip_on_arrive_soft is not None and not soft.active:
+            if auto_grip_ok and args.grip_on_arrive_soft is not None and not soft.active:
                 for m in soft.start(ctrl, tau_limit=args.grip_on_arrive_soft,
                                     source=f"到位后 --grip-on-arrive-soft {args.grip_on_arrive_soft:g}"):
                     log.info("%s", m)
@@ -1136,7 +1183,7 @@ def main(argv=None) -> int:
             if soft.active:
                 flags["soft_was_active"] = True
             grip_done = (not soft.active) if args.grip_on_arrive_soft is not None else True
-            if (args.lin_retreat > 0 and all_arrived_now and grip_done
+            if (args.lin_retreat > 0 and auto_grip_ok and grip_done
                     and not flags["retreated"]
                     and (args.grip_on_arrive is not None
                          or args.grip_on_arrive_soft is not None)):

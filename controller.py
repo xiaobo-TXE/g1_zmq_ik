@@ -61,6 +61,9 @@ AXIS_ORDER: Tuple[str, ...] = ("z", "y", "x")
 #: 轴分解时，某根轴的位移 ≤ 这个值就不单独成段（m）。避免为几微米造一段。
 AXIS_MIN_STEP = 1e-3
 
+#: 放置路径（start_place_path）默认的抬升余量（m）：抬升后水平平移，避开桌面/障碍。
+PLACE_CLEARANCE_DEFAULT = 0.05
+
 #: 笛卡尔直线段时间律的内部积分步长（s）。比控制周期细得多，保证
 #: "先算好整条曲线再按时间采样"的确定性，也让限幅不受控制周期抖动破坏。
 LIN_PROFILE_DT = 1e-3
@@ -663,6 +666,21 @@ class ArmController:
         if T0 is None:
             T0 = self._base_pose(arm)
         wps = self._axis_waypoints(T0[:3, 3], T_goal[:3, 3])
+        mv = self._start_waypoint_segments(arm, T0, wps, T_goal)
+        axes = "->".join(a.upper() for a in self.axis_order)
+        logger.info("轴分解直线[%s]: 共 %d 段（轴序 %s），总长 %.1fmm，段间角点停",
+                    arm, self._seg_total[arm], axes,
+                    sum(m.length for m in self._queue[arm]) * 1000)
+        return mv
+
+    def _start_waypoint_segments(self, arm: str, T0: np.ndarray,
+                                 wps: List[np.ndarray], T_goal: np.ndarray) -> LinearMove:
+        """把一串**位置航点**排成逐段直线并起段（段末速度归零 = 段间角点停）。
+
+        姿态按航点序号在 R0 -> R1 的测地线上均摊；起末姿态相同时即全程保持该姿态。
+        共用给 `start_axis_path`（轴分解）与 `start_place_path`（放置）。
+        `wps` 至少两个点（调用方保证）。
+        """
         R0, R1 = T0[:3, :3], T_goal[:3, :3]
         dR = _rot_log(R0.T @ R1)
         n = len(wps) - 1
@@ -680,10 +698,43 @@ class ArmController:
         self._approach[arm] = None
         self._lin_fail[arm] = 0
         self._assign_target(arm, T_goal)
-        axes = "->".join(a.upper() for a in self.axis_order)
-        logger.info("轴分解直线[%s]: 共 %d 段（轴序 %s），总长 %.1fmm，段间角点停",
-                    arm, n, axes, sum(m.length for m in segs) * 1000)
         return segs[0]
+
+    def start_place_path(self, arm: str, T_goal: np.ndarray,
+                         clearance: float = PLACE_CLEARANCE_DEFAULT) -> LinearMove:
+        """放置路径（抓取后搬运到位再松爪）：**先竖直抬升 -> 水平平移 -> 最后竖直下落**。
+
+        为什么不能直接用 `move_linear_to` 的轴分解：轴分解按 `axis_order`(Z->Y->X) 是
+        **先走目标高度**，目标比当前低时等于"贴着桌面降下去、再横着拖"，带着盒子会把盒子
+        拖倒 / 蹭桌。放置必须"先抬起来、再平移、最后才落下"。
+
+        抬升高度 = max(当前 z, 目标 z) + `clearance`；水平段仍按 Y 再 X（只走真正变了的轴）。
+        姿态：起末都是"当前锁定朝向"，所以全程盒子不转。段间角点停（速度精确归零）。
+        """
+        T_goal = np.asarray(T_goal, dtype=float).reshape(4, 4)
+        if not np.isfinite(T_goal).all():
+            raise ValueError(f"{arm} 的放置目标位姿含 NaN/Inf，已拒绝")
+        if clearance < 0.0:
+            raise ValueError(f"抬升余量必须 >= 0，收到 {clearance}")
+        T0 = self._cmd_pose_in_target_frame(arm)
+        if T0 is None:
+            T0 = self._base_pose(arm)
+        p0, p1 = np.asarray(T0, dtype=float)[:3, 3].copy(), T_goal[:3, 3].copy()
+        z_lift = max(p0[2], p1[2]) + float(clearance)
+        wps: List[np.ndarray] = [p0]
+        for nxt in (np.array([p0[0], p0[1], z_lift]),      # ① 抬升到安全高度
+                    np.array([p0[0], p1[1], z_lift]),      # ② 横向平移（y）
+                    np.array([p1[0], p1[1], z_lift]),      # ③ 前后平移（x）
+                    np.array([p1[0], p1[1], p1[2]])):      # ④ 下落到放置高度
+            if float(np.linalg.norm(nxt - wps[-1])) > AXIS_MIN_STEP:
+                wps.append(nxt)
+        if len(wps) < 2:                                   # 已在目标上：仍走一次的退化段
+            wps.append(p1)
+        mv = self._start_waypoint_segments(arm, T0, wps, T_goal)
+        logger.info("放置路径[%s]: 抬升到 z=%.3f（+%.0fmm）-> 平移到 (%.3f, %.3f) -> 下落到 "
+                    "z=%.3f，共 %d 段（段间角点停）",
+                    arm, z_lift, clearance * 1000, p1[0], p1[1], p1[2], len(wps) - 1)
+        return mv
 
     def move_linear_to(self, arm: str, T_goal: np.ndarray) -> Optional[LinearMove]:
         """整段 moveL（`--lin-all`）：从**当前指令位姿**沿直线走到 `T_goal`。

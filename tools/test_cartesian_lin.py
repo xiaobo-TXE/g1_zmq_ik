@@ -13,6 +13,7 @@
   [7] 两段式接近  ：先 PTP 到 pre-grasp，指令到位后自动切直线进给，方向沿工具轴
   [8] 整段 moveL  ：move_linear_to 从当前指令位姿起段、重复目标幂等、全程走直线
   [9] 轴分解 moveL：Z→Y→X 逐段轴对齐直线、段间角点停、全程落在线段并集上
+  [10] 放置路径    ：start_place_path 先抬升→平移→最后下落，低空段不产生水平位移
 
 用法：python tools/test_cartesian_lin.py [-v]
 """
@@ -497,6 +498,55 @@ def main() -> int:
     for i, w in enumerate(wps6[1:-1], start=1):        # 角点确实被"经过"（停一下）
         d = min(float(np.linalg.norm(q - w)) for q in traj6)
         check(f"经过第 {i} 个角点（< 1mm）", d < 1e-3, f"最近 {d*1000:.3f} mm")
+
+    # ---------------- [10] 放置路径（place）：先抬升 -> 平移 -> 最后下落 ----------------
+    print("\n[10] 放置路径：先抬升 -> 水平平移 -> 最后下落（不贴桌横拖）")
+    ctrl7, st7, pub7 = make_rig(model, ik, q0, max_step_deg=6.0, ee_speed=0.10,
+                                ee_accel=0.20, ee_jerk=2.0)
+    ctrl7.step(0.02)
+    start7 = ctrl7._cmd_pose_in_target_frame(RIGHT).copy()
+    goal7 = start7.copy()
+    goal7[0, 3] += 0.03                                # x 前移
+    goal7[1, 3] += 0.02                                # y 左移
+    goal7[2, 3] += 0.03                                # z 抬高（可达；关键是"先抬到安全高度、再平移、最后才落到目标高度"）
+    clr7 = 0.05
+    z_lift7 = max(start7[2, 3], goal7[2, 3]) + clr7
+    ctrl7.start_place_path(RIGHT, ctrl7.make_target_pose(RIGHT, goal7[:3, 3]),
+                           clearance=clr7)
+    segs7 = list(ctrl7._queue[RIGHT])
+    axis7 = [int(np.argmax(np.abs(m.p1 - m.p0))) for m in segs7]
+    check("拆成 4 段（抬升 / 横移 y / 前移 x / 下落）", len(segs7) == 4, f"{len(segs7)} 段")
+    check("段序 = Z→Y→X→Z（抬升在最前、下落在最后）", axis7 == [2, 1, 0, 2],
+          f"{axis7}（2=z,1=y,0=x）")
+    check("抬升高度 = max(当前, 目标) + 余量",
+          abs(segs7[0].p1[2] - z_lift7) < 1e-12, f"z_lift={z_lift7:.3f} m")
+    traj7 = []
+    for _ in range(3000):
+        info = ctrl7.step(0.02)
+        if RIGHT not in info.ee_cmd:
+            break
+        traj7.append(info.ee_cmd[RIGHT][:3, 3].copy())
+        if ctrl7.lin[RIGHT] is None and not ctrl7._queue[RIGHT]:
+            for _ in range(20):
+                info = ctrl7.step(0.02)
+                if RIGHT in info.ee_cmd:
+                    traj7.append(info.ee_cmd[RIGHT][:3, 3].copy())
+            break
+    traj7 = np.array(traj7)
+    check("放置路径精确到达目标（< 1mm）",
+          float(np.linalg.norm(traj7[-1] - goal7[:3, 3])) < 1e-3,
+          f"{np.linalg.norm(traj7[-1] - goal7[:3, 3]) * 1000:.3f} mm")
+    check("确实升到了安全高度（抬升真的发生）",
+          float(traj7[:, 2].max()) >= z_lift7 - 1e-9,
+          f"最高 z={float(traj7[:, 2].max()):.3f} vs {z_lift7:.3f}")
+    # 关键安全性质：**低空段只允许竖直运动** —— 每一点要么还在起点正上方（抬升），
+    # 要么已经在终点正上方（下落）；否则就是"贴着桌面横拖"，会把盒子拖倒/蹭桌。
+    low7 = traj7[traj7[:, 2] < z_lift7 - 1e-3]
+    d_start = np.linalg.norm(low7[:, :2] - start7[:2, 3], axis=1) if len(low7) else np.array([])
+    d_goal = np.linalg.norm(low7[:, :2] - goal7[:2, 3], axis=1) if len(low7) else np.array([])
+    worst7 = float(np.minimum(d_start, d_goal).max()) if len(low7) else 0.0
+    check("低空段不产生水平位移（抬升/下落都在目标正上方）", worst7 < 5e-4,
+          f"最大水平偏离 {worst7 * 1000:.3f} mm（{len(low7)} 帧低空）")
 
     n_fail = sum(1 for _, ok, _ in _R if not ok)
     print("\n" + "=" * 76)
