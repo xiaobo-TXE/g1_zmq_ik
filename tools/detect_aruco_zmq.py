@@ -49,11 +49,20 @@
 夹爪不在这一帧里下发：请用 g1_zmq_ik 的 `--grip-on-arrive-soft TAU`
 （到位后力限软闭合，见 README §2.7），或运行中敲 `gc`。
 
-预览窗口按键：`r` = 重新锁存（清掉已锁存的目标与检测轨迹，让下一次检测重新成为"第一帧"；
-Tag 被搬到新位置后按它）；`q` / `ESC` = 退出。
+预览窗口按键：`r` = 重新锁存（清掉已锁存的**抓取点+放置点**与检测轨迹，让下一次检测重新成为
+"第一帧"；Tag 被搬到新位置后按它）；`q` / `ESC` = 退出。
 
-依赖：`opencv-contrib-python`（cv2.aruco 在 contrib 里）、pyzmq、numpy。
-  uv pip install opencv-contrib-python
+**双 Tag 抓放（`--pick-id` / `--place-id`）**：抓取码贴在盒子上，放置码贴在落点（桌面）。
+两个码同时可见时，本工具把**抓取点**（`pos`）和**放置点**（`place_pos`）放在**同一帧**里发给 6003；
+控制端抓到盒子（到位 + 闭爪完成）后自动搬过去、下落、松开夹爪 —— 时序在控制端，
+因为只有它知道"到位"和"夹爪合上了"（6003 是单向的，检测端拿不到任何机器人状态）。
+要点：
+
+* **两个码必须同时在画面里**才下发（放置点随第一次成功下发被锁存，缺了它永远等不到放置点）；
+  只有单码时用 `--place-id 0`，行为与以前完全一致。
+* 放置点用**独立**的偏移/朝向：`--place-marker-to-grasp` / `--place-align-rpy`
+  （放置码平贴桌面，沿用抓取那套 `-0.09` 会把末端送到桌面以下）。
+* 先 `--no-send --print-axes --suggest-align` 核对两个码的 `axes(marker/torso)` 与推荐 align。
 
 用法::
 
@@ -68,6 +77,10 @@ Tag 被搬到新位置后按它）；`q` / `ESC` = 退出。
     # ③ 真机：到位后自动软闭合
     python main.py --robot-ip <IP> --arm right --target-frame torso \
         --gripper-port 6004 --mode-port 6000 --require-vla --grip-on-arrive-soft 0.2
+
+    # ④ 双 Tag：抓取码 ID3（盒子上）+ 放置码 ID4（落点），抓到自动搬过去放下
+    python main.py --config robot.json
+    python tools/detect_aruco_zmq.py --config robot.json
 """
 
 import argparse
@@ -300,6 +313,14 @@ class TargetSender:
     对端（g1_zmq_ik 的 6003）没起/重启时，send 会因 SNDTIMEO 抛 ``zmq.Again``：
     这里**接住它按丢帧处理**（计数 + 限频告警），绝不让它把整个检测循环干掉；
     对端一起来，下一帧自动恢复发送。锁存只在**发送成功**之后才生效，所以不会把目标锁在"没人收"的时候。
+
+    双 Tag 抓放时帧里还带一个**放置点**（`place_pos` / `place_quat`，见 `--place-id`）：
+
+    * 它与抓取点**同帧**发出 —— 控制端抓到盒子后才需要它，分开两帧就必然有一帧没有放置点；
+    * 锁存的是**一对**（抓取点 + 放置点），`--latch-resend-hz` 重发时一对一起重发
+      （否则控制端中途重启只会拿到位置目标、拿不到放置点）；
+    * 跳变拒绝只判**抓取点**：放置码是静态地标，它的检测抖动不该被当成"盒子被推动"；
+      死区则两个点都算（搬动放置码时目标要能跟着更新）。
     """
 
     def __init__(self, endpoint, hz, deadband_mm, jump_reject_mm,
@@ -321,7 +342,10 @@ class TargetSender:
                                     if float(latch_resend_hz) > 0 else 0.0)
         self.latched = None                       # 锁存的位置；None = 尚未锁存
         self.latched_quat = None
+        self.latched_place = None                 # 锁存的放置点（双 Tag 抓放；单 Tag 时恒为 None）
+        self.latched_place_quat = None
         self.last_sent = None
+        self.last_place_sent = None               # 只用于死区判断
         self.last_time = 0.0
         self.sent = 0
         self.skipped = 0
@@ -351,12 +375,21 @@ class TargetSender:
               '，**锁存第一次**（之后不再更新）' if self.latch_first else ''),
               flush=True)
 
-    def _send_raw(self, p, quaternion_torso, now):
-        """把一帧目标推进 socket（含丢帧处理）。返回是否真的发出去了。"""
+    def _send_raw(self, p, quaternion_torso, now, place_position=None,
+                  place_quaternion=None):
+        """把一帧目标推进 socket（含丢帧处理）。返回是否真的发出去了。
+
+        `place_position` / `place_quaternion` 是双 Tag 抓放的放置点，与抓取点同帧发出。
+        """
         frame = {'pos': [round(float(v), 6) for v in p]}
         if self.send_quat and quaternion_torso is not None:
             q = np.asarray(quaternion_torso, dtype=np.float64).reshape(4)
             frame['quat'] = [round(float(v), 6) for v in q]
+        if place_position is not None:
+            frame['place_pos'] = [round(float(v), 6) for v in place_position]
+            if self.send_quat and place_quaternion is not None:
+                pq = np.asarray(place_quaternion, dtype=np.float64).reshape(4)
+                frame['place_quat'] = [round(float(v), 6) for v in pq]
         try:
             self.socket.send_string(json.dumps(frame))
         except self.zmq.Again:
@@ -373,18 +406,26 @@ class TargetSender:
         self.sent += 1
         return True
 
-    def maybe_send(self, position_torso, quaternion_torso=None, now=None):
-        """返回 True 表示本帧真的发出去了。"""
+    def maybe_send(self, position_torso, quaternion_torso=None, now=None,
+                   place_position=None, place_quaternion=None):
+        """返回 True 表示本帧真的发出去了。
+
+        `place_position` / `place_quaternion` 是双 Tag 抓放的放置点（可省）。它随抓取点同帧发出、
+        与抓取点一起被锁存；但**不参与跳变拒绝**（放置码是静态地标，抖动不算"盒子被推动"）。
+        """
         if not self.enabled or self.socket is None:
             return False
         now = time.monotonic() if now is None else now
+        place_p = (None if place_position is None
+                   else np.asarray(place_position, dtype=np.float64).reshape(3))
 
         # ---- 已锁存：不再接受任何新检测。只有 latch_resend_period>0 时会重发**同一个**锁存值
         #      （重发旧值不算更新，只是让中途重启的控制端还能重新拿到目标）----
         if self.latched is not None:
             if (self.latch_resend_period > 0
                     and now - self.last_time >= self.latch_resend_period):
-                return self._send_raw(self.latched, self.latched_quat, now)
+                return self._send_raw(self.latched, self.latched_quat, now,
+                                      self.latched_place, self.latched_place_quat)
             self.skipped += 1
             return False
 
@@ -420,20 +461,31 @@ class TargetSender:
                       .format(jump * 1000, waited), flush=True)
             else:
                 self.jump_candidate = None
-            if jump < self.deadband:
+            # 死区：抓取点与放置点**任一个**动了就发（放置码被搬走时目标要能更新）
+            place_moved = (place_p is not None and self.last_place_sent is not None
+                           and float(np.linalg.norm(place_p - self.last_place_sent)) >= self.deadband)
+            if jump < self.deadband and not place_moved:
                 self.skipped += 1
                 return False
-        if not self._send_raw(p, quaternion_torso, now):
+        if not self._send_raw(p, quaternion_torso, now, place_p, place_quaternion):
             return False                                   # 对端不在 -> 不锁存，等下一帧重试
         self.last_sent = p.copy()
+        if place_p is not None:
+            self.last_place_sent = place_p.copy()
         if self.latch_first:
             # 只在**成功发出**之后锁存：对端没起时不要把目标锁死在一个没人收到的值上
             self.latched = p.copy()
             self.latched_quat = (None if quaternion_torso is None
                                  else np.asarray(quaternion_torso, dtype=np.float64).reshape(4).copy())
-            print('[INFO] 已锁存目标 pos={}：之后检测不再更新'
+            self.latched_place = None if place_p is None else place_p.copy()
+            self.latched_place_quat = (None if place_quaternion is None
+                                       else np.asarray(place_quaternion, dtype=np.float64).reshape(4).copy())
+            print('[INFO] 已锁存目标 pos={}{}：之后检测不再更新'
                   '（要重新锁存：预览窗口按 r，或重启检测端）'
-                  .format(vector_text(self.latched)), flush=True)
+                  .format(vector_text(self.latched),
+                          '' if self.latched_place is None
+                          else ' place={}（含放置点）'.format(vector_text(self.latched_place))),
+                  flush=True)
         return True
 
     def reset_latch(self) -> bool:
@@ -447,7 +499,10 @@ class TargetSender:
         had = self.latched is not None
         self.latched = None
         self.latched_quat = None
+        self.latched_place = None
+        self.latched_place_quat = None
         self.last_sent = None
+        self.last_place_sent = None
         self.jump_candidate = None
         self.last_time = 0.0                 # 别被限频再白等一个周期
         return had
@@ -652,6 +707,12 @@ def vector_text(vector):
     return '(' + ', '.join('{:.4f}'.format(float(value)) for value in vector) + ')'
 
 
+def nearest_with_id(results, marker_id):
+    """取指定 ID、离相机最近的检测结果；没有这个 ID 时返回 None（双 Tag 的角色选择）。"""
+    same = [r for r in results if int(r['id']) == int(marker_id)]
+    return min(same, key=lambda r: float(r['distance'])) if same else None
+
+
 def print_results(results):
     """打印识别到的目标（标记）位置：相机系 d435 + torso 系，另附距离/重投影误差。"""
     for result in results:
@@ -704,13 +765,13 @@ def suggest_grasp_align(result):
     return float(theta), axis, mz
 
 
-def print_align_suggestion(result):
-    """打印推荐的 --grasp-align-rpy，以及按它算出的末端三轴（核对标准）。"""
+def print_align_suggestion(result, arg_name='--grasp-align-rpy', label=''):
+    """打印推荐的 align 值（`arg_name`），以及按它算出的末端三轴（核对标准）。"""
     theta, axis, mz = suggest_grasp_align(result)
     R = _quat_to_rotation(result['torso_quaternion'])
     ee = R @ rotation_from_rpy(0.0, 0.0, theta)
-    print('    --suggest-align: --grasp-align-rpy 0 0 {:.4f}   探入方向 {}'.format(
-        theta, vector_text(axis)), flush=True)
+    print('    {}--suggest-align: {} 0 0 {:.4f}   探入方向 {}'.format(
+        label, arg_name, theta, vector_text(axis)), flush=True)
     print('                     预期 axes(ee/torso) x={} y={} z={}'.format(
         vector_text(ee[:, 0]), vector_text(ee[:, 1]), vector_text(ee[:, 2])), flush=True)
     if float(mz[2]) < 0.7:
@@ -722,7 +783,7 @@ def print_align_suggestion(result):
               .format(vector_text(ee[:, 1])), file=sys.stderr, flush=True)
 
 
-def print_marker_axes(result, align_rpy=(0.0, 0.0, 0.0)):
+def print_marker_axes(result, align_rpy=(0.0, 0.0, 0.0), label=''):
     """打印标记三个轴在 torso 系下的单位方向，用来决定 --marker-to-grasp 的偏移方向。
 
     标记坐标系（由 solvePnP 的 object_points 定义）：x/y 在标记平面内，**z 垂直于标记向外**
@@ -731,14 +792,18 @@ def print_marker_axes(result, align_rpy=(0.0, 0.0, 0.0)):
         axes(torso) x=(+0.01,-1.00,+0.03) y=(-0.99,-0.01,+0.05) z=(-0.03,-0.04,+1.00)
         -> 标记 z 轴指向 torso 的 +z（朝上）= 标记贴在物体顶面、面朝上；
            要把抓取点放在标记下方 15mm，就写 --marker-to-grasp 0 0 -0.015
+
+    `label` 用于双 Tag 时区分角色（例如 `抓取码 ID3 `）。
     """
     rotation = _quat_to_rotation(result['torso_quaternion'])
-    print('    axes(marker/torso) x={} y={} z={}'.format(
+    print('    {}axes(marker/torso) x={} y={} z={}'.format(
+        label,
         vector_text(rotation[:, 0]), vector_text(rotation[:, 1]),
         vector_text(rotation[:, 2])), flush=True)
     if align_rpy is not None:
         ee = rotation @ rotation_from_rpy(*align_rpy)
-        print('    axes(ee/torso)     x={} (探入方向) y={} (手指开合方向) z={}'.format(
+        print('    {}axes(ee/torso)     x={} (探入方向) y={} (手指开合方向) z={}'.format(
+            label,
             vector_text(ee[:, 0]), vector_text(ee[:, 1]),
             vector_text(ee[:, 2])), flush=True)
 
@@ -756,8 +821,23 @@ def build_parser():
     parser.add_argument('--marker-size', type=float, default=0.025,
                         help='physical marker side length in meters')
     parser.add_argument('--dictionary', default='DICT_APRILTAG_36H11')
-    parser.add_argument('--ids', type=int, nargs='*', default=[3],
+    parser.add_argument('--ids', type=int, nargs='*', default=[3,4],
                         help='accepted IDs; pass --ids with no values for all')
+    parser.add_argument('--pick-id', type=int, default=3, metavar='ID',
+                        help='抓取码 ID（双 Tag 抓放：这个码算抓取点，见 --place-id）')
+    parser.add_argument('--place-id', type=int, default=0, metavar='ID',
+                        help='放置码 ID（双 Tag 抓放：抓住盒子后搬到这个码的位置放下）。'
+                             '**0=关闭双 Tag 模式**（默认，单码行为：只发抓取点、不带 place_pos）；'
+                             '要用双 Tag 就在配置里写 place_id（见 robot.example.json）')
+    parser.add_argument('--place-marker-to-grasp', type=float, nargs=3, default=(0.0, 0.0, 0.0),
+                        metavar=('DX', 'DY', 'DZ'),
+                        help='放置码中心 -> 放置点的偏移（米，放置码自身坐标系）。'
+                             '放置码平贴桌面时给 0 0 0（末端落在码中心）；'
+                             '沿用抓取那套 -0.09 会把末端送到桌面以下')
+    parser.add_argument('--place-align-rpy', type=float, nargs=3, default=(0.0, 0.0, 0.0),
+                        metavar=('R', 'P', 'Y'),
+                        help='夹爪相对放置码的对准旋转(rad, ZYX, 放置码坐标系)。'
+                             '只影响 send_quat=true 时下发的放置朝向')
     parser.add_argument('--confirmation-frames', type=int, default=3)
     parser.add_argument('--max-distance', type=float, default=2.0)
     parser.add_argument('--min-marker-perimeter-px', type=float, default=60.0)
@@ -830,6 +910,15 @@ def parse_args(argv=None):
         build_parser().error('--confirmation-frames must be at least one')
     if args.log_interval < 0.0:
         build_parser().error('--log-interval cannot be negative')
+    # 双 Tag 抓放：两个角色不能是同一个码，且必须被 --ids 放行（否则检测阶段就被过滤掉了）
+    if args.place_id > 0:
+        if args.pick_id == args.place_id:
+            build_parser().error('--pick-id 与 --place-id 不能相同（都是 {}）'.format(args.pick_id))
+        if args.ids:
+            for name, mid in (('--pick-id', args.pick_id), ('--place-id', args.place_id)):
+                if mid not in args.ids:
+                    build_parser().error('{} {} 不在 --ids {} 里，检测端会把这个码过滤掉'
+                                         .format(name, mid, args.ids))
     return args
 
 
@@ -860,6 +949,15 @@ def main():
     print('[INFO] 抓取对准: --marker-to-grasp {}  --grasp-align-rpy {}  quat={}'.format(
         tuple(args.marker_to_grasp), tuple(args.grasp_align_rpy),
         'on' if args.send_quat else 'off'))
+    if args.place_id > 0:
+        print('[INFO] 双 Tag 抓放: 抓取码 ID{} / 放置码 ID{}（两个码同时在画面里才开始下发）；'
+              '放置对准: --place-marker-to-grasp {}  --place-align-rpy {}'.format(
+                  args.pick_id, args.place_id, tuple(args.place_marker_to_grasp),
+                  tuple(args.place_align_rpy)), flush=True)
+    else:
+        print('[INFO] 单码模式（--place-id 0，默认）：只发抓取点。'
+              '要用双 Tag 抓放（抓取码 + 放置码）就在配置里写 place_id，见 robot.example.json',
+              flush=True)
     print('[INFO] camera={}, dictionary={}, marker_size={} m, ids={}'.format(
         args.camera_name, args.dictionary, args.marker_size,
         args.ids if args.ids else 'ALL'))
@@ -873,6 +971,7 @@ def main():
                           latch_first=args.latch_first, latch_resend_hz=args.latch_resend_hz)
     last_log_time = 0.0
     send_log_time = 0.0
+    last_place_warn = 0.0
     warned_resolution = False
     last_camera_note = None
 
@@ -907,27 +1006,61 @@ def main():
 
             annotated, results = estimator.process(frame)
             now = time.monotonic()
+
+            # ---- 角色选择：双 Tag 时按 ID 取"哪个是抓取码、哪个是放置码"（各自取离相机最近的那个）
+            dual = args.place_id > 0
+            pick = place = None
+            if results:
+                if dual:
+                    pick = nearest_with_id(results, args.pick_id)
+                    place = nearest_with_id(results, args.place_id)
+                else:
+                    pick = min(results, key=lambda r: float(r['distance']))
+            pick_label = '抓取码 ID{} '.format(args.pick_id) if dual else ''
+            place_label = '放置码 ID{} '.format(args.place_id) if dual else ''
+
             if results and now - last_log_time >= args.log_interval:
                 print_results(results)
                 if args.print_axes:
-                    print_marker_axes(min(results, key=lambda r: float(r['distance'])),
-                                      args.grasp_align_rpy)
+                    if pick is not None:
+                        print_marker_axes(pick, args.grasp_align_rpy, label=pick_label)
+                    if place is not None:
+                        print_marker_axes(place, args.place_align_rpy, label=place_label)
                 if args.suggest_align:
-                    print_align_suggestion(min(results, key=lambda r: float(r['distance'])))
+                    if pick is not None:
+                        print_align_suggestion(pick, '--grasp-align-rpy', pick_label)
+                    if place is not None:
+                        print_align_suggestion(place, '--place-align-rpy', place_label)
                 last_log_time = now
 
-            # 把（已确认的）标记位姿换算成抓取位姿（位置 + 朝向），发给 6003
-            if results:
-                best = min(results, key=lambda r: float(r['distance']))
+            # 双 Tag：**两个码都看到才发**。放置点是随第一次成功下发一起被锁存的，缺了它整个流程
+            # 永远等不到放置点（单码用户请用 --place-id 0，行为与以前完全一致）。
+            if dual and place is None:
+                if now - last_place_warn >= 1.0:
+                    last_place_warn = now
+                    print('[WARN] 等待放置码 ID={}（双 Tag 抓放要求抓取码与放置码同时在画面里；'
+                          '只有单码请用 --place-id 0）'.format(args.place_id),
+                          file=sys.stderr, flush=True)
+            elif pick is not None:
+                # 把（已确认的）标记位姿换算成抓取位姿 / 放置位姿（位置 + 朝向），发给 6003
                 # T_ee = T_marker @ [R_align | offset]：偏移与对准旋转都在"标记自身坐标系"里给
-                offset = np.asarray(args.marker_to_grasp, dtype=np.float64).reshape(3)
-                R_marker = _quat_to_rotation(best['torso_quaternion'])
-                R_align = rotation_from_rpy(*args.grasp_align_rpy)
-                target_torso = np.asarray(best['torso_position'], dtype=np.float64) \
-                    + R_marker @ offset
-                target_quat = matrix_to_quaternion(R_marker @ R_align)
+                R_pick = _quat_to_rotation(pick['torso_quaternion'])
+                target_torso = (np.asarray(pick['torso_position'], dtype=np.float64)
+                                + R_pick @ np.asarray(args.marker_to_grasp,
+                                                      dtype=np.float64).reshape(3))
+                target_quat = matrix_to_quaternion(R_pick @ rotation_from_rpy(*args.grasp_align_rpy))
+                place_torso = place_quat = None
+                if place is not None:
+                    R_place = _quat_to_rotation(place['torso_quaternion'])
+                    place_torso = (np.asarray(place['torso_position'], dtype=np.float64)
+                                   + R_place @ np.asarray(args.place_marker_to_grasp,
+                                                          dtype=np.float64).reshape(3))
+                    place_quat = matrix_to_quaternion(
+                        R_place @ rotation_from_rpy(*args.place_align_rpy))
                 dropped_before = sender.dropped
-                sent = sender.maybe_send(target_torso, target_quat, now=now)
+                sent = sender.maybe_send(target_torso, target_quat, now=now,
+                                         place_position=place_torso,
+                                         place_quaternion=place_quat)
                 if now - send_log_time >= args.log_interval:
                     send_log_time = now
                     if not sender.enabled:
@@ -942,7 +1075,11 @@ def main():
                         state = '跳过(死区/限频)'
                     print('[INFO] 抓取位姿 torso p={} q={}  (id={}, {})'.format(
                         vector_text(target_torso), vector_text(target_quat),
-                        best['id'], state), flush=True)
+                        pick['id'], state), flush=True)
+                    if place_torso is not None:
+                        print('[INFO] 放置位姿 torso p={} q={}  (id={})'.format(
+                            vector_text(place_torso), vector_text(place_quat),
+                            place['id']), flush=True)
 
             if not args.no_display:
                 try:

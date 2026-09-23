@@ -161,7 +161,7 @@ def main() -> int:
     print("\n[8] 只在**发送成功**之后才锁存（发不出去就不锁，下次还试）")
     s5 = mod.TargetSender(endpoint, hz=50.0, deadband_mm=2.0, jump_reject_mm=100.0,
                           enabled=True, recover_s=0.5, latch_first=True)
-    s5._send_raw = lambda p, q, now: False             # 模拟"对端不在，这一帧发不出去"
+    s5._send_raw = lambda p, q, now, pp=None, pq=None: False   # 模拟"对端不在，这一帧发不出去"
     t8 = 6000.0
     check("发不出去 -> 不锁存", s5.maybe_send([0.10, 0.0, 0.0], now=t8) is False
           and s5.latched is None)
@@ -378,6 +378,73 @@ def main() -> int:
     s7.close()
     pull2.close(linger=0)
     ctx2.term()
+
+    print("\n[11] 双 Tag 抓放：放置点随抓取点**同帧**发出，并一起被锁存")
+    ctx3 = zmq.Context()
+    pull3 = ctx3.socket(zmq.PULL)
+    ep3 = "tcp://127.0.0.1:{}".format(pull3.bind_to_random_port("tcp://127.0.0.1"))
+
+    def drain3():
+        out = []
+        while pull3.poll(50):
+            out.append(pull3.recv_json())
+        return out
+
+    grasp = [0.30, -0.20, 0.15]
+    place = [0.40, 0.10, 0.02]
+
+    s8 = mod.TargetSender(ep3, hz=50.0, deadband_mm=2.0, jump_reject_mm=100.0,
+                          enabled=True, recover_s=0.5)
+    t11 = 9000.0
+    check("带放置点时发出", s8.maybe_send(grasp, now=t11, place_position=place) is True)
+    frames = drain3()
+    check("帧里带 place_pos（与控制端要求'同帧原子到达'一致）",
+          len(frames) == 1 and abs(frames[0]["place_pos"][0] - place[0]) < 1e-6,
+          f"frames={frames}")
+    check("send_quat=false 时不带 place_quat（姿态由控制端用锁定朝向）",
+          "place_quat" not in frames[0], f"frame={frames[0]}")
+    t11 += 1.0
+    check("只有放置点动了（>死区）也会重发（搬动放置码要能跟上）",
+          s8.maybe_send(grasp, now=t11, place_position=[0.42, 0.10, 0.02]) is True)
+    drain3()
+    t11 += 1.0
+    check("不带 place_position 时帧里没有 place_pos（单码行为不变）",
+          s8.maybe_send([grasp[0] + 0.05, grasp[1], grasp[2]], now=t11) is True
+          and "place_pos" not in drain3()[0])
+    s8.close()
+
+    s9 = mod.TargetSender(ep3, hz=50.0, deadband_mm=2.0, jump_reject_mm=100.0,
+                          enabled=True, recover_s=0.5, latch_first=True)
+    t11 += 1.0
+    check("首帧发出并锁存**一对**（抓取点 + 放置点）",
+          s9.maybe_send(grasp, now=t11, place_position=place) is True
+          and s9.latched is not None and s9.latched_place is not None,
+          f"latched_place={None if s9.latched_place is None else np.round(s9.latched_place, 3)}")
+    check("只发出 1 帧", len(drain3()) == 1)
+    check("锁存后抓取点与放置点都不再更新",
+          s9.maybe_send([grasp[0] + 0.05, grasp[1], grasp[2]], now=t11 + 1.0,
+                        place_position=[0.50, 0.10, 0.02]) is False
+          and len(drain3()) == 0 and s9.sent == 1, f"sent={s9.sent}")
+    check("reset_latch() 把一对都清掉（按 r 后重新锁存新的一对）",
+          s9.reset_latch() is True and s9.latched is None
+          and s9.latched_place is None and s9.latched_place_quat is None)
+    s9.close()
+
+    s10 = mod.TargetSender(ep3, hz=50.0, deadband_mm=2.0, jump_reject_mm=100.0,
+                           enabled=True, recover_s=0.5, latch_first=True, latch_resend_hz=2.0)
+    t11 += 10.0
+    s10.maybe_send(grasp, now=t11, place_position=place)
+    drain3()
+    t11 += 0.6                                          # > 1/2s
+    s10.maybe_send([0.9, 0.9, 0.9], now=t11, place_position=[0.9, 0.9, 0.9])
+    frames = drain3()
+    check("--latch-resend 重发的是锁存的那一对（控制端中途重启也能拿到放置点）",
+          len(frames) == 1 and abs(frames[0]["pos"][0] - grasp[0]) < 1e-6
+          and "place_pos" in frames[0]
+          and abs(frames[0]["place_pos"][0] - place[0]) < 1e-6, f"frames={frames}")
+    s10.close()
+    pull3.close(linger=0)
+    ctx3.term()
 
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
     print("\n" + "=" * 74)

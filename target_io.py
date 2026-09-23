@@ -14,11 +14,18 @@
     {"arm":   "right"}                      # 可选: right/left/both；默认用启动时的 --arm
     {"pos_left": [...], "pos_right": [...]}# 可选：一次给两条手臂（优先于 pos/arm）
     {"quat":  [0,0,0,1]}                    # 可选：目标朝向四元数 (x,y,z,w)；不给则保持锁定朝向
+    {"place_pos":  [0.40, 0.10, 0.02]}      # 可选：放置点位置（双 Tag 抓放：抓到后自动搬到这里）
+    {"place_quat": [0,0,0,1]}               # 可选：放置点朝向；不给则保持锁定朝向
     {"grip": 0}                             # 可选：夹爪开合百分比 0=闭 100=全开（也可 {"right":0}）
     {"grip_rad": {"right": 0.0}}            # 可选：直接给夹爪弧度（输出侧量纲，跳过百分比换算）
     {"grip_close_tau": 0.3}                 # 可选：力限软闭合请求（|τ|≥0.3 就冻结）；**可单独成帧**
     {"grip_sides": ["right"]}               # 可选：软闭合只做这几侧（right/left）；不给=两侧
     {"timestamp": 1788514855.53}            # 可选，只用于诊断乱序
+
+双 Tag 抓放（检测端 `--place-id`）：`pos` 是**抓取点**，`place_pos` 是同一次抓取的**放置点**，
+两者同帧原子到达。控制端抓到盒子（到位 + 闭爪完成）后自动走放置路径并在终点松开夹爪；
+`place_pos` 缺失时行为与单 Tag 完全一致（`--no-auto-place` 可显式关掉自动搬运）。
+`place_pos` 本身不算"有效字段"：只有 `place_pos` 的帧仍按空帧拒绝。
 
 示例（发送端）：
     python tools/send_target.py --mode circle --rate 30 --radius 0.05 --period 4
@@ -47,6 +54,25 @@ def _vec3(value, name: str) -> Optional[np.ndarray]:
     if not np.isfinite(arr).all():
         raise ValueError(f"{name} 含 NaN/Inf")
     return arr
+
+
+def _quat4(value, name: str = "quat", payload: str = "") -> Optional[np.ndarray]:
+    """解析四元数 (x,y,z,w) 并归一化；非法时返回 None（只告警，不抛）。"""
+    if value is None:
+        return None
+    try:
+        q = np.asarray(value, dtype=float).reshape(-1)
+        if q.size != 4:
+            raise ValueError(f"需要 4 个数 (x,y,z,w)，收到 {q.size} 个")
+        if not np.isfinite(q).all():
+            raise ValueError("含 NaN/Inf")
+        norm = float(np.linalg.norm(q))
+        if norm < 1e-9:
+            raise ValueError("模长≈0")
+        return q / norm
+    except Exception as exc:
+        logger.warning("%s 被忽略: %s（原始前 120 字节: %r）", name, exc, payload[:120])
+        return None
 
 
 def _sides(value, name: str) -> Optional[Dict[str, float]]:
@@ -130,6 +156,7 @@ class TargetReceiver:
             raise ValueError("帧必须是 JSON 对象")
         out = {"arm": None, "pos": None, "rpy": None, "delta": None, "per_arm": {},
                "grip": None, "grip_rad": None, "quat": None,
+               "place_pos": None, "place_quat": None,
                "timestamp": None, "raw_size": len(payload)}
         arm = pkt.get("arm")
         if arm is not None:
@@ -145,19 +172,15 @@ class TargetReceiver:
             if v is not None:
                 out["per_arm"][side] = v
         # 可选目标朝向：四元数 (x, y, z, w)。给了就用它，不给则保持启动时锁定的末端朝向
-        quat = pkt.get("quat")
-        if quat is not None:
-            try:
-                q = np.asarray(quat, dtype=float).reshape(-1)
-                if q.size != 4:
-                    raise ValueError(f"需要 4 个数 (x,y,z,w)，收到 {q.size} 个")
-                if not np.isfinite(q).all():
-                    raise ValueError("含 NaN/Inf")
-                if float(np.linalg.norm(q)) < 1e-9:
-                    raise ValueError("模长≈0")
-                out["quat"] = q / float(np.linalg.norm(q))
-            except Exception as exc:
-                logger.warning("quat 被忽略: %s（原始前 120 字节: %r）", exc, payload[:120])
+        out["quat"] = _quat4(pkt.get("quat"), "quat", payload)
+
+        # 可选：放置点（双 Tag 抓放）。与 pos 同帧到达，抓到后搬到那里；不参与下面的空帧校验
+        # 与 quat 同样隔离失败：place_pos 写坏了只丢放置点（退回单 Tag 行为），不能把抓取目标一起废掉
+        try:
+            out["place_pos"] = _vec3(pkt.get("place_pos"), "place_pos")
+        except Exception as exc:
+            logger.warning("place_pos 被忽略: %s（原始前 120 字节: %r）", exc, payload[:120])
+        out["place_quat"] = _quat4(pkt.get("place_quat"), "place_quat", payload)
 
         # 可选夹爪字段：grip = 开合百分比(0=闭,100=全开)；grip_rad = 直接给弧度(输出侧量纲)
         # 夹爪部分的错误只丢弃夹爪更新（warn），手臂目标照旧 —— 与上游 6002 的失败隔离一致
@@ -201,7 +224,8 @@ class TargetReceiver:
                 out["timestamp"] = float(ts)
             except Exception:
                 raise ValueError("timestamp 不是数字")
-        for key, vec in (("pos", out["pos"]), ("delta", out["delta"])):
+        for key, vec in (("pos", out["pos"]), ("delta", out["delta"]),
+                         ("place_pos", out["place_pos"])):
             if vec is not None and np.linalg.norm(vec) > MAX_TARGET_DIST:
                 logger.warning("%s 距目标系原点 %.2f m（超过 %.1f m，请确认坐标系与单位："
                                "默认 torso_link 系 + 米，见 README §3）",

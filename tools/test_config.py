@@ -198,8 +198,27 @@ def main_check() -> int:
     d0 = det.parse_args([])
     check("不给配置时检测端仍是自己的默认值",
           tuple(d0.marker_to_grasp) == (0.0, 0.0, 0.0) and d0.endpoint == "tcp://10.3.42.221:5556"
-          and d0.print_axes is True and d0.ids == [3],
-          f"grasp={d0.marker_to_grasp} endpoint={d0.endpoint}")
+          and d0.print_axes is True and d0.ids == [3, 4],
+          f"grasp={d0.marker_to_grasp} endpoint={d0.endpoint} ids={d0.ids}")
+    check("双 Tag 默认**关闭**（place_id=0，行为同旧版单码）；开启时 pick_id=3 / place_id=4 用 0 偏移 0 朝向",
+          d0.place_id == 0 and d0.pick_id == 3
+          and tuple(d0.place_marker_to_grasp) == (0.0, 0.0, 0.0)
+          and tuple(d0.place_align_rpy) == (0.0, 0.0, 0.0),
+          f"pick={d0.pick_id} place={d0.place_id} "
+          f"offset={d0.place_marker_to_grasp} align={d0.place_align_rpy}")
+    check("开启双 Tag：命令行给 place_id 就生效，且能配放置点的偏移/朝向",
+          (lambda a: a.place_id == 4 and tuple(a.place_marker_to_grasp) == (0.0, 0.0, -0.02))(
+              det.parse_args(["--place-id", "4", "--place-marker-to-grasp", "0", "0", "-0.02"])))
+    check("主程序默认：auto_place 开、等待闭爪与抬升余量有默认值",
+          main is not None and (lambda a: a.auto_place is True and a.place_settle_s == 0.5
+                                and a.place_wait_max_s == 3.0 and a.place_clearance == 50.0)(
+              main.parse_args(["--sim"])))
+    args, _ = parse(["--config", str(example), "--sim"])
+    check("示例配置里的双 Tag 自动搬运键生效（auto_place / place_clearance / place_settle_s）",
+          args is not None and args.auto_place is True and args.place_clearance == 50.0
+          and args.place_settle_s == 0.5,
+          f"auto_place={args.auto_place if args else None} "
+          f"clearance={args.place_clearance if args else None}")
     d1 = det.parse_args(["--config", cfg_sec])
     check("aruco 段生效（endpoint / marker_to_grasp / ids）",
           d1.endpoint == "tcp://1.2.3.4:5556" and tuple(d1.marker_to_grasp) == (0.0, 0.0, -0.015)

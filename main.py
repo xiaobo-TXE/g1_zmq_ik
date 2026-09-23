@@ -25,9 +25,15 @@
   python main.py --robot-ip 192.168.123.161 --arm right --pos 0.35 -0.20 0.10 \
       --arrive-pos 2 --arrive-rot 1 --on-arrive freeze
 
+  # 7) 双 Tag 抓放：目标来自 6003（检测端），抓到后自动搬到 place_pos 处放下
+  python main.py --config robot.json          # robot.json 里 auto_place / grip_on_arrive
+
 坐标系：目标与打印的所有末端位置都在 **同一个目标系**（x 前 y 左 z 上，单位 m）：
   默认 **torso_link（躯干系）** —— 手臂挂在躯干上，腰怎么转都不影响手臂解算，Tag 抓取用这个；
   用 --target-frame pelvis 可切回 **pelvis（骨盆）系**（旧行为，腰角参与换算）。
+
+6003 目标流里的 `place_pos`（可选）表示"这一次抓取的放置点"：到位并闭爪完成后自动走放置路径
+（抬升→平移→下落）并在终点松开夹爪，见 README §3.5。不带 `place_pos` 时行为与旧版完全一致。
 """
 
 from __future__ import annotations
@@ -211,6 +217,24 @@ def build_parser() -> argparse.ArgumentParser:
                         "Z→Y→X 轴分解成若干轴对齐直线段（只挑真正变了的轴），每段直线、"
                         "段间速度归零（角点停一下），默认关。与 --lin-approach 同开时本项优先")
 
+    # ---- 双 Tag 抓放：6003 的 pos = 抓取点、place_pos = 放置点；抓到后自动搬运并松爪 ----
+    P = p.add_argument_group("放置（双 Tag 抓放）")
+    P.add_argument("--auto-place", dest="auto_place", action="store_true", default=True,
+                   help="收到 6003 的放置点（place_pos）时：抓到盒子（到位+闭爪完成）后**自动**"
+                        "走放置路径（抬升→平移→下落）并在终点松开夹爪。检测端不带 place_pos 时"
+                        "本项不生效（行为与旧版一致）")
+    P.add_argument("--no-auto-place", dest="auto_place", action="store_false",
+                   help="关掉自动搬运：只走到抓取点，放置仍需手工命令（placed / place）")
+    P.add_argument("--place-clearance", type=float, default=PLACE_CLEARANCE_DEFAULT * 1000.0,
+                   metavar="MM",
+                   help="放置路径的抬升余量（mm）：先竖直抬到 max(当前,目标)+余量，再水平平移，"
+                        "最后下落 —— 不能按轴分解直接走，否则会贴着桌面横拖把盒子拖倒")
+    P.add_argument("--place-settle-s", type=float, default=0.5, metavar="S",
+                   help="闭爪指令发出后至少等这么久才起抬臂（等夹爪真的咬住盒子）")
+    P.add_argument("--place-wait-max-s", type=float, default=3.0, metavar="S",
+                   help="等夹爪合上的上限：超过它就按'夹爪已合上'处理（没有 6004 力反馈时"
+                        "靠这个不至于卡住；夹着盒子时实测 q 到不了指令位置，靠 |dq|≈0 判定）")
+
     g = p.add_argument_group("到位判定（实测末端是否已稳定到达目标）")
     g.add_argument("--no-arrive", action="store_true", help="关闭到位判定（默认开启）")
     g.add_argument("--arrive-pos", type=float, default=2.0, metavar="MM",
@@ -325,6 +349,77 @@ def apply_grip_percent(ctrl: ArmController, right_pct=None, left_pct=None,
         ctrl.set_gripper(right=right, left=left, source=source)
     except Exception as exc:
         log.warning("夹爪目标被拒（%s）: %s", source or "?", exc)
+
+
+#: 判定"夹爪已经合上"的容差：实测 q 距锁存目标（rad）；以及实测已停住的 |dq| 阈值
+GRIP_SETTLE_TOL_RAD = 0.15
+GRIP_SETTLE_DQ = 0.05
+
+
+def gripper_settled(ctrl: ArmController, grip_rx, arms) -> bool:
+    """夹爪是否已经"合上"——自动放置抬臂前必须确认，否则盒子还没被夹住就被抬起来，会掉。
+
+    判据（受控的每一侧都要满足其一）：
+      * 实测 q 已接近锁存的指令目标（差 ≤ GRIP_SETTLE_TOL_RAD）；或
+      * 实测已经停住（|dq| ≤ GRIP_SETTLE_DQ）—— **夹着盒子时实测到不了指令位置，但会停住**，
+        这是真机上最常命中的那条。
+
+    没有 6004 数据（`--gripper-port 0`、老上游）时无从判断，返回 True，由固定延时兜底。
+    """
+    if grip_rx is None or not grip_rx.state:
+        return True
+    for side in arms:
+        state = grip_rx.state.get(side)
+        if not state:
+            continue
+        q, target = state.get("q"), ctrl.grip.get(side)
+        if q is not None and target is not None and abs(q - target) <= GRIP_SETTLE_TOL_RAD:
+            continue
+        if abs(state.get("dq") or 0.0) <= GRIP_SETTLE_DQ:
+            continue
+        return False
+    return True
+
+
+def start_auto_place(ctrl: ArmController, flags: Dict, clearance_m: float) -> bool:
+    """双 Tag 抓放：把已"上膛"的放置点变成放置路径（抬升→平移→下落）并登记到 `place_arms`。
+
+    登记之后，主循环里既有的"`place_arms` 走完 → 自动松开夹爪"就会在终点放爪，不用另写松爪逻辑
+    （手工 `placed` 命令走的是同一条路）。同时：
+
+    * 关掉"到位自动闭爪"：否则放置目标判到位时又捏一下夹爪；
+    * `ignore_stream_target`：把 6003 的位置目标暂时接下来，直到检测端给出**不同**的抓取点；
+    * `retreated`：抑制 `--lin-retreat`（放置路径自己会先竖直抬升，不需要再沿工具轴退一段）。
+
+    放不下路径时返回 False（不动任何状态）。
+    """
+    arms = [a for a in flags["arms"] if a in flags["place_target"]]
+    if not arms:
+        log.warning("收到过放置点但没有对应手臂的目标，跳过自动放置")
+        return False
+    started = []
+    for arm in arms:
+        pos, quat = flags["place_target"][arm]
+        T = ctrl.make_target_pose(arm, pos, quat=quat)
+        if T is None:
+            log.warning("放置点无法生成位姿[%s]（末端参考姿态还没锁定？），跳过自动放置", arm)
+            continue
+        try:
+            ctrl.start_place_path(arm, T, clearance=clearance_m)
+            started.append(arm)
+        except Exception as exc:
+            log.warning("起放置路径失败[%s]: %s", arm, exc)
+    if not started:
+        return False
+    flags["place_arms"] = started
+    flags["place_armed"] = False
+    flags["place_close_t0"] = None
+    flags["autoclose_off"] = True
+    flags["ignore_stream_target"] = True
+    flags["retreated"] = True
+    log.info("抓取完成 -> 自动前往放置点[%s]：抬升 %.0fmm -> 水平平移 -> 下落，到位后自动松开夹爪",
+             "/".join(started), clearance_m * 1000.0)
+    return True
 
 
 def grip_target_line(ctrl: ArmController) -> str:
@@ -533,6 +628,37 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
 # ---------------------------------------------------------------------------
 # 目标流 -> 控制器
 # ---------------------------------------------------------------------------
+def _stream_key(pkt: dict):
+    """一帧目标里的"绝对目标组合"：(抓取点, 放置点)。
+
+    用来识别"这是不是已经搬运过的那同一条目标"—— 检测端会按 `--latch-resend-hz` 重发同一条
+    目标，检测抖动也会让同一处目标有几毫米的差。没有绝对位置目标（例如只发 delta）时返回 None。
+    """
+    pos = pkt.get("pos")
+    if pos is None:
+        per = pkt.get("per_arm") or {}
+        pos = per.get(RIGHT, per.get(LEFT))
+    if pos is None:
+        return None
+    place = pkt.get("place_pos")
+    return (np.asarray(pos, dtype=float).reshape(3),
+            None if place is None else np.asarray(place, dtype=float).reshape(3))
+
+
+def _stream_key_same(a, b, tol: float = 0.005) -> bool:
+    """两组目标是否"还是同一次抓取"：抓取点与放置点都在 tol（默认 5mm）以内。"""
+    if a is None or b is None:
+        return a is b
+    for pa, pb in zip(a, b):
+        if pa is None or pb is None:
+            if (pa is None) != (pb is None):
+                return False
+            continue
+        if float(np.linalg.norm(pa - pb)) > tol:
+            return False
+    return True
+
+
 def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
     """把一帧目标流数据应用到控制器（最新优先，直接覆盖上一条目标）。"""
     # 软闭合请求（Tag 程序可以一帧说"到位了，慢慢合上，夹住就停"）
@@ -561,7 +687,20 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
 
     # 收到新的 Tag **位置**目标 = 新的一次抓取：恢复"到位自动闭爪"
     # （`place` 搬运期间会把它关掉，避免放置目标判到位时又把夹爪捏上）
-    if pkt.get("per_arm") or pkt.get("pos") is not None or pkt.get("delta") is not None:
+    # 但搬运已经接管这条目标时不恢复：否则重发的同一帧会在搬运途中把自动闭爪重新打开，
+    # 放置到位时又捏一下夹爪（`place_key` = 已搬运过的那条目标）
+    motion_fields = bool(pkt.get("per_arm") or pkt.get("pos") is not None
+                         or pkt.get("delta") is not None)
+    incoming = _stream_key(pkt)
+    if flags["ignore_stream_target"]:
+        # 没有绝对位置目标的帧（delta 等）一律继续忽略：它们没法表达"换了一个盒子"，
+        # 放它们过去只会在放置路径上再叠一段位移
+        if incoming is None or _stream_key_same(incoming, flags["place_key"]):
+            motion_fields = False                 # 同一条目标（含 --latch-resend 的重发）：不再当位置目标用
+        else:
+            flags["ignore_stream_target"] = False  # 目标真的换了 -> 接受，开始新的一次抓取
+            log.info("收到新的抓取目标 -> 恢复接受 6003 位置目标（上一轮搬运结束）")
+    if motion_fields and not flags["ignore_stream_target"]:
         flags["autoclose_off"] = False
 
     arms = flags["arms"]
@@ -571,6 +710,28 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
     quat = pkt.get("quat")            # 可选目标朝向（四元数 x,y,z,w）
     lin_mm = float(flags.get("lin_approach_mm", 0.0))
     lin_all = bool(getattr(ctrl, "linear_all", False))
+
+    # ---- 双 Tag 抓放：`place_pos` 与 `pos` 同帧，是**这一次抓取**的放置点 ----
+    # 这里只**记下来**（存原始位置+朝向，姿态留到触发时再解），不立刻动；等主循环确认
+    # "到位 + 闭爪完成"后再起放置路径 —— 时序必须在控制端，只有它知道这两件事。
+    if motion_fields and pkt.get("place_pos") is not None:
+        place_p = np.asarray(pkt["place_pos"], dtype=float).reshape(3)
+        place_q = (None if pkt.get("place_quat") is None
+                   else np.asarray(pkt["place_quat"], dtype=float).reshape(4))
+        first = not flags["place_armed"]
+        for a in ([LEFT, RIGHT] if arm == "both" else [arm]):
+            old = flags["place_target"].get(a)
+            flags["place_target"][a] = (place_p.copy(), None if place_q is None else place_q.copy())
+            if a not in arms:
+                arms.append(a)
+            # 检测端会以 20Hz 重发同一帧：只在第一次上膛、或放置点真的挪了时才打日志
+            if old is None or float(np.linalg.norm(old[0] - place_p)) > 0.005:
+                log.info("收到放置点[%s] place_pos=[%s]（抓到后自动搬过去）", a,
+                         ", ".join(f"{v:+.3f}" for v in place_p))
+        if first:
+            log.info("双 Tag 抓放已上膛：到达抓取点并闭爪完成后自动前往放置点")
+        flags["place_armed"] = True
+        flags["place_key"] = incoming
 
     def apply_abs_target(arm: str, pos) -> None:
         """绝对位置目标的路由（优先级从高到低）：
@@ -592,6 +753,12 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
             flags["retreated"] = False
         else:
             ctrl.set_target_position(arm, pos, rpy=rpy, quat=quat)
+
+    # motion_fields=False 的情形：这一帧是"已经搬运过的那条目标"（重发）—— 夹爪字段已在上面
+    # 处理过，这里不再碰任何位置/姿态目标，免得把正在走的放置路径顶掉、或把手臂拉回盒子重抓。
+    if not motion_fields:
+        log.debug("6003 目标已被上一轮搬运接管（同一条 place_key），忽略其中的位置目标")
+        return
 
     for side, pos in (pkt.get("per_arm") or {}).items():
         apply_abs_target(side, pos)
@@ -925,6 +1092,10 @@ def main(argv=None) -> int:
              ctrl.grip_q_min, ctrl.grip_q_max, ctrl.grip_open_cm)
 
     log.info("%s", ctrl.describe())
+    if args.auto_place and args.grip_on_arrive is None and args.grip_on_arrive_soft is None:
+        log.warning("自动搬运（--auto-place）已开但没有配『到位闭爪』（--grip-on-arrive / "
+                    "-soft）：到位后没人闭爪，手臂会带着空夹爪走到放置点。Tag 抓取请在配置里"
+                    "写 grip_on_arrive（见 robot.example.json）")
     if hasattr(ik, "backend"):
         log.info("符号正解后端: %s", ik.backend)
     if args.target_frame == "torso":
@@ -999,7 +1170,12 @@ def main(argv=None) -> int:
                  p is not None for p in parse_initial_targets(args).values()),
              "arrival": arrival, "frozen": False, "grip_rx": grip_rx, "soft": soft,
              "arrive_object_m": args.arrive_object_mm / 1000.0,
-             "place_arms": [], "autoclose_off": False, "vla_explicit": None}
+             "place_arms": [], "autoclose_off": False, "vla_explicit": None,
+             # 双 Tag 抓放：place_target = 本次抓取的放置点（原始 pos/quat，触发时才解姿态）；
+             # place_armed = 已收到放置点、还没开始搬运；ignore_stream_target = 搬运已接管这条目标，
+             # 直到检测端给出**不同**的抓取点（place_key）才恢复接受位置目标
+             "place_target": {}, "place_armed": False,
+             "ignore_stream_target": False, "place_key": None, "place_close_t0": None}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
     target_silent_warned = False
     target_frames_seen = 0
@@ -1228,11 +1404,13 @@ def main(argv=None) -> int:
                                     source=f"到位后 --grip-on-arrive-soft {args.grip_on_arrive_soft:g}"):
                     log.info("%s", m)
             # 抓取退出：到位 + 闭爪完成后沿工具轴反方向直线退出（--lin-retreat）
+            # 有自动放置时不做它：放置路径自己会先竖直抬升，多退一段只会让它多绕一下
             if soft.active:
                 flags["soft_was_active"] = True
             grip_done = (not soft.active) if args.grip_on_arrive_soft is not None else True
             if (args.lin_retreat > 0 and auto_grip_ok and grip_done
                     and not flags["retreated"]
+                    and not (args.auto_place and flags["place_armed"])
                     and (args.grip_on_arrive is not None
                          or args.grip_on_arrive_soft is not None)):
                 flags["retreated"] = True
@@ -1242,6 +1420,25 @@ def main(argv=None) -> int:
                     except Exception as exc:
                         log.warning("退出直线段失败[%s]: %s", arm, exc)
                 log.info("到位并闭爪完成 -> 沿工具轴直线退出 %.0fmm（--lin-retreat）", args.lin_retreat)
+
+            # 抓稳盒子后自动前往放置点。
+            # 用**锁存的到位状态**（arrival.all_arrived）而不是到位边沿 `auto_grip_ok`：检测端会
+            # 以 20Hz 重发同一条目标（`--latch-first` 关掉时更是如此），边沿只出现一帧，用它做不了
+            # "至少等 --place-settle-s 再抬臂"这种跨周期的判断。target_rev 变了（换了新目标）时
+            # arrival 会自己把到位状态清掉，所以这里也会跟着重新计时。
+            arrived_state = arrival is not None and arrival.all_arrived(flags["arms"])
+            if not arrived_state or flags["autoclose_off"]:
+                flags["place_close_t0"] = None         # 还没到位 / 被搬运接管：重新计时
+            elif (args.auto_place and flags["place_armed"] and flags["place_target"]
+                    and not flags["place_arms"]):
+                if flags["place_close_t0"] is None:
+                    flags["place_close_t0"] = elapse
+                waited = elapse - flags["place_close_t0"]
+                # 夹爪确实合上了才抬臂（无 6004 时退化成固定延时，不卡住）
+                if (waited >= args.place_settle_s
+                        and (gripper_settled(ctrl, grip_rx, flags["arms"])
+                             or waited >= args.place_wait_max_s)):
+                    start_auto_place(ctrl, flags, args.place_clearance / 1000.0)
 
             if all_arrived_now and args.on_arrive != "none":
                 if args.on_arrive == "exit":

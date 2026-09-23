@@ -156,6 +156,8 @@ python tools/detect_aruco_zmq.py --config robot.json
 python tools/detect_aruco_zmq.py --no-send --endpoint tcp://10.3.42.221:5556
 ```
 
+用**两个 Tag**（盒子上的抓取码 + 落点上的放置码，抓到后自动搬过去松爪）见 §3.5。
+
 ### 3.2 抓取点与姿态怎么定
 
 检测给的是**标记中心**的位姿，抓取点 = 标记中心 + 一个在**标记自身坐标系**里给的偏移
@@ -208,6 +210,65 @@ python tools/detect_aruco_zmq.py --config robot.json --latch-first
 - 代价：之后盒子/相机真的移动了也不会自动更新，**需要重启检测端才能重新锁存**。
 - 担心控制端中途重启丢掉目标时，加 `--latch-resend-hz 1`：按秒重发**同一个锁存值**
   （重发旧值，不是更新目标）。
+
+---
+
+### 3.5 双 Tag 抓放：抓取码 + 放置码（抓完自动搬过去松爪）
+
+用**两个 Tag** 把"抓"和"放"分开：一个贴在盒子上（**抓取码**），一个贴在落点/桌面（**放置码**）。
+检测端按 ID 认出各自是谁，把两个点**放在同一帧**里发给 6003；控制端抓到盒子后自动搬到放置点、
+下落、松开夹爪 —— 不用再手敲 `placed`。
+
+```
+ID 3（贴盒顶）= 抓取码   ─┐
+                          ├─► 同一帧 {"pos": 抓取点, "place_pos": 放置点} ─► 6003
+ID 4（贴桌面）= 放置码   ─┘
+                          控制端：到位 → 自动闭爪 → 确认夹爪合上 → 抬升→平移→下落 → 自动松爪
+```
+
+配置（`robot.json`，两个程序共用一份；下面为示意，真实文件里注释要用 `_` 开头的键，
+见 `robot.example.json`）：
+
+```jsonc
+"aruco": {
+  "ids": [3, 4],            // 两个码都要放行
+  "pick_id": 3,             // 抓取码（贴盒子）
+  "place_id": 4,            // 放置码；0 = 关掉双 Tag（默认 0，行为回到单码）
+  "marker_to_grasp": [-0.03, 0.0, -0.09],   // 抓取点：沿用原来那套
+  "place_marker_to_grasp": [0.0, 0.0, 0.0], // 放置点：**独立**一套，平贴桌面时给 0
+  "place_align_rpy": [0.0, 0.0, 0.0]
+},
+"main": { "auto_place": true, "grip_on_arrive": 34.0 }
+```
+
+```bash
+python main.py --config robot.json                 # 终端 A：控制端（不给 --pos）
+python tools/detect_aruco_zmq.py --config robot.json   # 终端 B：检测端
+```
+
+**为什么时序在控制端而不是检测端**：6003 是单向的（`PUSH → PULL`），检测端只有相机，拿不到
+"到位了没有、夹爪合上没有"。让它自己掐时间就等于在没夹稳的时候抬手臂。控制端本来就知道这两件事
+（`arrival.py` 的到位判定 + 6004 的夹爪实测），所以检测端只负责"算两个点、同帧发出去"。
+
+**要点**：
+
+- **两个码必须同时在画面里**才开始下发。放置点是随**第一次成功下发**一起被锁存的（`--latch-first`），
+  缺了它这个流程永远等不到放置点。看不到时会每秒提示一次 `等待放置码 ID=4`；只有单码就把
+  `place_id` 设成 `0`（默认），行为与以前完全一致。
+- **放置点用独立的偏移/朝向**（`place_marker_to_grasp` / `place_align_rpy`）。放置码平贴桌面时
+  给 `0 0 0`（末端落在码中心）；沿用抓取那套 `-0.09` 会把末端送到桌面**以下** 9cm。
+- **确认夹爪真合上才抬臂**：`--place-settle-s`（默认 0.5s）是最短等待，之后还要看 6004 的实测
+  ——`q` 到不了指令位置（夹着盒子）但已经停住（`|dq| ≈ 0`）也算合上；没有 6004 就只按延时，
+  最迟 `--place-wait-max-s`（默认 3s）动手，不会卡住。
+- **重复目标被挡住**：检测端会 20Hz 重发同一条目标（关掉 `--latch-first` 时更是如此）。搬运期间
+  以及搬运完成后，**同一条**目标不再当位置目标用（否则会把正在走的放置路径顶掉、或松爪后又被
+  拉回去重抓一次）；等到检测端给出**不同**的抓取点才恢复，于是"换一个盒子"会自动开始下一轮。
+- 调法：先 `--no-send --print-axes --suggest-align` 看两个码的 `axes(marker/torso)` 与推荐 align，
+  再决定 `place_marker_to_grasp` 让末端落在盒底/桌面合适高度。
+
+参数：检测端 `--pick-id` / `--place-id` / `--place-marker-to-grasp` / `--place-align-rpy`；
+控制端 `--auto-place`（默认开）/ `--no-auto-place` / `--place-clearance`（抬升余量 mm，默认 50）/
+`--place-settle-s` / `--place-wait-max-s`。
 
 ---
 
@@ -307,6 +368,8 @@ s.send_string(json.dumps({'grip_close_tau': 0.3, 'grip_sides': ['right']}))"
 {"grip_rad": {"right": 0.0}}            可选，直接给夹爪弧度
 {"grip_close_tau": 0.3}                 可选，力限软闭合请求（可单独成帧）
 {"grip_sides": ["right"]}               可选，软闭合只做这几侧
+{"place_pos": [0.40, 0.10, 0.02]}        可选，放置点（双 Tag 抓放，见 §3.5）：抓到后自动搬到这里
+{"place_quat": [0, 0, 0, 1]}             可选，放置点朝向；不给则保持锁定的末端朝向
 {"timestamp": 1788514855.53}            可选，只用于诊断乱序
 ```
 
@@ -421,7 +484,13 @@ Dex1 抓取中心；0.185=指尖平面；Dex3 用 0.05）、`--solver auto|casad
 `--grasp-align-rpy R P Y`、`--no-quat`、`--marker-up`/`--no-marker-up`（IPPE 镜像支先验，默认开）、
 `--target-endpoint`（6003）、`--target-hz`（20）、
 `--deadband-mm`（2）、`--jump-reject-mm`（100）、`--jump-recover-s`（0.5）、`--no-send`、
-`--print-axes`、`--suggest-align`、`--no-display`。
+`--print-axes`、`--suggest-align`、`--no-display`；
+**双 Tag 抓放**（见 §3.5）：`--pick-id`（3）、`--place-id`（**0=关**，开启后是放置码 ID）、
+`--place-marker-to-grasp DX DY DZ`（0 0 0）、`--place-align-rpy R P Y`（0 0 0）。
+
+**双 Tag 自动搬运**（见 §3.5，控制端）：`--auto-place`（默认**开**；收到 6003 的 `place_pos` 后
+抓到盒子就自动走放置路径并在终点松爪）/ `--no-auto-place`、`--place-clearance MM`（50，放置路径
+的抬升余量）、`--place-settle-s`（0.5，闭爪后最短等待）、`--place-wait-max-s`（3.0，等夹爪合上的上限）。
 
 ---
 
@@ -474,6 +543,8 @@ python tools/test_arrival.py          # 到位判据状态机
 python tools/test_config.py           # --config 解析
 python tools/test_state_guard.py      # 状态守门与软闭合参数
 python tools/test_cartesian_lin.py    # 笛卡尔直线段（直线度/姿态插值/限幅/IK 失效即停/整段 moveL）
+python tools/test_auto_place.py       # 双 Tag 抓放（放置点识别/自动搬运触发/重复目标守卫）
+python tools/test_aruco_sender.py     # 检测端：防抖/跳变恢复/锁存（含"锁存一对"）
 python tools/test_model_cache.py      # 模型缓存环境指纹（旧缓存忽略/损坏重建/原子落盘）
 python tools/selftest_offline.py      # 正解一致性 / 反解精度 / 轨迹跟踪
 ```

@@ -14,6 +14,8 @@ import logging
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from target_io import TargetReceiver  # noqa: E402
@@ -99,7 +101,28 @@ def main() -> int:
         check(f"非法 τ 被拒绝/忽略 {bad}", err is not None or out.get("grip_close_tau") is None,
               f"err={err}")
 
-    print("\n[5] 帧格式的其他边界")
+    print("\n[5] 双 Tag 抓放的放置点（place_pos / place_quat）")
+    out, err = parse('{"pos": [0.30, -0.20, 0.15], "place_pos": [0.40, 0.10, 0.02]}')
+    check("place_pos 与 pos 同帧解析出来（抓到后搬到这里）",
+          err is None and out["place_pos"] is not None
+          and abs(float(out["place_pos"][0]) - 0.40) < 1e-9, f"err={err}")
+    out, err = parse('{"pos": [0.3, 0.0, 0.1], "place_quat": [0, 0, 0, 2]}')
+    check("place_quat 被归一化", err is None and out["place_quat"] is not None
+          and abs(float(np.linalg.norm(out["place_quat"])) - 1.0) < 1e-9,
+          f"place_quat={None if out is None else out['place_quat']}")
+    out, err = parse('{"pos": [0.3, 0.0, 0.1]}')
+    check("不带 place_* 的老帧照常（place_pos / place_quat 都是 None）",
+          err is None and out["place_pos"] is None and out["place_quat"] is None, f"err={err}")
+    out, err = parse('{"pos": [0.3, 0.0, 0.1], "place_pos": "盒子上"}')
+    check("坏 place_pos 只被忽略，抓取目标照旧（不能连坐）",
+          err is None and out["pos"] is not None and out["place_pos"] is None, f"err={err}")
+    out, err = parse('{"pos": [0.3, 0.0, 0.1], "place_quat": [0, 0, 1]}')
+    check("坏 place_quat 只被忽略，抓取目标照旧",
+          err is None and out["pos"] is not None and out["place_quat"] is None, f"err={err}")
+    out, err = parse('{"place_pos": [0.40, 0.10, 0.02]}')
+    check("只有 place_pos 的帧仍按空帧拒绝（place_* 不算有效字段）", err is not None, f"{err}")
+
+    print("\n[6] 帧格式的其他边界")
     out, err = parse('[]')
     check("非对象帧被拒绝", err is not None, f"{err}")
     out, err = parse('{')
