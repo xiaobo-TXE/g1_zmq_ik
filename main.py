@@ -989,7 +989,8 @@ def main(argv=None) -> int:
              "arrive_object_m": args.arrive_object_mm / 1000.0,
              "place_arms": [], "autoclose_off": False, "vla_explicit": None}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
-    last_target_warn = 0.0
+    target_silent_warned = False
+    target_frames_seen = 0
     console = None
     if args.interactive:
         print(HELP_TEXT)
@@ -1035,13 +1036,18 @@ def main(argv=None) -> int:
             if stream_pkt is not None and not flags["frozen"]:
                 apply_stream_target(ctrl, stream_pkt, flags)
 
-            # 目标流失联提示（仍然保持上一条目标，不会松手）
+            # 目标流失联提示（仍然保持上一条目标，不会松手）。
+            # **每次"沉默"只报一次**：检测端 --latch-first 锁存后就不再发帧，若按固定周期重报，
+            # 这条会每 target_timeout 秒刷一行、把交互终端淹掉（真机实测）。收到新帧再重新武装。
+            if target_rx.frames != target_frames_seen:
+                target_frames_seen = target_rx.frames
+                target_silent_warned = False
             if (target_rx.enabled and args.target_timeout > 0 and target_rx.frames > 0
-                    and target_rx.age() > args.target_timeout
-                    and elapse - last_target_warn > args.target_timeout):
-                last_target_warn = elapse
+                    and target_rx.age() > args.target_timeout and not target_silent_warned):
+                target_silent_warned = True
                 log.warning("目标流已 %.0fms 没有新目标（--target-timeout %.2fs），"
-                            "手臂保持在上一条目标位置", target_rx.age() * 1000, args.target_timeout)
+                            "手臂保持在上一条目标位置；之后不再重复提示，"
+                            "直到重新收到目标帧", target_rx.age() * 1000, args.target_timeout)
 
             if not flags["frozen"]:
                 demo.update(ctrl, flags["arms"], elapse)
