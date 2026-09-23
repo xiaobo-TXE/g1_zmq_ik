@@ -26,6 +26,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
+import main as mainmod  # noqa: E402  （只用到纯函数 vla_rise）
 from controller import ArmController  # noqa: E402
 from g1_ik import G1ArmModel, make_ik  # noqa: E402
 from zmq_link import GripperStateSubscriber, RobotStateSubscriber  # noqa: E402
@@ -243,6 +244,26 @@ def main() -> int:
     left_delta = float(np.linalg.norm(np.asarray(pub2.sent[-1][:7]) - np.asarray(pub2.sent[0][:7])))
     check("已到位的左臂基本不动（不该被拖着走）",
           left_delta < np.deg2rad(3.0), f"左臂关节变化 {np.rad2deg(left_delta):.2f}°")
+
+    print("\n[7] 进入 VLA 的上升沿（vla_rise）：只有『显式且新鲜』的状态才算，供自动张开夹爪用")
+    f = {}
+    check("第一次观察到 VLA 就算上升沿（程序在机器人已进 VLA 之后才启动）",
+          mainmod.vla_rise(f, True, True) is True and f["vla_explicit"] is True)
+    check("持续在 VLA：不再重复触发", mainmod.vla_rise(f, True, True) is False)
+    check("切到非 VLA：不算上升沿", mainmod.vla_rise(f, False, True) is False)
+    check("再回 VLA：才算上升沿", mainmod.vla_rise(f, True, True) is True)
+
+    # 关键安全性质：6000 断流/失联不能被当成"退出 VLA 又回来" —— 否则夹着盒子时会自动松手
+    g = {}
+    mainmod.vla_rise(g, True, True)                    # 先确认"在 VLA"
+    check("6000 帧太旧（fresh=False）不参与判定，也不改写已确认的状态",
+          mainmod.vla_rise(g, True, False) is False and g["vla_explicit"] is True)
+    check("上游从没给过模式（None、不新鲜）不触发", mainmod.vla_rise(g, None, False) is False)
+    check("失联后重新收到 VLA：不是上升沿（不会把盒子松掉）",
+          mainmod.vla_rise(g, True, True) is False)
+    mainmod.vla_rise(g, False, True)                   # 失联期间确实先收到了"非 VLA"
+    check("失联后先收到『非 VLA』、再回 VLA：才是真的上升沿",
+          mainmod.vla_rise(g, True, True) is True)
 
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
     print("\n" + "=" * 74)

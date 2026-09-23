@@ -393,7 +393,11 @@ Dex1 抓取中心；0.185=指尖平面；Dex3 用 0.05）、`--solver auto|casad
 
 **夹爪**：`--grip V`、`--grip-right`、`--grip-left`、`--grip-unit pct|cm|rad`、`--grip-open-cm`（8.5）、
 `--grip-qmax-rad`（5.6217）、`--grip-qmin-rad`（0.0）、`--grip-on-arrive PCT`、
-`--grip-on-arrive-soft [TAU]`、`--grip-soft-tau`（0.3）、`--grip-soft-rate`（1.5）。
+`--grip-on-arrive-soft [TAU]`、`--grip-soft-tau`（0.3）、`--grip-soft-rate`（1.5）、
+`--grip-open-on-vla`（默认**开**：观察到「进入 VLA」就把两侧夹爪张开到 100%；
+`--no-grip-open-on-vla` 关掉）。机器人侧会 latch 上一次夹爪目标并 100 Hz 无条件重发，
+所以「退出 VLA 再进入」后夹爪会停在旧状态（还闭合着）—— 靠这一项拉回张开。
+6000 失联/帧太旧**不算**「进入」，夹着盒子时不会误张开。
 
 **直线段**：`--lin-all`（整段 moveL，自动轴分解 Z→Y→X，默认关）、`--lin-approach MM`（两段式接近，0=关）、
 `--lin-retreat MM`（0=不动）、`--lin-speed`、`--lin-accel`、

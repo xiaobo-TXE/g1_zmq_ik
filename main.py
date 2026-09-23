@@ -181,6 +181,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="软闭合的默认 τ 阈值（交互命令 gc 不指定时用它）")
     g.add_argument("--grip-soft-rate", type=float, default=1.5,
                    help="软闭合的目标推进速度 rad/s（默认 1.5 ≈ 2.3cm/s 开口变化）")
+    g.add_argument("--grip-open-on-vla", dest="grip_open_on_vla", action="store_true",
+                   default=True,
+                   help="观察到『进入 VLA 模式』时自动把两侧夹爪张开到 100%%（默认开）。机器人侧会"
+                        "latch 上一次夹爪目标，所以『退出 VLA 再进入』后夹爪会停在旧状态（例如还是"
+                        "闭合的）；本项把它拉回张开。6000 失联/帧太旧不算『进入』，夹着盒子时不会误张开")
+    g.add_argument("--no-grip-open-on-vla", dest="grip_open_on_vla", action="store_false",
+                   help="关掉上面的自动张开（进入 VLA 时保持机器人侧原来的夹爪状态）")
 
     # ---- 笛卡尔直线段（抓取进给/退出）：6003 协议不变，主程序自己算 pre-grasp/退出点 ----
     L = p.add_argument_group("笛卡尔直线段（LIN）")
@@ -356,6 +363,22 @@ def unfreeze(flags: Dict, why: str) -> None:
     if flags.get("frozen"):
         flags["frozen"] = False
         log.info("已解冻（%s）：demo 轨迹 / ZMQ 目标流恢复生效", why)
+
+
+def vla_rise(flags: Dict, vla_now: Optional[bool], fresh: bool) -> bool:
+    """维护"上一次显式观察到的 VLA 状态"，返回本次是否为"进入 VLA"的上升沿。
+
+    只认**新鲜的显式**状态：`vla_now is None`（上游没给过模式）或 `fresh=False`
+    （6000 帧太旧）都不参与判定 —— 否则一次网络抖动就会被当成"退出 VLA 又回来"，
+    正夹着盒子的时候把盒子松掉。
+    第一次观察到 VLA（`vla_explicit` 还是 None）也算上升沿：程序在机器人已经进入 VLA
+    之后才启动时，同样要把夹爪从"机器人侧 latch 的旧状态"里拉出来。
+    """
+    if not fresh or vla_now is None:
+        return False
+    rose = flags.get("vla_explicit") is not True and bool(vla_now)
+    flags["vla_explicit"] = bool(vla_now)
+    return rose
 
 
 def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
@@ -964,7 +987,7 @@ def main(argv=None) -> int:
                  p is not None for p in parse_initial_targets(args).values()),
              "arrival": arrival, "frozen": False, "grip_rx": grip_rx, "soft": soft,
              "arrive_object_m": args.arrive_object_mm / 1000.0,
-             "place_arms": [], "autoclose_off": False}
+             "place_arms": [], "autoclose_off": False, "vla_explicit": None}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
     last_target_warn = 0.0
     console = None
@@ -1124,8 +1147,10 @@ def main(argv=None) -> int:
                 # 模式"未知"也算不满足 VLA：6000 断流或上游改了枚举名时，
                 # 旧实现会一直认为"还在 VLA"，--require-vla 的保护就形同虚设（fail-open）
                 mode_age = mode_rx.age()
-                mode_unknown = mode_rx.is_vla() is None or mode_age > 1.0
-                not_vla = (mode_rx.is_vla() is False) or mode_unknown
+                vla_now = mode_rx.is_vla()
+                mode_fresh = (vla_now is not None) and (mode_age <= 1.0)
+                mode_unknown = not mode_fresh
+                not_vla = (vla_now is False) or mode_unknown
                 if not_vla and elapse - last_mode_warn > 5.0:
                     last_mode_warn = elapse
                     if mode_unknown:
@@ -1141,6 +1166,11 @@ def main(argv=None) -> int:
                     # --require-vla：非 VLA 时干脆不发（回到 VLA 时 controller 会自动重新锚定）
                     ctrl.set_send_enabled(not not_vla,
                                           reason=f"模式={mode_rx.mode}")
+                # 进入 VLA 的上升沿（显式且新鲜）：按需把夹爪拉回张开。
+                # 机器人侧会 latch 上一次夹爪目标并 100Hz 无条件重发，退出/重进 VLA 都不会清掉它 ——
+                # 所以"重进 VLA 后夹爪还闭合着"只能由这里解。
+                if vla_rise(flags, vla_now, mode_fresh) and args.grip_open_on_vla:
+                    apply_grip_percent(ctrl, 100, 100, source="进入 VLA：自动张开夹爪")
 
             # 打印
             if flags["force_print"] or (print_every > 0 and ctrl.cycle % print_every == 0):
