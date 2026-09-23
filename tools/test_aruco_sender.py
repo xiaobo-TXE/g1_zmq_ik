@@ -341,6 +341,44 @@ def main() -> int:
           and np.array_equal(rv_v_on, rv_v_off) and np.array_equal(tv_v_on, tv_v_off),
           f"两支最大 z·up={vert_z:+.3f} < 阈值 {mod2.MARKER_UP_MIN_Z}")
 
+    print("\n[10] reset_latch()：Tag 被搬走后按 r 重新锁存新位置")
+    # 上面那套 socket 在 [9] 之后已经 close/term 了（后面几节不碰 ZMQ），这里自己开一套
+    ctx2 = zmq.Context()
+    pull2 = ctx2.socket(zmq.PULL)
+    ep2 = "tcp://127.0.0.1:{}".format(pull2.bind_to_random_port("tcp://127.0.0.1"))
+
+    def drain2():
+        out = []
+        while pull2.poll(50):
+            out.append(pull2.recv_json())
+        return out
+
+    s7 = mod.TargetSender(ep2, hz=50.0, deadband_mm=2.0, jump_reject_mm=100.0,
+                          enabled=True, recover_s=0.5, latch_first=True)
+    t10 = 8000.0
+    first10 = [0.30, -0.20, 0.15]
+    s7.maybe_send(first10, now=t10)
+    drain2()
+    check("先锁存第一个目标", s7.latched is not None)
+    moved = [0.60, -0.20, 0.15]                        # Tag 被搬走 300mm（远超跳变阈值）
+    t10 += 1.0
+    check("锁存后新位置被忽略（按下 r 之前的病）",
+          s7.maybe_send(moved, now=t10) is False and len(drain2()) == 0)
+    check("reset_latch() 报告原本有锁存并清掉",
+          s7.reset_latch() is True and s7.latched is None)
+    check("没有锁存时 reset_latch() 返回 False（幂等）", s7.reset_latch() is False)
+    t10 += 0.1
+    check("重置后：大跳变的新位置立刻发出去（不再等 jump-recover）",
+          s7.maybe_send(moved, now=t10) is True, f"sent={s7.sent}")
+    frames = drain2()
+    check("发出去的是新位置", len(frames) == 1
+          and abs(frames[0]["pos"][0] - moved[0]) < 1e-6, f"frames={frames}")
+    check("新位置被重新锁存", s7.latched is not None
+          and float(np.linalg.norm(s7.latched - np.asarray(moved))) < 1e-9)
+    s7.close()
+    pull2.close(linger=0)
+    ctx2.term()
+
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
     print("\n" + "=" * 74)
     print(f"结果: {len(_RESULTS)-n_fail}/{len(_RESULTS)} 通过"

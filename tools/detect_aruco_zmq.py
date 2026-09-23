@@ -49,6 +49,9 @@
 夹爪不在这一帧里下发：请用 g1_zmq_ik 的 `--grip-on-arrive-soft TAU`
 （到位后力限软闭合，见 README §2.7），或运行中敲 `gc`。
 
+预览窗口按键：`r` = 重新锁存（清掉已锁存的目标与检测轨迹，让下一次检测重新成为"第一帧"；
+Tag 被搬到新位置后按它）；`q` / `ESC` = 退出。
+
 依赖：`opencv-contrib-python`（cv2.aruco 在 contrib 里）、pyzmq、numpy。
   uv pip install opencv-contrib-python
 
@@ -428,9 +431,26 @@ class TargetSender:
             self.latched = p.copy()
             self.latched_quat = (None if quaternion_torso is None
                                  else np.asarray(quaternion_torso, dtype=np.float64).reshape(4).copy())
-            print('[INFO] 已锁存目标 pos={}：之后检测不再更新（要重新锁存请重启检测端）'
+            print('[INFO] 已锁存目标 pos={}：之后检测不再更新'
+                  '（要重新锁存：预览窗口按 r，或重启检测端）'
                   .format(vector_text(self.latched)), flush=True)
         return True
+
+    def reset_latch(self) -> bool:
+        """清掉锁存，让**下一帧成功发出的目标重新成为"第一帧"**（预览窗口按键 r）。
+
+        同时清掉发送基准 `last_sent` 与跳变候选：Tag 被搬到新位置后，再检测到的位置本来
+        就是一次大跳变，留着旧基准会被 `--jump-reject-mm` 当误检丢掉、要等
+        `--jump-recover-s` 才接受 —— 按 r 的语义就是"我知道它动了，直接认"。
+        返回原本是否有锁存值。
+        """
+        had = self.latched is not None
+        self.latched = None
+        self.latched_quat = None
+        self.last_sent = None
+        self.jump_candidate = None
+        self.last_time = 0.0                 # 别被限频再白等一个周期
+        return had
 
     def close(self):
         if self.socket is not None:
@@ -927,8 +947,19 @@ def main():
             if not args.no_display:
                 try:
                     cv2.imshow('ArUco ZMQ pose', annotated)
-                    if cv2.waitKey(1) & 0xFF in (27, ord('q')):
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (27, ord('q')):
                         break
+                    if key == ord('r'):
+                        # 重新锁存：Tag 被搬到新位置后，让下一次检测重新成为"第一帧"。
+                        # 估计器的时间连续性轨迹也要清 —— IPPE 双解消歧是按"上一帧位姿"选解的，
+                        # 而那一帧属于 Tag 的**旧**位置，留着会把新位置往旧位姿上带。
+                        had = sender.reset_latch()
+                        estimator.tracks.clear()
+                        print('[INFO] {}：检测轨迹已清空，下一次检测重新成为第一帧'
+                              '（需连续确认 {} 帧）'.format(
+                                  '已清除锁存目标（按键 r）' if had else '按键 r：当前没有锁存目标',
+                                  args.confirmation_frames), flush=True)
                 except cv2.error as exc:
                     # 无显示器/无 GUI 后端（机载部署常见）：关掉预览继续跑，别让检测整体挂掉
                     print('[WARN] 无法显示预览窗口（{}），已关闭显示继续运行；'
