@@ -164,10 +164,12 @@ def main_check() -> int:
     print("\n[7] 仓库里的示例配置本身可用")
     example = Path(__file__).resolve().parent.parent / "robot.example.json"
     args, err = parse(["--config", str(example), "--sim"])
-    check("robot.example.json 能解析且无被忽略的键",
+    check("robot.example.json 能解析且无被忽略的键（示例用**位置闭合**，不是软闭合）",
           args is not None and args.config_ignored == [] and args.require_vla is True
-          and args.gripper_port == 6004 and args.grip_on_arrive_soft == 0.3,
-          f"applied={len(args.config_applied) if args else 0} ignored={args.config_ignored if args else err}")
+          and args.gripper_port == 6004
+          and args.grip_on_arrive is not None and args.grip_on_arrive_soft is None,
+          f"applied={len(args.config_applied) if args else 0} "
+          f"grip_on_arrive={args.grip_on_arrive if args else None} ignored={args.config_ignored if args else err}")
 
     print("\n[8] 分「段」：两个程序共用一份配置")
     cfg_sec = write_config({
