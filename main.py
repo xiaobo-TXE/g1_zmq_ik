@@ -287,6 +287,7 @@ HELP_TEXT = """
   rt [MM]        沿工具轴反方向直线退出 MM（默认 100mm）
   lin            打印直线段状态
   place X Y Z [MM]  放置一条龙：抬升(默认50mm) -> 平移到 X Y Z -> 下落 -> 松开夹爪
+  placed DX DY DZ [MM]  同上，但三个数是**相对当前目标的增量**（抓着盒子时更好用）
   h              打印当前实测/目标/误差/到位状态
   j              打印当前下发的 14 个关节角
   ?              显示本帮助
@@ -450,19 +451,28 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
         elif head == "lin":
             for arm in (LEFT, RIGHT):
                 log.info("直线段[%s]: %s", arm, ctrl.lin_status(arm) or "（未在走）")
-        elif head == "place" and len(args) in (3, 4):
-            pos = [float(v) for v in args[:3]]
+        elif head in ("place", "placed") and len(args) in (3, 4):
+            # place  = 三个数是**绝对位置**（目标系，m）
+            # placed = 三个数是**相对当前目标的增量**（m）—— 抓着盒子时往往只知道"往哪挪多少"
+            rel = head == "placed"
+            vals = [float(v) for v in args[:3]]
             clr = abs(float(args[3])) / 1000.0 if len(args) == 4 else PLACE_CLEARANCE_DEFAULT
             started = []
             for arm in flags["arms"]:
+                try:
+                    pos = (ctrl.base_pose(arm)[:3, 3] + np.asarray(vals, dtype=float)
+                           if rel else np.asarray(vals, dtype=float))
+                except Exception as exc:
+                    log.warning("%s 算不出目标[%s]: %s", head, arm, exc)
+                    continue
                 T = ctrl.make_target_pose(arm, pos)
                 if T is None:
-                    log.warning("参考姿态还没锁定，place 暂不可用（等收到状态帧后再试）")
+                    log.warning("参考姿态还没锁定，%s 暂不可用（等收到状态帧后再试）", head)
                     continue
                 try:
                     ctrl.start_place_path(arm, T, clearance=clr)
                 except Exception as exc:
-                    log.warning("place 起段失败[%s]: %s", arm, exc)
+                    log.warning("%s 起段失败[%s]: %s", head, arm, exc)
                     continue
                 started.append(arm)
             if started:
@@ -471,11 +481,13 @@ def apply_console_command(cmd: str, ctrl: ArmController, flags: Dict) -> bool:
                 # 若那一刻恰好落在下面的松爪之后，盒子就被重新夹住（放不下去）。
                 # 收到新的 Tag 位置目标（= 下一次抓取）时自动恢复，见 apply_stream_target()。
                 flags["autoclose_off"] = True
-                log.info("place[%s]: 抬升 %.0fmm -> 平移到 %s -> 下落 -> 走完自动松开夹爪"
+                what = (f"相对偏移 {np.round(vals, 4)}" if rel
+                        else f"平移到 {np.round(vals, 4)}")
+                log.info("%s[%s]: 抬升 %.0fmm -> %s -> 下落 -> 走完自动松开夹爪"
                          "（期间关闭『到位自动闭爪』）",
-                         "/".join(started), clr * 1000, np.round(pos, 4))
+                         head, "/".join(started), clr * 1000, what)
             else:
-                log.warning("place 未起段：目标非法或没有可用的受控臂")
+                log.warning("%s 未起段：目标非法或没有可用的受控臂", head)
         elif head == "go":
             apply_grip_percent(ctrl, 100, 100, source="交互命令 go（张开/释放）")
             if flags.get("soft") is not None:

@@ -907,6 +907,14 @@ class ArmController:
             return (T_L if arm == LEFT else T_R).copy()
         raise ValueError(f"{arm} 还没有目标位姿（未收到状态帧），拒绝以目标系原点为基准")
 
+    def base_pose(self, arm: str) -> np.ndarray:
+        """`_base_pose` 的公开入口：放置的**增量目标**（`placed DX DY DZ`）以它为准。
+
+        有锁存目标就用目标（= 上一条指令想去的地方，与 `move_target_by` 同一口径），
+        否则用当前指令位姿；都还没有则抛错。
+        """
+        return self._base_pose(arm)
+
     def set_target_rpy(self, arm: str, rpy: Sequence[float]) -> None:
         """显式指定 rpy（会清掉 quat：即"不再跟标记转"）。"""
         self.quat_target[arm] = None
