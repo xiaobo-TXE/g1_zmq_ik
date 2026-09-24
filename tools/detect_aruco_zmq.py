@@ -60,8 +60,9 @@
 
 * **两个码必须同时在画面里**才下发（放置点随第一次成功下发被锁存，缺了它永远等不到放置点）；
   只有单码时用 `--place-id 0`，行为与以前完全一致。
-* 放置点用**独立**的偏移/朝向：`--place-marker-to-grasp` / `--place-align-rpy`
-  （放置码平贴桌面，沿用抓取那套 `-0.09` 会把末端送到桌面以下）。
+* 放置点用**独立**的偏移/朝向：`--place-marker-to-grasp` / `--place-align-rpy`。
+  注意 z 的**符号和抓取相反**：抓取码在盒顶、抓取点在标签下方（-0.09）；放置码在桌面、末端要抬到
+  桌面上方（**+0.09**，= 盒底到抓取点的距离）。照抄 -0.09 会把盒子捅进桌子。
 * 先 `--no-send --print-axes --suggest-align` 核对两个码的 `axes(marker/torso)` 与推荐 align。
 
 用法::
@@ -831,9 +832,10 @@ def build_parser():
                              '要用双 Tag 就在配置里写 place_id（见 robot.example.json）')
     parser.add_argument('--place-marker-to-grasp', type=float, nargs=3, default=(0.0, 0.0, 0.0),
                         metavar=('DX', 'DY', 'DZ'),
-                        help='放置码中心 -> 放置点的偏移（米，放置码自身坐标系）。'
-                             '放置码平贴桌面时给 0 0 0（末端落在码中心）；'
-                             '沿用抓取那套 -0.09 会把末端送到桌面以下')
+                        help='放置码中心 -> 放置点的偏移（米，放置码自身坐标系）。**z 是正的**：'
+                             '放置码在桌面上，而末端（=抓取点，盒腰）必须抬到桌面上方，'
+                             'z = 盒底到抓取点的距离（盒高 18cm、抓取点在腰部 -> 0.09）。'
+                             '别照抄抓取那套 -0.09：那个是"从盒顶往下"，在桌面上会捅进桌子')
     parser.add_argument('--place-align-rpy', type=float, nargs=3, default=(0.0, 0.0, 0.0),
                         metavar=('R', 'P', 'Y'),
                         help='夹爪相对放置码的对准旋转(rad, ZYX, 放置码坐标系)。'
