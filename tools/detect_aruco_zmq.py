@@ -1105,10 +1105,19 @@ def main():
                         # 而那一帧属于 Tag 的**旧**位置，留着会把新位置往旧位姿上带。
                         had = sender.reset_latch()
                         estimator.tracks.clear()
-                        print('[INFO] {}：检测轨迹已清空，下一次检测重新成为第一帧'
-                              '（需连续确认 {} 帧）'.format(
-                                  '已清除锁存目标（按键 r）' if had else '按键 r：当前没有锁存目标',
-                                  args.confirmation_frames), flush=True)
+                        # 清完锁存**不等于**马上会重新下发：双 Tag 模式还要求两个码都在画面里。
+                        # 缺码时必须说清楚，否则操作者只看到"按了 r 但手臂不动"，无从判断。
+                        blocked = []
+                        if dual:
+                            if pick is None:
+                                blocked.append('抓取码 ID{}'.format(args.pick_id))
+                            if place is None:
+                                blocked.append('放置码 ID{}'.format(args.place_id))
+                        print('[INFO] {}；{}'.format(
+                            '已清除锁存目标（按键 r）' if had else '按键 r：当前没有锁存目标',
+                            '两个码都在画面里 -> 下一帧检测就会重新下发' if not blocked else
+                            '但现在**发不出去**：缺 {} -> 把它们摆回画面里才会重新下发'
+                            .format(' 与 '.join(blocked))), flush=True)
                 except cv2.error as exc:
                     # 无显示器/无 GUI 后端（机载部署常见）：关掉预览继续跑，别让检测整体挂掉
                     print('[WARN] 无法显示预览窗口（{}），已关闭显示继续运行；'

@@ -754,6 +754,7 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
             motion_fields = False                 # 同一条目标（含 --latch-resend 的重发）：不再当位置目标用
         else:
             flags["ignore_stream_target"] = False  # 目标真的换了 -> 接受，开始新的一次抓取
+            flags["ignore_logged"] = False         # 重新武装"被忽略"的提示
             log.info("收到新的抓取目标 -> 恢复接受 6003 位置目标（上一轮搬运结束）")
     if motion_fields and not flags["ignore_stream_target"]:
         flags["autoclose_off"] = False
@@ -819,7 +820,13 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
     # motion_fields=False 的情形：这一帧是"已经搬运过的那条目标"（重发）—— 夹爪字段已在上面
     # 处理过，这里不再碰任何位置/姿态目标，免得把正在走的放置路径顶掉、或把手臂拉回盒子重抓。
     if not motion_fields:
-        log.debug("6003 目标已被上一轮搬运接管（同一条 place_key），忽略其中的位置目标")
+        # **必须说清楚**：否则操作者只看到"按了 r 但手臂不动"，无从判断是检测端没发还是这边没接。
+        # 只在第一次被挡时提示（检测端 20Hz 重发，否则刷屏），等新目标来了再重新武装。
+        if not flags.get("ignore_logged"):
+            flags["ignore_logged"] = True
+            log.info("6003 的位置目标被忽略：与上一轮搬运过的是同一条（place_key 没变）。要让手臂按"
+                     "**新位置**动，需让检测端给出一个**不同**的抓取点 —— 检测端预览窗口按 r 重新锁存"
+                     "（按之前先点一下预览窗口让它获得焦点）")
         return
 
     for side, pos in (pkt.get("per_arm") or {}).items():
@@ -1245,7 +1252,7 @@ def main(argv=None) -> int:
              # 直到检测端给出**不同**的抓取点（place_key）才恢复接受位置目标
              "place_target": {}, "place_armed": False,
              "ignore_stream_target": False, "place_key": None, "place_close_t0": None,
-             "place_release_t0": {}}
+             "place_release_t0": {}, "ignore_logged": False}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
     target_silent_warned = False
     target_frames_seen = 0
