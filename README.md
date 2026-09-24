@@ -52,7 +52,7 @@ python main.py --robot-ip 192.168.123.161 --arm left --target-frame torso \
 ```
 
 `--pos` 是绝对位置（torso 系，米；**y 为正 = 左侧**）。不给 `--pos` 也可以，程序会保持启动时的
-位姿等外部目标。下面的示例按 `robot.json` 的 `"arm": "left"` 写。
+位姿等外部目标。下面的示例按 `robot.toml` 的 `arm = "left"` 写。
 
 ### 2.2 先不接机器人试一遍
 
@@ -66,21 +66,26 @@ python main.py --sim --arm left --pos 0.35 0.20 0.10 --interactive      # 常开
 
 ### 2.3 用配置文件（推荐）
 
-`--config` 把 JSON 里的键当**默认值**，命令行显式给的仍然优先。键名 = 参数名去掉 `--`、`-` 换成 `_`
-（`--grip-on-arrive-soft` → `grip_on_arrive_soft`）；以 `_` 开头的键忽略，可以当注释。
+`--config` 支持 **TOML（推荐）和 JSON**，按扩展名分派。文件里的键当**默认值**，
+命令行显式给的仍然优先。键名 = 参数名去掉 `--`、`-` 换成 `_`
+（`--grip-on-arrive-soft` → `grip_on_arrive_soft`）。
 
-程序读**自己那一段**（`main` 段或 `aruco` 段）和顶层平铺的键：
+为什么推荐 TOML：它有**原生注释**（`#`），不必再把说明写成 `_` 开头的"注释键"
+（老 JSON 里那样，注释占了 40% 的键）；类型也是显式的，不会像 YAML 那样把 `no` 悄悄变成 `False`。
+Python 3.11+ 用标准库 `tomllib`，3.10 用它的前身 `tomli`（已列入依赖）。
+
+程序读**自己那一段**（`[main]` 或 `[aruco]`）和顶层平铺的键：
 
 ```bash
-cp robot.example.json robot.json     # robot.json 不进版本库，放你自己的真机常量
-python main.py --config robot.json
-python tools/detect_aruco_zmq.py --config robot.json
+cp robot.example.toml robot.toml     # robot.toml 不进版本库，放你自己的真机常量
+python main.py --config robot.toml
+python tools/detect_aruco_zmq.py --config robot.toml
 ```
 
 命令行覆盖配置里的一项：
 
 ```bash
-python main.py --config robot.json --lin-approach 120
+python main.py --config robot.toml --lin-approach 120
 ```
 
 ### 2.4 给目标的几种方式
@@ -145,10 +150,10 @@ q                   退出
 
 ```bash
 # 终端 A：控制端（不给 --pos，目标全部来自 6003）
-python main.py --config robot.json
+python main.py --config robot.toml
 
 # 终端 B：Tag 检测端
-python tools/detect_aruco_zmq.py --config robot.json
+python tools/detect_aruco_zmq.py --config robot.toml
 ```
 
 只在画面里看检测结果、不下发（确认检测稳、看清标签三轴指向）：
@@ -172,8 +177,8 @@ z 垂直于标签面朝外（标签正对相机时 z 指向相机）。
 不知道填哪个时让工具自己算（四选一，并按当前标签轴打印预期结果）：
 
 ```bash
-python tools/detect_aruco_zmq.py --config robot.json --no-send --suggest-align
-python tools/detect_aruco_zmq.py --config robot.json --no-send --print-axes
+python tools/detect_aruco_zmq.py --config robot.toml --no-send --suggest-align
+python tools/detect_aruco_zmq.py --config robot.toml --no-send --print-axes
 ```
 
 判定标准是打印出来的 `axes(marker/torso)` 与 `axes(ee/torso)`：末端的 x 是探入方向、
@@ -209,7 +214,7 @@ y 是手指开合方向、z 朝上。标签平贴盒顶时 `marker z ≈ (0,0,+1
 
 ```bash
 # 只下发第一次成功发出的目标，之后检测不再更新它
-python tools/detect_aruco_zmq.py --config robot.json --latch-first
+python tools/detect_aruco_zmq.py --config robot.toml --latch-first
 ```
 
 - 锁存发生在**第一次成功发出**之后（对端没起时不会把目标锁死在没人收到的值上）。
@@ -232,24 +237,25 @@ ID 4（贴桌面）= 放置码   ─┘
                           控制端：到位 → 自动闭爪 → 确认夹爪合上 → 抬升→平移→下落 → 自动松爪
 ```
 
-配置（`robot.json`，两个程序共用一份；下面为示意，真实文件里注释要用 `_` 开头的键，
-见 `robot.example.json`）：
+配置（`robot.toml`，两个程序共用一份；完整可用的版本见 `robot.example.toml`）：
 
-```jsonc
-"aruco": {
-  "ids": [3, 4],            // 两个码都要放行
-  "pick_id": 3,             // 抓取码（贴盒子）
-  "place_id": 4,            // 放置码；0 = 关掉双 Tag（默认 0，行为回到单码）
-  "marker_to_grasp": [-0.03, 0.0, -0.09],   // 抓取点：标签在盒顶，从标签往下 9cm（盒腰）
-  "place_marker_to_grasp": [0.0, 0.0, 0.09], // 放置点：标签在桌面，末端要抬到**桌面上方** 9cm
-  "place_align_rpy": [0.0, 0.0, 0.0]
-},
-"main": { "auto_place": true, "grip_on_arrive": 34.0 }
+```toml
+[aruco]
+ids = [3, 4]                          # 两个码都要放行
+pick_id = 3                           # 抓取码（贴盒子）
+place_id = 4                          # 放置码；0 = 关掉双 Tag（默认 0，行为回到单码）
+marker_to_grasp = [-0.03, 0.0, -0.09] # 抓取点：标签在盒顶，从标签往下 9cm（盒腰）
+place_marker_to_grasp = [0.0, 0.0, 0.09]  # 放置点：标签在桌面，末端要抬到**桌面上方** 9cm
+place_align_rpy = [0.0, 0.0, 0.0]
+
+[main]
+auto_place = true
+grip_on_arrive = 34.0
 ```
 
 ```bash
-python main.py --config robot.json                 # 终端 A：控制端（不给 --pos）
-python tools/detect_aruco_zmq.py --config robot.json   # 终端 B：检测端
+python main.py --config robot.toml                 # 终端 A：控制端（不给 --pos）
+python tools/detect_aruco_zmq.py --config robot.toml   # 终端 B：检测端
 ```
 
 **为什么时序在控制端而不是检测端**：6003 是单向的（`PUSH → PULL`），检测端只有相机，拿不到
@@ -295,7 +301,7 @@ python tools/detect_aruco_zmq.py --config robot.json   # 终端 B：检测端
 
 ```bash
 # 所有绝对位置目标（--pos / 6003 的 pos / 交互命令 p）都走轴分解直线
-python main.py --config robot.json --lin-all
+python main.py --config robot.toml --lin-all
 ```
 
 **② 两段式接近（`--lin-approach MM`）**——长距离转场仍走 PTP（快、不易在奇异点附近失败），
@@ -304,7 +310,7 @@ python main.py --config robot.json --lin-all
 
 ```bash
 # 进给 60mm，进给段 jerk 限幅 2.0，闭爪完成后沿工具轴退出 100mm
-python main.py --config robot.json \
+python main.py --config robot.toml \
     --lin-approach 60 --lin-jerk 2.0 --lin-retreat 100
 ```
 
@@ -331,15 +337,15 @@ python main.py --config robot.json \
 
 ```bash
 # 启动时给（--grip-unit 默认百分比：0=闭 100=全开）
-python main.py --config robot.json --grip 100
-python main.py --config robot.json --grip 0 --grip-unit pct
-python main.py --config robot.json --grip-right 0 --grip-left 100
+python main.py --config robot.toml --grip 100
+python main.py --config robot.toml --grip 0 --grip-unit pct
+python main.py --config robot.toml --grip-right 0 --grip-left 100
 
 # 到位后自动闭爪（位置闭合）
-python main.py --config robot.json --grip-on-arrive 0
+python main.py --config robot.toml --grip-on-arrive 0
 
 # 到位后做力限软闭合：慢慢合上，|τ| 到 0.3 就冻结（抓盒子用这个，需要 6004 力反馈）
-python main.py --config robot.json --grip-on-arrive-soft 0.3 --gripper-port 6004
+python main.py --config robot.toml --grip-on-arrive-soft 0.3 --gripper-port 6004
 ```
 
 软闭合也可以从 6003 目标流里单独发一帧（不带位置）：

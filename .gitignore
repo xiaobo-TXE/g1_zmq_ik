@@ -6,4 +6,5 @@ _model_cache_*.tmp*
 .DS_Store
 .venv/
 robot.json
+robot.toml
 .commandcode/

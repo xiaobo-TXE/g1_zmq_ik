@@ -61,6 +61,13 @@ def write_config(payload: dict) -> str:
     return fd.name
 
 
+def write_toml(text: str) -> str:
+    fd = tempfile.NamedTemporaryFile("w", suffix=".toml", encoding="utf-8", delete=False)
+    fd.write(text)
+    fd.close()
+    return fd.name
+
+
 def parse(argv):
     """解析参数；argparse 报错（parser.error）会抛 SystemExit，这里捕获后返回 (None, code)。"""
     err = io.StringIO()
@@ -162,9 +169,9 @@ def main_check() -> int:
           (err[1].strip().splitlines() or [""])[-1][:70] if err else "")
 
     print("\n[7] 仓库里的示例配置本身可用")
-    example = Path(__file__).resolve().parent.parent / "robot.example.json"
+    example = Path(__file__).resolve().parent.parent / "robot.example.toml"
     args, err = parse(["--config", str(example), "--sim"])
-    check("robot.example.json 能解析且无被忽略的键（示例用**位置闭合**，不是软闭合）",
+    check("robot.example.toml 能解析且无被忽略的键（示例用**位置闭合**，不是软闭合）",
           args is not None and args.config_ignored == [] and args.require_vla is True
           and args.gripper_port == 6004
           and args.grip_on_arrive is not None and args.grip_on_arrive_soft is None,
@@ -230,7 +237,7 @@ def main_check() -> int:
     check("检测端命令行也优先于文件",
           tuple(d2.marker_to_grasp) == (0.0, 0.0, -0.03) and d2.no_send is True and d2.ids == [3, 7],
           f"grasp={d2.marker_to_grasp}")
-    example = Path(__file__).resolve().parent.parent / "robot.example.json"
+    example = Path(__file__).resolve().parent.parent / "robot.example.toml"
     d3 = det.parse_args(["--config", str(example)])
     # 对准值会随标签在盒顶的贴法变化（四选一），所以这里断言**不变量**而不是某个具体值：
     # roll/pitch 必须为 0（保持 z 朝上），yaw 必须是 90° 的整数倍（水平面内四选一）
@@ -245,6 +252,51 @@ def main_check() -> int:
           and abs(float(d3.marker_to_grasp[0])) < 0.05 and abs(float(d3.marker_to_grasp[1])) < 0.05
           and d3.target_endpoint == "tcp://127.0.0.1:6003",
           f"grasp={d3.marker_to_grasp} ignored={d3.config_ignored}")
+
+    print("\n[10] .toml 配置（推荐格式；.json 仍兼容）")
+    cfg_toml = write_toml("""
+# TOML 的原生注释（这就是换格式的理由：不必再写 `_` 开头的注释键）
+[main]
+arm = "left"
+interactive = true
+grip_on_arrive = 34.0
+arrive_pos = 30.0        # 行尾注释
+
+[aruco]
+pick_id = 3
+place_id = 4
+ids = [3, 4]
+marker_to_grasp = [-0.03, 0.0, -0.09]
+place_marker_to_grasp = [0.0, 0.0, 0.09]
+""")
+    a, err = parse(["--config", cfg_toml])
+    check("TOML 的 [main] 段生效（含行尾注释、int/float/bool）",
+          a is not None and a.arm == "left" and a.interactive is True
+          and a.grip_on_arrive == 34.0 and a.arrive_pos == 30.0 and a.gripper_port == 6004,
+          f"err={err}")
+    check("TOML 里别的段（aruco）不报错、不告警、留给检测端",
+          a is not None and a.config_ignored == [] and a.config_sections == ["aruco"],
+          f"ignored={a.config_ignored if a else err} sections={a.config_sections if a else None}")
+    a2, _ = parse(["--config", cfg_toml, "--arm", "both"])
+    check("TOML 里命令行仍然优先", a2 is not None and a2.arm == "both")
+    dt = det.parse_args(["--config", cfg_toml])
+    check("检测端读同一份 TOML 的 aruco 段",
+          dt.ids == [3, 4] and dt.pick_id == 3 and dt.place_id == 4
+          and tuple(dt.marker_to_grasp) == (-0.03, 0.0, -0.09) and dt.config_ignored == [],
+          f"ids={dt.ids} pick={dt.pick_id} place={dt.place_id}")
+
+    bad_ext = write_toml('[main]\narm = "left"\n')[:-5] + ".ini"
+    Path(bad_ext).write_text('[main]\narm = "left"\n', encoding="utf-8")
+    a3, err3 = parse(["--config", bad_ext])
+    check("不认识的扩展名 → 报错退出且说明支持哪些",
+          a3 is None and err3 and err3[0] == 2 and ".toml" in err3[1],
+          (err3[1].strip().splitlines() or [""])[-1][:70] if err3 else "")
+
+    bad_syntax = write_toml("[main]\narm = \n")
+    a4, err4 = parse(["--config", bad_syntax])
+    check("TOML 语法错误 → 报错退出且提示清楚",
+          a4 is None and err4 and err4[0] == 2 and "语法错误" in err4[1],
+          (err4[1].strip().splitlines() or [""])[-1][:70] if err4 else "")
 
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
     print("\n" + "=" * 74)

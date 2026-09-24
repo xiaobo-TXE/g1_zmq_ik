@@ -80,8 +80,8 @@
         --gripper-port 6004 --mode-port 6000 --require-vla --grip-on-arrive-soft 0.2
 
     # ④ 双 Tag：抓取码 ID3（盒子上）+ 放置码 ID4（落点），抓到自动搬过去放下
-    python main.py --config robot.json
-    python tools/detect_aruco_zmq.py --config robot.json
+    python main.py --config robot.toml
+    python tools/detect_aruco_zmq.py --config robot.toml
 """
 
 import argparse
@@ -100,7 +100,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 try:
     from config_file import add_config_argument, parse_args_with_config  # noqa: E402
 except ImportError:            # 只把本文件拷到别处运行时（没有仓库根目录）
-    def add_config_argument(parser, section, example="robot.example.json"):
+    def add_config_argument(parser, section, example="robot.example.toml"):
         parser.add_argument('--config', metavar='FILE',
                             help='（本副本不可用：没找到仓库根目录的 config_file.py）')
 
@@ -829,7 +829,7 @@ def build_parser():
     parser.add_argument('--place-id', type=int, default=0, metavar='ID',
                         help='放置码 ID（双 Tag 抓放：抓住盒子后搬到这个码的位置放下）。'
                              '**0=关闭双 Tag 模式**（默认，单码行为：只发抓取点、不带 place_pos）；'
-                             '要用双 Tag 就在配置里写 place_id（见 robot.example.json）')
+                             '要用双 Tag 就在配置里写 place_id（见 robot.example.toml）')
     parser.add_argument('--place-marker-to-grasp', type=float, nargs=3, default=(0.0, 0.0, 0.0),
                         metavar=('DX', 'DY', 'DZ'),
                         help='放置码中心 -> 放置点的偏移（米，放置码自身坐标系）。**z 是正的**：'
@@ -958,7 +958,7 @@ def main():
                   tuple(args.place_align_rpy)), flush=True)
     else:
         print('[INFO] 单码模式（--place-id 0，默认）：只发抓取点。'
-              '要用双 Tag 抓放（抓取码 + 放置码）就在配置里写 place_id，见 robot.example.json',
+              '要用双 Tag 抓放（抓取码 + 放置码）就在配置里写 place_id，见 robot.example.toml',
               flush=True)
     if args.place_id > 0 and not any(abs(float(v)) > 1e-9 for v in args.place_marker_to_grasp):
         print('[WARN] --place-marker-to-grasp 是 0 0 0：末端会停在**放置码中心的高度**（桌面）上，'

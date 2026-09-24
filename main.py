@@ -26,7 +26,7 @@
       --arrive-pos 2 --arrive-rot 1 --on-arrive freeze
 
   # 7) 双 Tag 抓放：目标来自 6003（检测端），抓到后自动搬到 place_pos 处放下
-  python main.py --config robot.json          # robot.json 里 auto_place / grip_on_arrive
+  python main.py --config robot.toml          # robot.toml 里 auto_place / grip_on_arrive
 
 坐标系：目标与打印的所有末端位置都在 **同一个目标系**（x 前 y 左 z 上，单位 m）：
   默认 **torso_link（躯干系）** —— 手臂挂在躯干上，腰怎么转都不影响手臂解算，Tag 抓取用这个；
@@ -1157,7 +1157,7 @@ def main(argv=None) -> int:
     if args.auto_place and args.grip_on_arrive is None and args.grip_on_arrive_soft is None:
         log.warning("自动搬运（--auto-place）已开但没有配『到位闭爪』（--grip-on-arrive / "
                     "-soft）：到位后没人闭爪，手臂会带着空夹爪走到放置点。Tag 抓取请在配置里"
-                    "写 grip_on_arrive（见 robot.example.json）")
+                    "写 grip_on_arrive（见 robot.example.toml）")
     if args.auto_place and args.on_arrive != "none":
         log.warning("--auto-place 与 --on-arrive %s 冲突：到位后 --on-arrive 先生效"
                     "（freeze 会冻结目标流与搬运计时、exit 直接退出），自动搬运不会执行。"

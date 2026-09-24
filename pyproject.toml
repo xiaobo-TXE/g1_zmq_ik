@@ -9,6 +9,7 @@ dependencies = [
     "pin>=3.1", # Pinocchio（PyPI 版即可；它不含 pinocchio.casadi，见 README）
     "casadi>=3.6", # PyPI 轮子自带 IPOPT 插件
     "opencv-contrib-python>=5.0.0.93",
+    "tomli>=2.0; python_version < '3.11'", # --config 的 .toml 解析：3.11+ 用标准库 tomllib
 ]
 
 # 可选：tools/detect_aruco_zmq.py（ArUco 检测前端）需要，主程序不需要

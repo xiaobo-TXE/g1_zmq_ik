@@ -290,7 +290,7 @@ def main():
               f"（x 偏 {x_t*(math.cos(math.radians(psi))-1)*1000:+6.1f} mm）")
     print("    → 这是**纯 y** 偏移的典型特征，且与腰 yaw 成正比；torso 系下不会出现")
     print("    → 核对：main.py 启动行必须打印『目标系 = torso_link（躯干系）』，"
-          "且 robot.json 里 target_frame=torso")
+          "且配置里 target_frame=torso")
 
     # ---- ⑧ 真机 vs 模型的关节零位/几何偏差 ----
     print("\n[⑧] 真机 vs 模型的关节角偏差（URDF 零位/符号与实机不一致）→ 末端固定偏移")

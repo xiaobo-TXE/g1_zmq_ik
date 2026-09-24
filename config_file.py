@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""`--config` JSON 配置文件的共用实现（`main.py` 与 `tools/detect_aruco_zmq.py` 都用它）。
+"""`--config` 配置文件的共用实现（`main.py` 与 `tools/detect_aruco_zmq.py` 都用它）。
+
+**支持两种格式**（按扩展名分派）：`.toml` 与 `.json`。推荐 TOML —— 它有原生注释（`#`），
+不必再把说明写成 `_` 开头的"注释键"；类型也是显式的，不会像 YAML 那样把 `no` 悄悄变成 `False`。
+（TOML 用标准库 `tomllib` 读，Python 3.10 则用它的前身 `tomli`；只读不写。）
 
 约定（一条配置管两个程序）：
 
 * 键名 = 参数名去掉 `--` 并把 `-` 换成 `_`：`--grip-on-arrive-soft` → `grip_on_arrive_soft`；
 * 取值按**参数自身的类型**转换（所以 `"gripper_port": "6004"` 也认），并按 `choices` 校验；
-* 以 `_` 开头的键整个忽略 —— 可以拿来当注释；
+* 以 `_` 开头的键整个忽略 —— JSON 里可以拿来当注释（TOML 直接用 `#` 就行）；
 * 顶层可以再分段：本程序只读自己那一段（`main` 段给主程序、`aruco` 段给检测端），
-  别人的段原样忽略、不告警（这样两个程序能共用一份 `robot.json`）；
+  别人的段原样忽略、不告警（这样两个程序能共用一份配置）；
 * **命令行显式给的参数永远优先**，配置文件只补没写的那些。
 
 用法::
@@ -23,19 +27,64 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 
-__all__ = ["add_config_argument", "load_config", "parse_args_with_config"]
+try:                                   # Python 3.11+ 有标准库 tomllib
+    import tomllib
+except ModuleNotFoundError:            # 3.10：需要 `pip install tomli`（就是 tomllib 的前身）
+    try:
+        import tomli as tomllib        # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        tomllib = None                 # type: ignore[assignment]
+
+__all__ = ["add_config_argument", "load_config", "parse_args_with_config", "load_raw_config"]
+
+#: 认识的配置格式（扩展名 -> 说明）
+FORMATS = {".toml": "TOML", ".json": "JSON"}
+
+
+def load_raw_config(path: str) -> dict:
+    """按扩展名读配置文件，返回原始 dict（不做任何键名/类型处理）。
+
+    * `.toml` —— 标准库 `tomllib`（3.10 用 `tomli`）；
+    * `.json` —— 沿用老写法，`_` 开头的键当注释。
+
+    读到的东西不合法时抛 ValueError（调用方 `parser.error` 打印清楚后退出）。
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in FORMATS:
+        raise ValueError(f"不认识的扩展名 {ext!r}：支持 {', '.join(sorted(FORMATS))}"
+                         f"（TOML 推荐）")
+    if ext == ".toml" and tomllib is None:
+        raise ValueError("这个 Python 没有 tomllib（3.11+ 才有）。用 .json 配置，"
+                         "或装上 TOML 的前身：uv pip install tomli")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as exc:
+        raise ValueError(f"读不了文件：{exc}") from exc
+    if ext == ".json":
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"JSON 语法错误：{exc}") from exc
+    # 注意：tomllib 的 TOMLDecodeError 本身就是 ValueError 的子类，
+    # 所以这里不能"如果是 ValueError 就原样抛出" —— 会把真正的位置信息丢掉
+    try:
+        return tomllib.loads(text)
+    except Exception as exc:
+        raise ValueError(f"TOML 语法错误：{exc}") from exc
 
 
 def add_config_argument(parser: argparse.ArgumentParser, section: str,
-                        example: str = "robot.example.json") -> None:
+                        example: str = "robot.example.toml") -> None:
     """给解析器加 `--config`（帮助文本里说明本程序读哪一段）。"""
     parser.add_argument(
         "--config", metavar="FILE",
-        help=f"JSON 配置文件：文件里的键作为**默认值**，命令行显式给的参数优先。"
-             f"键名 = 参数名去掉 -- 并把 - 换成 _（例 --grip-on-arrive-soft → "
-             f"grip_on_arrive_soft）；以 _ 开头的键忽略（可当注释用）；"
+        help=f"配置文件（.toml 推荐 / .json 也认）：文件里的键作为**默认值**，命令行显式给的参数"
+             f"优先。键名 = 参数名去掉 -- 并把 - 换成 _（例 --grip-on-arrive-soft → "
+             f"grip_on_arrive_soft）；TOML 用 # 写注释（JSON 里以 _ 开头的键忽略）；"
              f"顶层 `{section}` 段（若存在）等价于平铺。示例见仓库里的 {example}")
 
 
@@ -72,10 +121,9 @@ def load_config(path: str, parser: argparse.ArgumentParser,
     返回 ``(默认值 dict, 已应用的键, 不认识的键, 忽略掉的段名)``。
     本程序自己的段（`sections` 里的名字）里的键与顶层平铺的键等价；其它 dict 段视为别的程序的配置。
     """
-    with open(path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
+    raw = load_raw_config(path)
     if not isinstance(raw, dict):
-        raise ValueError("顶层必须是 JSON 对象")
+        raise ValueError("顶层必须是对象/表（TOML 的 [section] 或 JSON 的 {}）")
 
     own = set(sections)
     flat: Dict[str, object] = {}

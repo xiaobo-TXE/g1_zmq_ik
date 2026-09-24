@@ -8,6 +8,9 @@ pyzmq>=24
 pin>=3.1
 casadi>=3.6
 
+# --config 读 .toml 用：Python 3.11+ 用标准库 tomllib，3.10 用它的前身 tomli（只读，无传递依赖）
+tomli>=2.0; python_version < "3.11"
+
 # 说明：
 # * PyPI 的 pin 轮子含 Pinocchio，但【不含 pinocchio.casadi】。程序会自动改用内置符号正解
 #   （同一份 URDF 数据搭 CasADi 表达式，与 pinocchio.casadi 数值差 ~2e-16，见 README）。
