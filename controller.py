@@ -444,6 +444,8 @@ class ArmController:
         self.quat_target: Dict[str, Optional[np.ndarray]] = {LEFT: None, RIGHT: None}
         self.target_rev: Dict[str, int] = {LEFT: 0, RIGHT: 0}   # 目标真的变了才自增
         self._ref_rot: Optional[Dict[str, np.ndarray]] = None
+        #: 锁定参考姿态那一刻的**完整末端位姿**（位置+朝向）—— 放置完归位就回到这里
+        self._ref_pose: Dict[str, Optional[np.ndarray]] = {LEFT: None, RIGHT: None}
         # 参考姿态还没锁定时收到的位置目标，按手臂排队（原实现是单槽，
         # --arm both 时先到的左臂会被右臂覆盖，导致左臂目标被丢掉）
         self._pending_positions: List[Tuple[str, np.ndarray]] = []
@@ -945,12 +947,26 @@ class ArmController:
             T_L, T_R = self.ee_in_target_frame(self.q_cmd)
             self._assign_target(arm, T_L if arm == LEFT else T_R)
 
+    def ref_pose(self, arm: str) -> Optional[np.ndarray]:
+        """启动瞬间锁定的**完整末端位姿**（归位目标）。None = 还没锁定参考姿态。
+
+        与 `lock_reference_orientation()` 同时产生，取的是那一瞬的**实测**位姿 ——
+        也就是"运行 main.py 时手在哪里"。
+        """
+        T = self._ref_pose.get(arm)
+        return None if T is None else T.copy()
+
     def lock_reference_orientation(self) -> None:
         if self.q_meas is None:
             return
         T_L, T_R = self.ee_in_target_frame(self.q_meas)
         self._ref_rot = {LEFT: T_L[:3, :3].copy(), RIGHT: T_R[:3, :3].copy()}
-        logger.info("已锁定参考姿态（纯位置指令将保持该末端朝向）")
+        # 顺手把**完整位姿**也记下来：放置完松爪后「归位」就回到这里（启动瞬间的实测末端位姿）。
+        # 注意用 q_meas（实测）而不是 q_cmd —— 启动瞬间两者相同，意思就是"程序启动时手在哪"。
+        self._ref_pose = {LEFT: T_L.copy(), RIGHT: T_R.copy()}
+        logger.info("已锁定参考姿态（纯位置指令将保持该末端朝向；归位目标 = 启动位姿 %s）",
+                    " ".join(f"{a}={np.round(self._ref_pose[a][:3, 3], 3)}"
+                             for a in (LEFT, RIGHT)))
         if self._pending_positions:
             pending, self._pending_positions = self._pending_positions, []
             for arm, pos in pending:

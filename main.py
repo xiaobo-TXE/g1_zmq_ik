@@ -241,6 +241,14 @@ def build_parser() -> argparse.ArgumentParser:
     P.add_argument("--place-wait-max-s", type=float, default=3.0, metavar="S",
                    help="等夹爪合上的上限：超过它就按'夹爪已合上'处理（没有 6004 力反馈时"
                         "靠这个不至于卡住；夹着盒子时实测 q 到不了指令位置，靠 |dq|≈0 判定）")
+    P.add_argument("--place-return", dest="place_return", action="store_true", default=True,
+                   help="放置完松爪后**归位**（默认开）：先沿工具轴直线退出 --place-return-retreat mm "
+                        "离开盒子，再按 Z→Y→X 轴分解直线段走回**启动这一程序时的末端位姿**"
+                        "（就是『手原来在哪』）。手动 placed 放置完也一样归位")
+    P.add_argument("--no-place-return", dest="place_return", action="store_false",
+                   help="关掉归位：松爪后手臂就停在放置点")
+    P.add_argument("--place-return-retreat", type=float, default=100.0, metavar="MM",
+                   help="归位第一步：松爪后沿工具轴反方向退出的距离（0=不退，直接从当前位置走回启动位姿）")
 
     g = p.add_argument_group("到位判定（实测末端是否已稳定到达目标）")
     g.add_argument("--no-arrive", action="store_true", help="关闭到位判定（默认开启）")
@@ -456,6 +464,53 @@ def apply_auto_grip_percent(ctrl: ArmController, pct: float, source: str,
     apply_grip_percent(ctrl, pct if "right" in sides else None,
                        pct if "left" in sides else None, source=source)
     return sides
+
+
+def return_home(ctrl: ArmController, flags: Dict, arm: str) -> bool:
+    """归位第二步：走回**启动瞬间记下的位姿**（`ref_pose`）。返回是否真的起了路径。"""
+    T = ctrl.ref_pose(arm)
+    if T is None:
+        log.warning("归位[%s]跳过：还没有启动位姿（参考姿态未锁定？）", arm)
+        return False
+    ctrl.move_linear_to(arm, T)          # 轴分解直线段（Z→Y→X），不划弧
+    log.info("归位[%s]：沿直线段走回启动位姿 (%.3f, %.3f, %.3f)", arm, T[0, 3], T[1, 3], T[2, 3])
+    return True
+
+
+def start_return(ctrl: ArmController, flags: Dict, arm: str, retreat_mm: float) -> None:
+    """松爪后的归位：**先沿工具轴退出** `retreat_mm`（离开盒子），**再**走回启动位姿。
+
+    为什么要先退：松爪时手指还在盒子两侧，直接走回起点会蹭着盒子拖；沿工具轴（=当时进给的
+    方向）直线退出来才是最短、最干净的一步。
+    """
+    if retreat_mm > 0:
+        ctrl.retract(arm, retreat_mm / 1000.0)
+        flags["return_arms"][arm] = "retract"
+        log.info("归位[%s]：先沿工具轴退出 %.0fmm 离开盒子，再走回启动位姿", arm, retreat_mm)
+    elif return_home(ctrl, flags, arm):
+        flags["return_arms"][arm] = "home"
+
+
+def advance_return(ctrl: ArmController, flags: Dict) -> list:
+    """每周期推进归位：上一段走完就进下一段。返回本周期**归位完成**的臂。
+
+    `ctrl.lin_status()` 为空只说明"这一段没在走"（走完或被取消）—— 归位是空手动作，
+    两种情况下继续下一段都是安全的（不像放置路径那样会松爪掉盒子）。
+    """
+    done = []
+    for arm in list(flags["return_arms"]):
+        if ctrl.lin_status(arm):
+            continue                                  # 这一段还在走
+        if flags["return_arms"][arm] == "retract":
+            if return_home(ctrl, flags, arm):
+                flags["return_arms"][arm] = "home"
+            else:
+                flags["return_arms"].pop(arm, None)
+        else:
+            flags["return_arms"].pop(arm, None)
+            done.append(arm)
+            log.info("归位完成[%s]：已回到启动位姿", arm)
+    return done
 
 
 def grip_target_line(ctrl: ArmController) -> str:
@@ -758,6 +813,10 @@ def apply_stream_target(ctrl: ArmController, pkt: dict, flags: Dict) -> None:
             log.info("收到新的抓取目标 -> 恢复接受 6003 位置目标（上一轮搬运结束）")
     if motion_fields and not flags["ignore_stream_target"]:
         flags["autoclose_off"] = False
+        # 新目标接管：正在做的"归位"就不必再走了（手臂已经朝新目标去了）
+        if flags["return_arms"]:
+            log.info("收到新目标 -> 放弃未完成的归位[%s]", "/".join(sorted(flags["return_arms"])))
+            flags["return_arms"].clear()
 
     # 正在搬运（放置路径还没走完）：**任何**来自 6003 的位置目标都不接 —— 半路换目标会把正在走的
     # 放置路径顶掉，而路径一旦"没有段在走"，主循环就会当成"走完了"把盒子松开（扔在半路）。
@@ -1161,6 +1220,10 @@ def main(argv=None) -> int:
              ctrl.grip_q_min, ctrl.grip_q_max, ctrl.grip_open_cm)
 
     log.info("%s", ctrl.describe())
+    if args.place_return:
+        log.info("放置完松爪后会自动归位：先沿工具轴退出 %.0fmm，再走回**启动位姿**"
+                 "（就是现在这只手的位姿；想让它停在放置点用 --no-place-return）",
+                 args.place_return_retreat)
     if args.auto_place and args.grip_on_arrive is None and args.grip_on_arrive_soft is None:
         log.warning("自动搬运（--auto-place）已开但没有配『到位闭爪』（--grip-on-arrive / "
                     "-soft）：到位后没人闭爪，手臂会带着空夹爪走到放置点。Tag 抓取请在配置里"
@@ -1252,7 +1315,9 @@ def main(argv=None) -> int:
              # 直到检测端给出**不同**的抓取点（place_key）才恢复接受位置目标
              "place_target": {}, "place_armed": False,
              "ignore_stream_target": False, "place_key": None, "place_close_t0": None,
-             "place_release_t0": {}, "ignore_logged": False}
+             "place_release_t0": {}, "ignore_logged": False,
+             # 松爪后的归位：arm -> "retract"（正在沿工具轴退出）| "home"（正在走向启动位姿）
+             "return_arms": {}}
     target_rx = TargetReceiver(args.target_port, default_arm=args.arm)
     target_silent_warned = False
     target_frames_seen = 0
@@ -1416,8 +1481,20 @@ def main(argv=None) -> int:
                 elif not flags["place_arms"]:
                     if flags.get("soft") is not None:
                         flags["soft"].stop("place 走完松开夹爪")
-                    apply_auto_grip_percent(ctrl, 100, "place 走完（松开夹爪）",
-                                            controlled_only=args.grip_controlled_only)
+                    released = apply_auto_grip_percent(ctrl, 100, "place 走完（松开夹爪）",
+                                                       controlled_only=args.grip_controlled_only)
+                    # 松爪后归位：先沿工具轴退出来，再走回启动位姿（--no-place-return 可关）。
+                    # 只对**受控臂**归位：未受控臂的关节本来是冻结的，不该因为两侧夹爪松开就把它也开走
+                    if args.place_return:
+                        for a in [x for x in released if x in flags["arms"]]:
+                            try:
+                                start_return(ctrl, flags, a, args.place_return_retreat)
+                            except Exception as exc:
+                                log.warning("起归位路径失败[%s]: %s", a, exc)
+
+            # 归位的第二段/收尾：上一段（退出）走完就走向启动位姿
+            if flags["return_arms"]:
+                advance_return(ctrl, flags)
 
             # --delta：等首帧拿到 q_cmd（=测量位姿）后再叠加相对位移
             if args.delta is not None and info.q_cmd is not None and not delta_done:

@@ -73,6 +73,23 @@ class FakeCtrl:
         """与真机同形的换算（0=闭 100=开）；测试只关心**哪一侧被写**。"""
         return float(pct) / 100.0 * 5.0
 
+    def retract(self, arm, distance, T_from=None):
+        self.calls.append(("retract", arm, round(float(distance), 4)))
+        return None
+
+    def ref_pose(self, arm):
+        """假装"启动瞬间记下的位姿"。"""
+        T = np.eye(4)
+        T[:3, 3] = getattr(self, "home_xyz", (0.30, 0.20, 0.30))
+        return T
+
+    def lin_status(self, arm):
+        """用 self.lin_busy 模拟"当前有段在走"。"""
+        return "直线: 50%" if getattr(self, "lin_busy", False) else ""
+
+    def line_paths(self):
+        return [c for c in self.calls if c[0] == "retract"]
+
     def motions(self):
         return [c for c in self.calls if c[0] in ("set", "moveL", "approach")]
 
@@ -92,7 +109,7 @@ def make_flags(**over) -> dict:
              "retreated": False, "autoclose_off": False, "lin_approach_mm": 0.0,
              "place_arms": [], "place_target": {}, "place_armed": False,
              "ignore_stream_target": False, "place_key": None, "place_close_t0": None,
-             "place_release_t0": {}}
+             "place_release_t0": {}, "return_arms": {}}
     flags.update(over)
     return flags
 
@@ -250,6 +267,38 @@ def main_check() -> int:
           flags5["place_armed"] is False)
     main.disarm_place(flags5, "再来一次")          # 幂等：没有上膛时不该报错/不该重复打日志
     check("重复撤掉是幂等的", flags5["place_armed"] is False)
+
+    print("\n[12] 松爪后归位：先沿工具轴退出，再走回启动位姿")
+    ctrl6, flags6 = FakeCtrl(), make_flags()
+    main.start_return(ctrl6, flags6, RIGHT, 100.0)
+    check("第一步：沿工具轴退出 100mm（0.1m）",
+          ctrl6.line_paths() == [("retract", RIGHT, 0.1)], f"calls={ctrl6.line_paths()}")
+    check("此时**还没**起回头路径（先退出来再说）",
+          not [c for c in ctrl6.calls if c[0] == "moveL"] and flags6["return_arms"] == {RIGHT: "retract"})
+    ctrl6.lin_busy = True
+    main.advance_return(ctrl6, flags6)
+    check("退出段还在走时不抢跑", flags6["return_arms"] == {RIGHT: "retract"})
+    ctrl6.lin_busy = False
+    main.advance_return(ctrl6, flags6)
+    moveL = [c for c in ctrl6.calls if c[0] == "moveL"]
+    check("退出走完后：走回启动位姿（轴分解直线段）",
+          len(moveL) == 1 and flags6["return_arms"] == {RIGHT: "home"}, f"moveL={moveL}")
+    check("回头目标是启动位姿记的那个点",
+          np.allclose(moveL[0][2], (0.30, 0.20, 0.30)), f"{moveL}")
+    done = main.advance_return(ctrl6, flags6)
+    check("再走完就结束并报完成", done == [RIGHT] and flags6["return_arms"] == {})
+
+    ctrl7, flags7 = FakeCtrl(), make_flags()
+    main.start_return(ctrl7, flags7, RIGHT, 0.0)
+    check("--place-return-retreat 0：不退出，直接走回启动位姿",
+          not ctrl7.line_paths() and flags7["return_arms"] == {RIGHT: "home"})
+
+    ctrl8, flags8 = FakeCtrl(), make_flags()
+    main.start_return(ctrl8, flags8, RIGHT, 100.0)
+    ctrl8.lin_busy = False
+    main.apply_stream_target(ctrl8, parse({"pos": [0.55, -0.10, 0.15]}), flags8)
+    check("归位还没走完就来了新抓取目标 -> 放弃归位（手臂朝新目标去）",
+          flags8["return_arms"] == {}, f"return_arms={flags8['return_arms']}")
 
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
     print("\n" + "=" * 74)
