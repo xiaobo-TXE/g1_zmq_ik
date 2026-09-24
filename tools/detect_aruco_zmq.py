@@ -1075,22 +1075,31 @@ def main():
                                          place_quaternion=place_quat)
                 if now - send_log_time >= args.log_interval:
                     send_log_time = now
+                    latched = sender.latched is not None
                     if not sender.enabled:
                         state = '未发送(--no-send)：这是算出来的抓取点，可用来校 --marker-to-grasp'
                     elif sent:
                         state = '已下发(累计 {} 帧)'.format(sender.sent)
                     elif sender.dropped > dropped_before:
                         state = '对端未就绪，已丢帧(累计丢 {})'.format(sender.dropped)
-                    elif sender.latched is not None:
+                    elif latched:
                         state = '已锁存目标，不再更新(累计下发 {} 帧)'.format(sender.sent)
                     else:
                         state = '跳过(死区/限频)'
-                    print('[INFO] 抓取位姿 torso p={} q={}  (id={}, {})'.format(
-                        vector_text(target_torso), vector_text(target_quat),
+                    # 锁存之后要打印**真正下发的那一份**，而不是每帧重算的当前检测值 ——
+                    # 否则"已锁存、不再更新"旁边挂着一串一直在变的数字，看着就像锁存没生效。
+                    # （当前检测值看上面的 [TARGET] 行）
+                    which = '已锁存下发值' if latched else '当前检测'
+                    print('[INFO] 抓取位姿[{}] torso p={} q={}  (id={}, {})'.format(
+                        which,
+                        vector_text(sender.latched if latched else target_torso),
+                        vector_text(sender.latched_quat if latched else target_quat),
                         pick['id'], state), flush=True)
-                    if place_torso is not None:
-                        print('[INFO] 放置位姿 torso p={} q={}  (id={})'.format(
-                            vector_text(place_torso), vector_text(place_quat),
+                    shown_place = sender.latched_place if latched else place_torso
+                    if shown_place is not None:
+                        print('[INFO] 放置位姿[{}] torso p={} q={}  (id={})'.format(
+                            which, vector_text(shown_place),
+                            vector_text(sender.latched_place_quat if latched else place_quat),
                             place['id']), flush=True)
 
             if not args.no_display:
