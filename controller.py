@@ -455,6 +455,10 @@ class ArmController:
         self._approach: Dict[str, Optional[dict]] = {LEFT: None, RIGHT: None}
         #: 连续反解失败计数：超过 lin_abort_cycles 就取消该段（IK 失效即停）
         self._lin_fail: Dict[str, int] = {LEFT: 0, RIGHT: 0}
+        #: 该臂的直线段/放置路径是**被取消**的（反解失败/不可达），不是走完的。
+        #: 取消后 lin_status() 也返回空串，光看"没有段在走"分不出"走完了"和"半路取消"——
+        #: 而放置路径要是被误当成"走完了"，主循环会立刻松开夹爪，把盒子扔在半空。
+        self.lin_aborted: Dict[str, bool] = {LEFT: False, RIGHT: False}
         #: 直线段的默认限幅（None = 沿用末端限速那套 ee_speed/ee_accel/ee_jerk）
         self.lin_speed: Optional[float] = None
         self.lin_accel: Optional[float] = None
@@ -613,6 +617,7 @@ class ArmController:
         self._seg_total[arm] = 0
         self._approach[arm] = None          # 显式起段 = 取消同臂的待接近阶段
         self._lin_fail[arm] = 0
+        self.lin_aborted[arm] = False       # 新路径：清掉上一次的"被取消"标记
         self._assign_target(arm, np.asarray(T_goal, dtype=float))
         logger.info("直线段[%s]: 长 %.1fmm 转角 %.1f° 时长 %.2fs（v≤%.0fmm/s a≤%.2fm/s² j≤%.1f）",
                     arm, mv.length * 1000, np.rad2deg(mv.rot_angle), mv.duration,
@@ -697,6 +702,7 @@ class ArmController:
         self.lin[arm] = segs[0]
         self._approach[arm] = None
         self._lin_fail[arm] = 0
+        self.lin_aborted[arm] = False       # 新路径：清掉上一次的"被取消"标记
         self._assign_target(arm, T_goal)
         return segs[0]
 
@@ -803,6 +809,7 @@ class ArmController:
         self._queue[arm] = []               # 两段式接近 = 取消同臂的轴分解路径
         self._seg_total[arm] = 0
         self._lin_fail[arm] = 0
+        self.lin_aborted[arm] = False       # 新路径：清掉上一次的"被取消"标记
         self._approach[arm] = {"T_pre": T_pre, "T_grasp": T_grasp, "from": T_from}
         self._assign_target(arm, T_pre)
         logger.info("两段式接近[%s]: 先到 pre-grasp %s（沿工具轴后退 %.0fmm），到位后直线进给",
@@ -832,6 +839,7 @@ class ArmController:
         self._queue[arm] = []
         self._seg_total[arm] = 0
         self._lin_fail[arm] = 0
+        self.lin_aborted[arm] = True        # 让调用方分得出"取消"和"走完"
 
     def lin_status(self, arm: str) -> str:
         """给日志用的一行状态（没有直线段时返回空串）。"""

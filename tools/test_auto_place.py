@@ -91,7 +91,8 @@ def make_flags(**over) -> dict:
     flags = {"arms": [RIGHT], "soft": None, "last_stream_pos": {}, "pending_delta": [],
              "retreated": False, "autoclose_off": False, "lin_approach_mm": 0.0,
              "place_arms": [], "place_target": {}, "place_armed": False,
-             "ignore_stream_target": False, "place_key": None, "place_close_t0": None}
+             "ignore_stream_target": False, "place_key": None, "place_close_t0": None,
+             "place_release_t0": {}}
     flags.update(over)
     return flags
 
@@ -180,7 +181,8 @@ def main_check() -> int:
           len(ctrl.motions()) == n_before and flags["ignore_stream_target"] is True
           and flags["pending_delta"] == [])
 
-    print("\n[7] 换了一个新盒子（抓取点真的变了）：恢复接受，开始新的一轮")
+    print("\n[7] 搬运结束、换了一个新盒子（抓取点真的变了）：恢复接受，开始新的一轮")
+    flags["place_arms"] = []                   # 放置路径走完（主循环里由 lin_status 清空）
     main.apply_stream_target(ctrl, parse({"pos": [GRASP[0] + 0.2, GRASP[1], GRASP[2]],
                                           "place_pos": [PLACE[0] + 0.2, PLACE[1], PLACE[2]]}), flags)
     check("目标流重新被接受", flags["ignore_stream_target"] is False)
@@ -218,6 +220,36 @@ def main_check() -> int:
     main.apply_auto_grip_percent(c_r, 100.0, "松开", controlled_only=False)
     check("关掉本项时两侧都写（旧行为）",
           "right" in c_r.grip and "left" in c_r.grip, f"grip={c_r.grip}")
+
+    print("\n[10] 正在搬运时：任何位置目标都不接（半路换目标会把放置路径顶掉 -> 误判走完 -> 松爪）")
+    ctrl4, flags4 = FakeCtrl(), make_flags()
+    main.apply_stream_target(ctrl4, parse({"pos": GRASP, "place_pos": PLACE}), flags4)
+    main.start_auto_place(ctrl4, flags4, 0.05)
+    n = len(ctrl4.motions())
+    main.apply_stream_target(ctrl4, parse({"pos": [0.60, -0.20, 0.15],      # 全新的抓取点
+                                           "place_pos": [0.70, 0.10, 0.02]}), flags4)
+    check("搬运途中来的**新目标**也不接（否则放置路径被顶掉、盒子被扔在半路）",
+          len(ctrl4.motions()) == n, f"motions={ctrl4.motions()[n:]}")
+    check("搬运途中不再上膛", flags4["place_armed"] is False)
+    check("搬运途中不会二次起放置路径", len(ctrl4.places()) == 1)
+    # 搬运结束（place_arms 清空）后，新的抓取点应当能正常开始下一轮
+    flags4["place_arms"] = []
+    main.apply_stream_target(ctrl4, parse({"pos": [0.60, -0.20, 0.15],
+                                           "place_pos": [0.70, 0.10, 0.02]}), flags4)
+    check("搬运结束后新目标恢复生效（下一轮能开始）",
+          len(ctrl4.motions()) == n + 1 and flags4["place_armed"] is True
+          and flags4["ignore_stream_target"] is False,
+          f"motions={ctrl4.motions()[n:]}")
+
+    print("\n[11] 人工接管后不再自动搬运（disarm_place）")
+    ctrl5, flags5 = FakeCtrl(), make_flags()
+    main.apply_stream_target(ctrl5, parse({"pos": GRASP, "place_pos": PLACE}), flags5)
+    check("先上膛", flags5["place_armed"] is True)
+    main.disarm_place(flags5, "收到交互命令 p")
+    check("人工给目标后撤掉待搬运（否则手动挪完到位会按旧放置点自动搬过去）",
+          flags5["place_armed"] is False)
+    main.disarm_place(flags5, "再来一次")          # 幂等：没有上膛时不该报错/不该重复打日志
+    check("重复撤掉是幂等的", flags5["place_armed"] is False)
 
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
     print("\n" + "=" * 74)

@@ -960,6 +960,10 @@ def main():
         print('[INFO] 单码模式（--place-id 0，默认）：只发抓取点。'
               '要用双 Tag 抓放（抓取码 + 放置码）就在配置里写 place_id，见 robot.example.json',
               flush=True)
+    if args.place_id > 0 and not any(abs(float(v)) > 1e-9 for v in args.place_marker_to_grasp):
+        print('[WARN] --place-marker-to-grasp 是 0 0 0：末端会停在**放置码中心的高度**（桌面）上，'
+              '如果盒子是用腰部抓取的，盒子下半截会压进桌子。应该填 +盒底到抓取点的距离 '
+              '（盒高 18cm、抓取点在腰部 -> 0 0 0.09）', file=sys.stderr, flush=True)
     print('[INFO] camera={}, dictionary={}, marker_size={} m, ids={}'.format(
         args.camera_name, args.dictionary, args.marker_size,
         args.ids if args.ids else 'ALL'))
@@ -1037,11 +1041,17 @@ def main():
 
             # 双 Tag：**两个码都看到才发**。放置点是随第一次成功下发一起被锁存的，缺了它整个流程
             # 永远等不到放置点（单码用户请用 --place-id 0，行为与以前完全一致）。
-            if dual and place is None:
-                if now - last_place_warn >= 1.0:
+            missing = []
+            if dual:
+                if pick is None:
+                    missing.append('抓取码 ID{}'.format(args.pick_id))
+                if place is None:
+                    missing.append('放置码 ID{}'.format(args.place_id))
+            if missing:
+                if now - last_place_warn >= 1.0:       # 告警限频，别刷屏
                     last_place_warn = now
-                    print('[WARN] 等待放置码 ID={}（双 Tag 抓放要求抓取码与放置码同时在画面里；'
-                          '只有单码请用 --place-id 0）'.format(args.place_id),
+                    print('[WARN] 等待 {}（双 Tag 抓放要求两个码同时在画面里；'
+                          '只有单码请用 --place-id 0）'.format(' 与 '.join(missing)),
                           file=sys.stderr, flush=True)
             elif pick is not None:
                 # 把（已确认的）标记位姿换算成抓取位姿 / 放置位姿（位置 + 朝向），发给 6003
