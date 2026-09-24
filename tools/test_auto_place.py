@@ -69,6 +69,10 @@ class FakeCtrl:
         if left is not None:
             self.grip["left"] = left
 
+    def grip_pct_to_rad(self, pct):
+        """与真机同形的换算（0=闭 100=开）；测试只关心**哪一侧被写**。"""
+        return float(pct) / 100.0 * 5.0
+
     def motions(self):
         return [c for c in self.calls if c[0] in ("set", "moveL", "approach")]
 
@@ -192,6 +196,28 @@ def main_check() -> int:
     check("没有放置点 -> 不起路径、不动状态",
           main.start_auto_place(ctrl3, flags3, 0.05) is False
           and flags3["place_arms"] == [] and flags3["ignore_stream_target"] is False)
+
+    print("\n[9] --grip-controlled-only：自动夹爪动作只动受控臂那一侧")
+    c_r, c_l, c_b = FakeCtrl(RIGHT), FakeCtrl(LEFT), FakeCtrl("both")
+    check("默认（关）= 两侧都动",
+          main.auto_grip_sides(c_r, False) == ("right", "left")
+          and main.auto_grip_sides(c_l, False) == ("right", "left"))
+    check("开了以后跟着 --arm 走（right -> 只右爪，left -> 只左爪）",
+          main.auto_grip_sides(c_r, True) == ("right",)
+          and main.auto_grip_sides(c_l, True) == ("left",))
+    check("--arm both 时仍是两侧（没有'只动一侧'的意义）",
+          main.auto_grip_sides(c_b, True) == ("right", "left"))
+    main.apply_auto_grip_percent(c_r, 34.0, "到位后闭爪", controlled_only=True)
+    check("只给受控侧下目标：右爪 34% -> 1.7rad",
+          c_r.grip.get("right") is not None and abs(c_r.grip["right"] - 1.7) < 1e-9,
+          f"grip={c_r.grip}")
+    check("未受控侧没有被写入（机器人侧保持原状态）", "left" not in c_r.grip, f"grip={c_r.grip}")
+    main.apply_auto_grip_percent(c_l, 34.0, "到位后闭爪", controlled_only=True)
+    check("换成 --arm left 就只写左爪", "right" not in c_l.grip and "left" in c_l.grip,
+          f"grip={c_l.grip}")
+    main.apply_auto_grip_percent(c_r, 100.0, "松开", controlled_only=False)
+    check("关掉本项时两侧都写（旧行为）",
+          "right" in c_r.grip and "left" in c_r.grip, f"grip={c_r.grip}")
 
     n_fail = sum(1 for _, ok, _ in _RESULTS if not ok)
     print("\n" + "=" * 74)

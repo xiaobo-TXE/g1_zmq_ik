@@ -7,22 +7,22 @@
   python main.py --check
 
   # 1) 仿真闭环（没有机器人也能跑通整条链路）
-  python main.py --sim --arm right --pos 0.35 -0.20 0.10 --duration 8
+  python main.py --sim --arm left --pos 0.35 0.20 0.10 --duration 8
 
-  # 2) 真机：右臂末端（夹爪抓取中心）移到 torso 系下的 (0.35, -0.20, 0.10)，姿态保持不变
-  python main.py --robot-ip 192.168.123.161 --arm right --pos 0.35 -0.20 0.10
+  # 2) 真机：左臂末端（夹爪抓取中心）移到 torso 系下的 (0.35, 0.20, 0.10)，姿态保持不变
+  python main.py --robot-ip 192.168.123.161 --arm left --pos 0.35 0.20 0.10
 
   # 3) 先干跑（只打印不下发），确认数值合理再上真机
-  python main.py --robot-ip 192.168.123.161 --arm right --pos 0.35 -0.20 0.10 --dry-run
+  python main.py --robot-ip 192.168.123.161 --arm left --pos 0.35 0.20 0.10 --dry-run
 
   # 4) 画圆测试：绕起始位置在 x-z 平面画半径 5cm 的圆
-  python main.py --robot-ip 192.168.123.161 --arm right --demo circle --radius 0.05 --period 6
+  python main.py --robot-ip 192.168.123.161 --arm left --demo circle --radius 0.05 --period 6
 
   # 5) 交互模式：运行中随时输入新目标
-  python main.py --robot-ip 192.168.123.161 --arm right --interactive
+  python main.py --robot-ip 192.168.123.161 --arm left --interactive
 
   # 6) 到位判定：到位就打印一行 ✅（残差/耗时），并可选择到位后动作
-  python main.py --robot-ip 192.168.123.161 --arm right --pos 0.35 -0.20 0.10 \
+  python main.py --robot-ip 192.168.123.161 --arm left --pos 0.35 0.20 0.10 \
       --arrive-pos 2 --arrive-rot 1 --on-arrive freeze
 
   # 7) 双 Tag 抓放：目标来自 6003（检测端），抓到后自动搬到 place_pos 处放下
@@ -179,7 +179,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--grip-qmin-rad", type=float, default=GRIPPER_Q_MIN_DEFAULT,
                    help="机器人侧标定的闭合角（rad；上游默认 0.0）")
     g.add_argument("--grip-on-arrive", type=float, metavar="PCT",
-                   help="到位后自动把两侧夹爪压到这个开合百分比（例：0 = 到位即闭爪）；不给则不动夹爪")
+                   help="到位后自动把夹爪压到这个开合百分比（例：0 = 到位即闭爪）；不给则不动夹爪。"
+                        "默认两侧都压；--grip-controlled-only 可改成只动受控臂那一侧")
     g.add_argument("--grip-on-arrive-soft", type=float, metavar="TAU", nargs="?", const=0.3,
                    help="到位后做**力限软闭合**：慢慢闭合，|tau_est| 达到该阈值就冻结（默认 0.3）。"
                         "与 --grip-on-arrive 互斥；需要 --gripper-port 的 6004 力反馈")
@@ -194,6 +195,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "闭合的）；本项把它拉回张开。6000 失联/帧太旧不算『进入』，夹着盒子时不会误张开")
     g.add_argument("--no-grip-open-on-vla", dest="grip_open_on_vla", action="store_false",
                    help="关掉上面的自动张开（进入 VLA 时保持机器人侧原来的夹爪状态）")
+    g.add_argument("--grip-controlled-only", dest="grip_controlled_only", action="store_true",
+                   help="**自动**夹爪动作只动受控臂那一侧（--arm left 就只动左爪）：到位后自动闭爪、"
+                        "放置完松开、进入 VLA 自动张开都只作用于受控侧，未受控臂的夹爪保持机器人侧"
+                        "原来的状态。默认关 = 两侧都动（与旧版一致）。"
+                        "交互命令 g/gc/go 与启动 --grip 不受本项影响")
 
     # ---- 笛卡尔直线段（抓取进给/退出）：6003 协议不变，主程序自己算 pre-grasp/退出点 ----
     L = p.add_argument_group("笛卡尔直线段（LIN）")
@@ -229,8 +235,9 @@ def build_parser() -> argparse.ArgumentParser:
                    metavar="MM",
                    help="放置路径的抬升余量（mm）：先竖直抬到 max(当前,目标)+余量，再水平平移，"
                         "最后下落 —— 不能按轴分解直接走，否则会贴着桌面横拖把盒子拖倒")
-    P.add_argument("--place-settle-s", type=float, default=0.5, metavar="S",
-                   help="闭爪指令发出后至少等这么久才起抬臂（等夹爪真的咬住盒子）")
+    P.add_argument("--place-settle-s", type=float, default=0.7, metavar="S",
+                   help="闭爪指令发出后至少等这么久才起抬臂（等夹爪真的咬住盒子）。默认 0.7s："
+                        "机器人侧夹爪限速 6rad/s，从全开收到目标位一般要 0.55~0.62s，留一点余量")
     P.add_argument("--place-wait-max-s", type=float, default=3.0, metavar="S",
                    help="等夹爪合上的上限：超过它就按'夹爪已合上'处理（没有 6004 力反馈时"
                         "靠这个不至于卡住；夹着盒子时实测 q 到不了指令位置，靠 |dq|≈0 判定）")
@@ -420,6 +427,29 @@ def start_auto_place(ctrl: ArmController, flags: Dict, clearance_m: float) -> bo
     log.info("抓取完成 -> 自动前往放置点[%s]：抬升 %.0fmm -> 水平平移 -> 下落，到位后自动松开夹爪",
              "/".join(started), clearance_m * 1000.0)
     return True
+
+
+def auto_grip_sides(ctrl: ArmController, controlled_only: bool = False) -> tuple:
+    """自动夹爪动作该作用在哪几侧：默认两侧；`--grip-controlled-only` 时只取受控臂那一侧。
+
+    未受控臂的**关节**本来就是冻结的（controller 里保持住），所以它的夹爪也应当保持机器人侧
+    原来的状态，不该被自动动作顺手带上。
+    """
+    if not controlled_only:
+        return ("right", "left")
+    return tuple(s for s in ("right", "left") if ctrl.controlled in (s, "both"))
+
+
+def apply_auto_grip_percent(ctrl: ArmController, pct: float, source: str,
+                            controlled_only: bool = False) -> tuple:
+    """自动动作的"两侧同值"夹爪下发（到位闭爪 / 放置完松开 / 进入 VLA 张开）。
+
+    返回实际下发的侧。交互命令 `g`/`gc`/`go` 与启动 `--grip` **不走这里** —— 那是你显式给的。
+    """
+    sides = auto_grip_sides(ctrl, controlled_only)
+    apply_grip_percent(ctrl, pct if "right" in sides else None,
+                       pct if "left" in sides else None, source=source)
+    return sides
 
 
 def grip_target_line(ctrl: ArmController) -> str:
@@ -1313,7 +1343,8 @@ def main(argv=None) -> int:
                 if not flags["place_arms"]:
                     if flags.get("soft") is not None:
                         flags["soft"].stop("place 走完松开夹爪")
-                    apply_grip_percent(ctrl, 100, 100, source="place 走完（松开夹爪）")
+                    apply_auto_grip_percent(ctrl, 100, "place 走完（松开夹爪）",
+                                            controlled_only=args.grip_controlled_only)
 
             # --delta：等首帧拿到 q_cmd（=测量位姿）后再叠加相对位移
             if args.delta is not None and info.q_cmd is not None and not delta_done:
@@ -1364,7 +1395,8 @@ def main(argv=None) -> int:
                 # 机器人侧会 latch 上一次夹爪目标并 100Hz 无条件重发，退出/重进 VLA 都不会清掉它 ——
                 # 所以"重进 VLA 后夹爪还闭合着"只能由这里解。
                 if vla_rise(flags, vla_now, mode_fresh) and args.grip_open_on_vla:
-                    apply_grip_percent(ctrl, 100, 100, source="进入 VLA：自动张开夹爪")
+                    apply_auto_grip_percent(ctrl, 100, "进入 VLA：自动张开夹爪",
+                                            controlled_only=args.grip_controlled_only)
 
             # 打印
             if flags["force_print"] or (print_every > 0 and ctrl.cycle % print_every == 0):
@@ -1397,10 +1429,12 @@ def main(argv=None) -> int:
                                and arrival.all_arrived(flags["arms"]))
             auto_grip_ok = all_arrived_now and not flags["autoclose_off"]
             if auto_grip_ok and args.grip_on_arrive is not None:
-                apply_grip_percent(ctrl, args.grip_on_arrive, args.grip_on_arrive,
-                                   source=f"到位后 --grip-on-arrive {args.grip_on_arrive:g}%")
+                apply_auto_grip_percent(ctrl, args.grip_on_arrive,
+                                        f"到位后 --grip-on-arrive {args.grip_on_arrive:g}%",
+                                        controlled_only=args.grip_controlled_only)
             if auto_grip_ok and args.grip_on_arrive_soft is not None and not soft.active:
-                for m in soft.start(ctrl, tau_limit=args.grip_on_arrive_soft,
+                for m in soft.start(ctrl, sides=auto_grip_sides(ctrl, args.grip_controlled_only),
+                                    tau_limit=args.grip_on_arrive_soft,
                                     source=f"到位后 --grip-on-arrive-soft {args.grip_on_arrive_soft:g}"):
                     log.info("%s", m)
             # 抓取退出：到位 + 闭爪完成后沿工具轴反方向直线退出（--lin-retreat）

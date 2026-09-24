@@ -47,20 +47,21 @@ source .venv/bin/activate
 控制端：
 
 ```bash
-python main.py --robot-ip 192.168.123.161 --arm right --target-frame torso \
-    --pos 0.35 -0.20 0.15
+python main.py --robot-ip 192.168.123.161 --arm left --target-frame torso \
+    --pos 0.35 0.20 0.15
 ```
 
-`--pos` 是绝对位置（torso 系，米）。不给 `--pos` 也可以，程序会保持启动时的位姿等外部目标。
+`--pos` 是绝对位置（torso 系，米；**y 为正 = 左侧**）。不给 `--pos` 也可以，程序会保持启动时的
+位姿等外部目标。下面的示例按 `robot.json` 的 `"arm": "left"` 写。
 
 ### 2.2 先不接机器人试一遍
 
 把 `--robot-ip` 换成 `--sim`，用内部仿真状态源，不连任何端口：
 
 ```bash
-python main.py --sim --arm right --pos 0.35 -0.20 0.10
-python main.py --sim --arm right --pos 0.35 -0.20 0.10 --on-arrive exit   # 到位即退出
-python main.py --sim --arm right --pos 0.35 -0.20 0.10 --interactive      # 常开 + 键盘命令
+python main.py --sim --arm left --pos 0.35 0.20 0.10
+python main.py --sim --arm left --pos 0.35 0.20 0.10 --on-arrive exit   # 到位即退出
+python main.py --sim --arm left --pos 0.35 0.20 0.10 --interactive      # 常开 + 键盘命令
 ```
 
 ### 2.3 用配置文件（推荐）
@@ -85,26 +86,26 @@ python main.py --config robot.json --lin-approach 120
 ### 2.4 给目标的几种方式
 
 ```bash
-# 绝对位置（torso 系，米）+ 保持启动时锁定的末端朝向
-python main.py --robot-ip <IP> --arm right --pos 0.35 -0.20 0.10
+# 绝对位置（torso 系，米；y 为正 = 左侧）+ 保持启动时锁定的末端朝向
+python main.py --robot-ip <IP> --arm left --pos 0.35 0.20 0.10
 
 # 相对当前位姿的位移（前移 5cm、上移 3cm）
-python main.py --robot-ip <IP> --arm right --delta 0.05 0 0.03
+python main.py --robot-ip <IP> --arm left --delta 0.05 0 0.03
 
 # 指定末端姿态（rpy，弧度）；不给就保持启动时锁定的朝向
-python main.py --robot-ip <IP> --arm right --pos 0.35 -0.20 0.10 --rpy 0 0 0
+python main.py --robot-ip <IP> --arm left --pos 0.35 0.20 0.10 --rpy 0 0 0
 
 # 指定末端姿态（四元数 x y z w，优先级高于 --rpy）
-python main.py --robot-ip <IP> --arm right --pos 0.35 -0.20 0.10 --quat 0 0 0 1
+python main.py --robot-ip <IP> --arm left --pos 0.35 0.20 0.10 --quat 0 0 0 1
 
 # 双臂同时
 python main.py --robot-ip <IP> --arm both --pos-left 0.30 0.20 0.10 --pos-right 0.30 -0.20 0.10
 
 # 轨迹测试：绕起始位置在 x-z 平面画 5cm 的圆（line = 沿 x 往返）
-python main.py --robot-ip <IP> --arm right --demo circle --radius 0.05 --period 6
+python main.py --robot-ip <IP> --arm left --demo circle --radius 0.05 --period 6
 
 # 只打印将要发送的帧，不下发
-python main.py --robot-ip <IP> --arm right --pos 0.35 -0.20 0.10 --dry-run
+python main.py --robot-ip <IP> --arm left --pos 0.35 0.20 0.10 --dry-run
 ```
 
 ### 2.5 运行中的键盘命令
@@ -195,6 +196,11 @@ y 是手指开合方向、z 朝上。标签平贴盒顶时 `marker z ≈ (0,0,+1
 抓取时盒子被推走通常是这两件事：**① 接近时夹爪是闭合的** —— 在配置里写 `"grip": 100` 启动即张开；
 **② 开合方向没跨在窄面上** —— 用 `axes(ee/torso)` 的 y 确认它跨的是盒子的窄边。
 
+**只动受控臂的夹爪**：默认「到位自动闭爪 / 放置完松开 / 进 VLA 自动张开」都是**两侧一起**下发的
+（未受控臂的**手臂关节**会被冻结保持，但夹爪是独立通道，不跟着冻结）。想让自动动作只作用于受控臂，
+在配置里写 `"grip_controlled_only": true`（= `--grip-controlled-only`）——未受控臂的夹爪就保持
+机器人侧原来的状态。启动 `--grip` 与交互命令 `g`/`gc`/`go` **不受**这一项影响（那是你显式给的）。
+
 ### 3.4 锁存第一次目标（`--latch-first`）
 
 检测端默认是"变化 ≥ 死区就更新目标"。如果**夹爪/手臂碰到了 Tag 码把它推远**，检测到的目标
@@ -257,9 +263,10 @@ python tools/detect_aruco_zmq.py --config robot.json   # 终端 B：检测端
   `place_id` 设成 `0`（默认），行为与以前完全一致。
 - **放置点用独立的偏移/朝向**（`place_marker_to_grasp` / `place_align_rpy`）。放置码平贴桌面时
   给 `0 0 0`（末端落在码中心）；沿用抓取那套 `-0.09` 会把末端送到桌面**以下** 9cm。
-- **确认夹爪真合上才抬臂**：`--place-settle-s`（默认 0.5s）是最短等待，之后还要看 6004 的实测
+- **确认夹爪真合上才抬臂**：`--place-settle-s`（默认 0.7s）是最短等待，之后还要看 6004 的实测
   ——`q` 到不了指令位置（夹着盒子）但已经停住（`|dq| ≈ 0`）也算合上；没有 6004 就只按延时，
-  最迟 `--place-wait-max-s`（默认 3s）动手，不会卡住。
+  最迟 `--place-wait-max-s`（默认 3s）动手，不会卡住。0.7s 是照"从全开收到目标位"的物理时间定的：
+  机器人侧夹爪限速 6 rad/s，全开→34% 约 0.55~0.62s。
 - **重复目标被挡住**：检测端会 20Hz 重发同一条目标（关掉 `--latch-first` 时更是如此）。搬运期间
   以及搬运完成后，**同一条**目标不再当位置目标用（否则会把正在走的放置路径顶掉、或松爪后又被
   拉回去重抓一次）；等到检测端给出**不同**的抓取点才恢复，于是"换一个盒子"会自动开始下一轮。
@@ -429,7 +436,7 @@ for p in my_trajectory:                 # 想发多快就发多快，积压时�
 `p/d/r` 可解冻）；`exit` 到位即退出并打印残差与耗时。它与 `--grip-on-arrive*` 正交，可以一起用。
 
 ```bash
-python main.py --sim --arm right --pos 0.35 -0.20 0.10 --on-arrive exit
+python main.py --sim --arm left --pos 0.35 0.20 0.10 --on-arrive exit
 ```
 
 ---
@@ -458,7 +465,10 @@ Dex1 抓取中心；0.185=指尖平面；Dex3 用 0.05）、`--solver auto|casad
 **夹爪**：`--grip V`、`--grip-right`、`--grip-left`、`--grip-unit pct|cm|rad`、`--grip-open-cm`（8.5）、
 `--grip-qmax-rad`（5.6217）、`--grip-qmin-rad`（0.0）、`--grip-on-arrive PCT`、
 `--grip-on-arrive-soft [TAU]`、`--grip-soft-tau`（0.3）、`--grip-soft-rate`（1.5）、
-`--grip-open-on-vla`（默认**开**：观察到「进入 VLA」就把两侧夹爪张开到 100%；
+`--grip-controlled-only`（**自动**夹爪动作只动受控臂那一侧：到位闭爪 / 放置完松开 / 进 VLA 张开；
+默认关=两侧都动。未受控臂的**关节**本来就是冻结的，这一项让它的夹爪也保持机器人侧原状态。
+交互命令 `g`/`gc`/`go` 与启动 `--grip` 不受影响 —— 那是你显式给的）、
+`--grip-open-on-vla`（默认**开**：观察到「进入 VLA」就把夹爪张开到 100%；
 `--no-grip-open-on-vla` 关掉）。机器人侧会 latch 上一次夹爪目标并 100 Hz 无条件重发，
 所以「退出 VLA 再进入」后夹爪会停在旧状态（还闭合着）—— 靠这一项拉回张开。
 6000 失联/帧太旧**不算**「进入」，夹着盒子时不会误张开。
@@ -490,7 +500,7 @@ Dex1 抓取中心；0.185=指尖平面；Dex3 用 0.05）、`--solver auto|casad
 
 **双 Tag 自动搬运**（见 §3.5，控制端）：`--auto-place`（默认**开**；收到 6003 的 `place_pos` 后
 抓到盒子就自动走放置路径并在终点松爪）/ `--no-auto-place`、`--place-clearance MM`（50，放置路径
-的抬升余量）、`--place-settle-s`（0.5，闭爪后最短等待）、`--place-wait-max-s`（3.0，等夹爪合上的上限）。
+的抬升余量）、`--place-settle-s`（0.7，闭爪后最短等待）、`--place-wait-max-s`（3.0，等夹爪合上的上限）。
 
 ---
 

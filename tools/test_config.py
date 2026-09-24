@@ -210,13 +210,13 @@ def main_check() -> int:
           (lambda a: a.place_id == 4 and tuple(a.place_marker_to_grasp) == (0.0, 0.0, -0.02))(
               det.parse_args(["--place-id", "4", "--place-marker-to-grasp", "0", "0", "-0.02"])))
     check("主程序默认：auto_place 开、等待闭爪与抬升余量有默认值",
-          main is not None and (lambda a: a.auto_place is True and a.place_settle_s == 0.5
+          main is not None and (lambda a: a.auto_place is True and a.place_settle_s == 0.7
                                 and a.place_wait_max_s == 3.0 and a.place_clearance == 50.0)(
               main.parse_args(["--sim"])))
     args, _ = parse(["--config", str(example), "--sim"])
     check("示例配置里的双 Tag 自动搬运键生效（auto_place / place_clearance / place_settle_s）",
           args is not None and args.auto_place is True and args.place_clearance == 50.0
-          and args.place_settle_s == 0.5,
+          and args.place_settle_s == 0.7,
           f"auto_place={args.auto_place if args else None} "
           f"clearance={args.place_clearance if args else None}")
     d1 = det.parse_args(["--config", cfg_sec])
